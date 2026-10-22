@@ -1465,5 +1465,59 @@ class ArchivedRunEvidenceTests(unittest.TestCase):
                              digests["EFI/BOOT/BOOTX64.EFI"])
 
 
+class PinDiscrepancyTests(unittest.TestCase):
+    """The three pin discrepancies of the reorganized repository.
+
+    They are preserved, not repaired: the brief says to preserve them rather
+    than blindly update their digests. What is validated is WHY they stand.
+    """
+
+    def report(self):
+        import a8_pin_discrepancies as pd
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = pd.main([])
+        return code, json.loads(buffer.getvalue())
+
+    def test_every_stale_pin_and_the_unpinned_header_are_named(self):
+        code, report = self.report()
+        # The discrepancies stand, so the tool says so and exits 1.
+        self.assertEqual(code, 1)
+        self.assertFalse(report["ok"])
+        self.assertEqual(len(report["stale"]), 2)
+        self.assertEqual(len(report["unpinned"]), 1)
+        stale = {entry["path"]: entry for entry in report["stale"]}
+        self.assertIn("compiler/c/nova/frontend/nova.c", stale)
+        self.assertIn("compiler/c/nova/frontend/nova.h", stale)
+        # The required header the snapshot names with a stale path.
+        self.assertEqual(report["unpinned"][0]["header"],
+                         "compiler/c/nova/analysis/seed_reachability.h")
+        for entry in stale.values():
+            self.assertNotEqual(entry["pinned"], entry["on_disk"])
+
+    def test_the_pin_of_nova_h_designates_a_real_revision(self):
+        _, report = self.report()
+        entry = {e["path"]: e for e in report["stale"]}["compiler/c/nova/frontend/nova.h"]
+        self.assertTrue(entry["history"]["found"])
+        self.assertTrue(entry["history"]["revision"])
+
+    def test_the_content_delta_is_paths_only(self):
+        _, report = self.report()
+        for entry in report["stale"]:
+            if entry["verdict"] == "campaign copy not available":
+                self.skipTest("the campaign tree is not on this machine")
+            self.assertEqual(entry["verdict"], "paths-and-comments-only")
+            self.assertEqual(entry["code_lines"], 0)
+            self.assertGreater(entry["changed_lines"], 0)
+
+    def test_the_tool_never_writes(self):
+        import a8_pin_discrepancies as pd
+        source = Path(pd.__file__).read_text()
+        for forbidden in ("open(", "write_text", "write_bytes", "shutil",
+                          "os.remove", "unlink", "subprocess.run([\"git\", \"-C\", str(ROOT), \"push\""):
+            with self.subTest(token=forbidden):
+                self.assertNotIn(forbidden, source)
+
+
 if __name__ == "__main__":
     unittest.main()

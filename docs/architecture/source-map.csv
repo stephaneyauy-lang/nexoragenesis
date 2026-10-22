@@ -1136,6 +1136,7 @@ toolchain/ntasm-nova/nova_machine_many.nova,compiler/nova/backend/nova/nova_mach
 toolchain/ntasm-nova/nova_native_driver.nova,compiler/nova/drivers/nova_native_driver.nova
 toolchain/ntasm-nova/nova_native_driver_many.nova,compiler/nova/drivers/nova_native_driver_many.nova
 toolchain/ntasm-nova/nova_source_emit.nova,compiler/nova/frontend/nova_source_emit.nova
+toolchain/ntasm-nova/ntasm_native_driver.nova,compiler/nova/drivers/ntasm_native_driver.nova
 toolchain/ntasm-nova/ntir.nova,compiler/nova/formats/ntir/ntir.nova
 toolchain/ntasm-nova/ntir_inspect.nova,compiler/nova/inspectors/ntir_inspect.nova
 toolchain/ntasm-nova/nxo.nova,compiler/nova/formats/nxo/nxo.nova

@@ -67,16 +67,16 @@ The transport facts of the same run (`boot-result.json`,
 `"pass": false`.
 
 **When the guest stopped:** the last write of its serial log is at
-**2074 s** after the start of the run (the run directory name carries the
-start stamp `20261021T170311Z`; the mtime of `serial.log` is its last
-write, and reading a file does not change its mtime). The transport then
-waited for its whole budget: 2135 RAM polls at 5 s, that is **10675 s**. So
-**about 8601 s, two hours and twenty-three minutes, were spent waiting for a
-guest that was already gone.** That is the measured "the parent waited until
-timeout and the UI showed waiting".
+**t+2062 s** after QEMU started (the anchor is the mtime of
+`qemu.command.json`, the moment the guest was actually launched; the mtime
+of `serial.log` is its last write, and reading a file does not change it).
+The transport then waited for its whole budget: 2135 RAM polls at 5 s, that
+is **10675 s**. So **about 8613 s, two hours and twenty-three minutes, were
+spent waiting for a guest that was already gone.** That is the measured
+"the parent waited until timeout and the UI showed waiting".
 
-The guest was not slowing down before it stopped: sixteen batches in 2074 s
-is 130 s per batch, against 98 s per batch in the run before it and 186 s
+The guest was not slowing down before it stopped: sixteen batches in 2062 s
+is 129 s per batch, against 98 s per batch in the run before it and 186 s
 per batch in the run of 14:37. It stopped hard, in the middle of a batch.
 
 ## The five producer runs of that day
@@ -90,7 +90,7 @@ compiling the same `NOVA.IN` and the same P2 compiler:
 | 14:14:50Z | 13 | LOWER | 983 s | 960 s | -23 s | `9b3509ec` | `17fd29cd` |
 | 14:37:38Z | 19 | OBJECT | 3527 s | 3565 s | 38 s | `9b3509ec` | `17fd29cd` |
 | 16:22:08Z | 15 | LOWER | 1470 s | no record | - | `9b3509ec` | `413b7816` |
-| 17:03:11Z | 16 | LOWER | 2074 s | 10675 s | **8601 s** | `9b3509ec` | `413b7816` |
+| 17:03:11Z | 16 | LOWER | 2062 s | 10675 s | **8613 s** | `9b3509ec` | `413b7816` |
 
 Read with care, the five runs are not five instances of the same thing. The
 run of 14:37 was **still working** when its own deadline arrived (38 s of
@@ -101,6 +101,80 @@ serial ends with the firmware loading `Boot0002 "EFI Internal Shell"`, so
 the guest had *returned to the firmware* without a terminal marker and the
 firmware moved on to the next boot option. That leaves two runs where the
 guest stopped by itself: the run of 13:53 and the run of 17:03.
+
+## The measured reproduction (2026-10-22)
+
+The producer step of trial 05 was **reproduced in this repository**: the exact
+four images of the failing run, read from the archive, booted by the
+transport of this branch. It stopped at the same point as the archived run.
+
+```
+NG_NOVA_BATCH_OBJECT_END 15
+NG_NOVA_BATCH_LOWER_BEGIN 16      <- byte for byte the archived tail
+```
+
+and the liveness block of its `boot-result.json` says:
+
+```json
+{"polled": 435, "unavailable": 0, "malformed": 0, "fatal": true,
+ "state": "paused", "reason": "shutdown",
+ "detail": "the monitor reported VM status: paused (shutdown)"}
+```
+
+Three things the archive did not hold:
+
+1. **The guest powers off deterministically** at batch 16. This is a
+   reproduction, not a coincidence of timing.
+2. **The VM state at the moment of the failure is measured**: `paused
+   (shutdown)`, with the HMP transcript kept. The archive only had the
+   house build's own note that a paused VM had to be closed by hand.
+3. **The transport saw the dead guest in at most five seconds**, against the
+   8613 s of dead waiting the archived run records. The liveness poll is
+   proven on a real failure, not only on the deliberate watchdog case: the
+   same step, reproduced here, spent **3.2 s** of dead time instead of
+   8613 s — 2693 times less, because the poll that saw `paused (shutdown)`
+   ended the run there.
+
+The real transcript of that poll is kept as
+`tests/transport/fixtures/hmp-live-paused-shutdown.txt`, and the suite
+parses it.
+
+**The cause is still not established.** What is measured is the state of the
+guest, not the reason it stopped. The bisection that would settle it is
+`a8-trial05-bisection.md`.
+
+## The bisection, run A and run B: the zeroing is REFUTED
+
+The bisection (`a8-trial05-bisection.md`) isolates one variable per run. Two
+runs are done, with the same host, the same seed, the same payload and the
+same 512 MiB guest:
+
+| run | runtime | batches | stopped in | the liveness poll saw |
+|---|---|---|---|---|
+| **A** | the word-wise zeroing, `413b7816` | 16 | LOWER | `paused (shutdown)` |
+| **B** | the runtime BEFORE the zeroing, `17fd29cd` | 16 | LOWER | `paused (shutdown)` |
+
+Run B is the byte-wise runtime of the campaign itself
+(`runtime-native/asm-runtime-01/source.ntasm`, sha256 `486ce6f1…`, the image
+`asm-runtime-02` produced). **The guest stops at the same batch, in the same
+phase, with the same VM state, whatever the runtime.**
+
+**So the word-wise pool zeroing is REFUTED as the cause of the trial 05
+shutdown.** It was the only code change between the run that kept going and
+the run that stopped, and reverting it changes nothing.
+
+What the bisection leaves open:
+
+- **The memory of the guest.** A shadow run with a 1536 MiB guest (three
+  times the contract) is running; the transport now takes
+  `--guest-memory` for exactly this, the contract value stays the default
+  and a non-contract guest is flagged in the evidence
+  (`qemu_memory_is_contract`).
+- **The content of batch 16.** The stop is at the LOWER phase of the
+  seventeenth batch, every time. What that batch contains is the next
+  thing to look at.
+- **Whatever the guest does when it powers itself off.** The VM state is
+  measured, the reason is not.
 
 ## What the evidence refutes
 

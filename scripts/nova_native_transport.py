@@ -434,6 +434,26 @@ def foreign_qemu_pids():
 # The proven ESP, boot and PE work, promoted from the prototype
 # --------------------------------------------------------------------------
 
+def guest_memory(args):
+    """The guest memory this run uses: the contract value unless the run
+    asked for another one, for a DIAGNOSTIC only."""
+    return check_guest_memory(getattr(args, "guest_memory", None) or QEMU_MEMORY)
+
+
+def check_guest_memory(value):
+    """The guest memory of a boot, as the contract writes it.
+
+    The contract value is 512M and it is the default. Another value is
+    accepted for a DIAGNOSTIC run only, and it is recorded in the contract
+    record, so an evidence that was taken with another guest says so.
+    """
+    if not isinstance(value, str) or not value:
+        raise Refusal("guest memory must be a non-empty string")
+    if not re.fullmatch(r"[0-9]{1,4}[KMGT]?", value):
+        raise Refusal("guest memory must be <number>[KMGT], got %r" % value)
+    return value
+
+
 def digest(p):
     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
@@ -736,8 +756,10 @@ def boot(where, image, marker, args, expect_bad=False, marker_checks=None,
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     serial_path = where / "serial.log"
+    guest_memory = check_guest_memory(getattr(args, "guest_memory", None)
+                                      or QEMU_MEMORY)
     command = [
-        args.qemu, "-machine", "q35,accel=tcg", "-cpu", "max", "-m", QEMU_MEMORY,
+        args.qemu, "-machine", "q35,accel=tcg", "-cpu", "max", "-m", guest_memory,
         "-smp", str(QEMU_CPUS),
         "-drive", "if=pflash,format=raw,unit=0,readonly=on,file=" + str(Path(args.code).resolve()),
         "-drive", "if=pflash,format=raw,unit=1,file=" + str(where / "vars.fd"),
@@ -1085,7 +1107,9 @@ def write_transport_result(where, args, repo, work_root, ram, failure):
                   failure="" if failure is None else str(failure),
                   runner_path=str(Path(__file__).resolve()),
                   runner_sha256=digest(Path(__file__).resolve()),
-                  qemu=args.qemu, qemu_memory=QEMU_MEMORY, qemu_smp=QEMU_CPUS,
+                  qemu=args.qemu, qemu_memory=guest_memory(args),
+                  qemu_memory_is_contract=guest_memory(args) == QEMU_MEMORY,
+                  qemu_smp=QEMU_CPUS,
                   code=str(args.code), vars=str(args.vars),
                   pins=PINS, ram=ram_record(ram), a8_selfhost_proven=False)
     (where / "transport-result.json").write_text(json.dumps(record, indent=2))
@@ -1099,7 +1123,8 @@ def record_workspace(where, args, repo, work_root):
         repo=str(repo), work_root=str(work_root), name=args.name,
         timeout=args.timeout, timeout_bounds=[TIMEOUT_MIN, TIMEOUT_MAX],
         pins=PINS, qemu=args.qemu, code=str(args.code), vars=str(args.vars),
-        qemu_memory=QEMU_MEMORY, qemu_smp=QEMU_CPUS, qemu_network="none", qemu_display="none",
+        qemu_memory=getattr(args, "guest_memory", None) or QEMU_MEMORY,
+        qemu_smp=QEMU_CPUS, qemu_network="none", qemu_display="none",
         ram_start_min=RAM_START_MIN, ram_stop_max=RAM_STOP_MAX,
         ram_poll_seconds=RAM_POLL_SECONDS,
         hmp_poll_seconds=HMP_POLL_SECONDS, hmp_command=HMP_COMMAND,
@@ -1276,6 +1301,9 @@ def build_parser():
     # The house builder passes its own --timeout explicitly (10800).
     ap.add_argument("--timeout", type=int, default=240,
                     help="seconds, %d..%d" % (TIMEOUT_MIN, TIMEOUT_MAX))
+    ap.add_argument("--guest-memory", default=QEMU_MEMORY,
+                    help="the memory of the guest; the contract value is %s, and "
+                         "a DIAGNOSTIC run may use another one" % QEMU_MEMORY)
     sub = ap.add_subparsers(dest="mode", required=True)
     assembly = sub.add_parser("assemble")
     assembly.add_argument("source", type=Path)

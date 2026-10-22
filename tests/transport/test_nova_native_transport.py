@@ -23,6 +23,7 @@ import hashlib
 import inspect
 import io
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -32,13 +33,24 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools" / "validation"))
 
 import nova_native_transport as nt
+import a8_run_evidence as ev
 from nova_native_transport import (exclusive_failure, firmware_return, nova_runtime_failure,
                                    native_driver_failure, driver_output_matches,
                                    root_inventory_names)
 
 MARKER = "NG_NV2_NATIVE_TEST_OK"
+
+# The archived A8 evidence, read only. The tests that need it are skipped
+# when it is not on this machine.
+ARCHIVE_ROOT = Path(os.environ.get(
+    "A8_ARCHIVE_ROOT", "C:/NexoraGenesis/out/a8-selfhost-20261015"))
+TRIAL05_PRODUCER = ARCHIVE_ROOT / (
+    "house-stage-20261021-01/out/ntasm-house/20261021T170311Z-82584f32/producer")
+TRIAL03_PRODUCER = ARCHIVE_ROOT / (
+    "house-stage-20261021-01/out/ntasm-house/20261021T143738Z-1c413f15/producer")
 
 
 def start(boot="Boot0001", name="UEFI Non-Block Boot Device"):
@@ -1230,6 +1242,148 @@ class BootLivenessTests(unittest.TestCase):
             with self.subTest(token=forbidden):
                 self.assertNotIn(forbidden, source)
         self.assertEqual(nt.HMP_COMMAND, "info status")
+
+
+class ArchivedRunEvidenceTests(unittest.TestCase):
+    """The read-only reader of an archived A8 run.
+
+    It turns a run directory into the facts the raw evidence holds, so a
+    diagnosis is a measurement and not a story.
+    """
+
+    def batches(self, count, last_phase=None):
+        lines = []
+        for index in range(count):
+            lines.append("NG_NOVA_BATCH_LOWER_BEGIN %d" % index)
+            lines.append("NG_NOVA_BATCH_LOWER_END %d" % index)
+            lines.append("NG_NOVA_BATCH_OBJECT_BEGIN %d" % index)
+            lines.append("NG_NOVA_BATCH_OBJECT_END %d" % index)
+        if last_phase == "LOWER":
+            lines.append("NG_NOVA_BATCH_LOWER_BEGIN %d" % count)
+        elif last_phase == "OBJECT":
+            lines.append("NG_NOVA_BATCH_LOWER_BEGIN %d" % count)
+            lines.append("NG_NOVA_BATCH_LOWER_END %d" % count)
+            lines.append("NG_NOVA_BATCH_OBJECT_BEGIN %d" % count)
+        return "\r\n".join(lines) + "\r\n"
+
+    def test_the_completed_batches_are_counted(self):
+        facts = ev.parse_serial(self.batches(16))
+        self.assertEqual(facts["batches_completed"], 16)
+        self.assertEqual(facts["last_completed_batch"], 15)
+        self.assertIsNone(facts["stopped_in"])
+
+    def test_a_stop_in_the_lower_phase_is_read(self):
+        facts = ev.parse_serial(self.batches(16, "LOWER"))
+        self.assertEqual(facts["batches_completed"], 16)
+        self.assertEqual(facts["stopped_in"], "LOWER")
+        self.assertEqual(facts["last_line"], "NG_NOVA_BATCH_LOWER_BEGIN 16")
+
+    def test_a_stop_in_the_object_phase_is_read(self):
+        facts = ev.parse_serial(self.batches(19, "OBJECT"))
+        self.assertEqual(facts["batches_completed"], 19)
+        self.assertEqual(facts["stopped_in"], "OBJECT")
+        self.assertEqual(facts["last_line"], "NG_NOVA_BATCH_OBJECT_BEGIN 19")
+
+    def test_the_terminal_marker_is_read(self):
+        facts = ev.parse_serial(self.batches(2) + "NG_NV2_NATIVE_RUN_OK\r\n")
+        self.assertEqual(facts["terminal_marker"], "NG_NV2_NATIVE_RUN_OK")
+        self.assertEqual(facts["batches_completed"], 2)
+
+    def test_an_empty_serial_reads_nothing(self):
+        facts = ev.parse_serial("")
+        self.assertEqual(facts["batches_completed"], 0)
+        self.assertIsNone(facts["stopped_in"])
+        self.assertIsNone(facts["terminal_marker"])
+        self.assertEqual(facts["last_line"], "")
+
+    def test_a_synthetic_run_directory_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            where = Path(tmp) / "20261021T170311Z-82584f32" / "producer"
+            where.mkdir(parents=True)
+            (where / "serial.log").write_text(self.batches(16, "LOWER"),
+                                              encoding="utf-8")
+            (where / "boot-result.json").write_text(json.dumps(dict(
+                marker="NG_NV2_NATIVE_RUN_OK", marker_exact_once=False,
+                firmware_return=False, exit_code=0, shutdown="hmp",
+                forced=False, **{"pass": False})), encoding="utf-8")
+            (where / "transport-result.json").write_text(json.dumps(dict(
+                timeout=10800, failure="", runner_sha256="0" * 64,
+                a8_selfhost_proven=False,
+                ram=dict(polled=2135, tripped=False, poll_seconds=5.0))),
+                encoding="utf-8")
+            (where / "inputs.json").write_text(json.dumps([
+                dict(esp="NOVACORE.EFI", bytes=10, sha256="ab" * 32)]),
+                encoding="utf-8")
+            facts = ev.read_run(where)
+            self.assertTrue(facts["readable"])
+            self.assertEqual(facts["serial"]["batches_completed"], 16)
+            self.assertEqual(facts["serial"]["stopped_in"], "LOWER")
+            self.assertFalse(facts["boot"]["pass_"])
+            self.assertEqual(facts["transport"]["ram_polled"], 2135)
+            self.assertEqual(facts["transport"]["ram_tripped"], False)
+            self.assertEqual(facts["inputs"][0]["esp"], "NOVACORE.EFI")
+            self.assertEqual(facts["wait"]["waited_seconds"], 2135 * 5.0)
+            self.assertIn("guest_stopped_after_seconds", facts["wait"])
+
+    def test_a_missing_directory_is_reported_not_raised(self):
+        facts = ev.read_run(Path("/definitely-absent-12345"))
+        self.assertFalse(facts["readable"])
+        self.assertIn("error", facts)
+
+    def test_the_reader_never_writes(self):
+        source = Path(ev.__file__).read_text()
+        for forbidden in ("open(", ".write_text", ".write_bytes", "shutil",
+                          "os.remove", "unlink"):
+            with self.subTest(token=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    @unittest.skipUnless(TRIAL05_PRODUCER.is_dir(),
+                         "the archived A8 evidence is not on this machine")
+    def test_the_archived_trial05_run_says_what_the_diagnosis_says(self):
+        facts = ev.read_run(TRIAL05_PRODUCER)
+        self.assertTrue(facts["readable"])
+        # The guest completed sixteen batches and stopped in the LOWER phase
+        # of the seventeenth, with no terminal marker and no firmware return.
+        self.assertEqual(facts["serial"]["batches_completed"], 16)
+        self.assertEqual(facts["serial"]["stopped_in"], "LOWER")
+        self.assertEqual(facts["serial"]["last_line"],
+                         "NG_NOVA_BATCH_LOWER_BEGIN 16")
+        self.assertIsNone(facts["serial"]["terminal_marker"])
+        self.assertFalse(facts["boot"]["pass_"])
+        self.assertFalse(facts["boot"]["firmware_return"])
+        self.assertEqual(facts["boot"]["exit_code"], 0)
+        self.assertEqual(facts["boot"]["shutdown"], "hmp")
+        self.assertFalse(facts["boot"]["forced"])
+        # The RAM guard never tripped, and the transport waited its whole
+        # budget: the guest was gone long before the transport gave up.
+        self.assertFalse(facts["transport"]["ram_tripped"])
+        self.assertEqual(facts["transport"]["timeout"], 10800)
+        self.assertGreater(facts["wait"]["dead_wait_seconds"], 3600)
+        self.assertLess(facts["wait"]["guest_stopped_after_seconds"], 3600)
+
+    @unittest.skipUnless(TRIAL03_PRODUCER.is_dir(),
+                         "the archived A8 evidence is not on this machine")
+    def test_the_earlier_run_was_still_working_when_its_deadline_hit(self):
+        # The same reader on the run that reached nineteen batches: there,
+        # the guest was still writing when the deadline arrived.
+        facts = ev.read_run(TRIAL03_PRODUCER)
+        self.assertEqual(facts["serial"]["batches_completed"], 19)
+        self.assertEqual(facts["serial"]["stopped_in"], "OBJECT")
+        self.assertLess(facts["wait"]["dead_wait_seconds"], 600)
+
+    @unittest.skipUnless(TRIAL05_PRODUCER.is_dir(),
+                         "the archived A8 evidence is not on this machine")
+    def test_the_archived_run_used_the_watchdog_fixed_host(self):
+        # The host of the failing run is the very image the watchdog proof
+        # certified: the firmware watchdog was already neutralised there.
+        facts = ev.read_run(TRIAL05_PRODUCER)
+        digests = {item["esp"]: item["sha256"] for item in facts["inputs"]}
+        self.assertEqual(digests["EFI/BOOT/BOOTX64.EFI"],
+                         "9b3509ec28ca705fdaec2c95e2221d28d2f8793cb7fcc308986899c94b57dad2")
+        proof = ARCHIVE_ROOT / "watchdog-20261021" / "result.json"
+        if proof.is_file():
+            self.assertEqual(json.loads(proof.read_text())["normal_host_sha256"],
+                             digests["EFI/BOOT/BOOTX64.EFI"])
 
 
 if __name__ == "__main__":

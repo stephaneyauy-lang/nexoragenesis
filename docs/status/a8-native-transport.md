@@ -21,5 +21,10 @@ The transport looks for the two pinned S0 producers in `legacy/ntasm-s0/fixed-po
 ## Remaining work
 
 - Verify monitor exchange and cleanup with one bounded live QEMU run.
-- Diagnose the original guest shutdown; detecting it is not fixing its cause.
+- The guest shutdown of trial 05 is still unexplained. What the archived
+  evidence does establish, and what it refutes, is in
+  [a8-trial05-shutdown.md](a8-trial05-shutdown.md): the firmware watchdog is
+  refuted for that run, the guest stopped mid-batch at t+2074 s, and the
+  transport then waited 8601 s for a guest that was already gone. The cause
+  is not established; detecting it is not fixing its cause.
 - Reconcile native-build dependencies with the reorganized source tree, then prove the complete A8 contract before integrating the normal build.

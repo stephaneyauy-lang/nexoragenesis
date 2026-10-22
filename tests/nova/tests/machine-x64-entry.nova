@@ -1,0 +1,106 @@
+module machine_x64_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import ntasm_lexer;
+import ntir;
+import machine_ir;
+import machine_x64;
+import ir_image;
+
+// The C-callable entry for the Machine IR consumer. One entry, several modes,
+// and the split between them is the point: `ntir_out` holds the NTIR image and
+// `out` holds the Machine IR image, so a caller can damage one and drive the
+// other, and a refusal at the CHECKER and a refusal at the ENCODER are two
+// different facts a gate can tell apart.
+//
+//   mode 0  parse, ntir.build, machine_ir.lower, machine_ir.verify, then
+//           machine_x64.constraints. Nothing is emitted. report[0]=records,
+//           [1]=values, [2]=executable count, [3]=0.
+//   mode 1  mode 0, then machine_x64.emit_text into `text`. length[0] is the
+//           byte count and is written ONLY when the emission succeeded.
+//   mode 2  parse and ntir.build ONLY, so a caller can damage the NTIR image.
+//   mode 3  machine_ir.lower over the NTIR image already in `ntir_out`, no
+//           parse, then machine_x64.constraints. The absence of a parse is the
+//           proof that the checker reads the IR and not the source.
+//   mode 4  mode 3 without the check, so a caller may damage the Machine IR
+//           image and then check or emit it with mode 5 or 6.
+//   mode 5  machine_x64.constraints over the image already in `out`.
+//   mode 6  machine_x64.emit_text over the image already in `out`.
+//   mode 7  machine_ir.serialize over the image already in `out`, so a caller
+//           can print the IR the consumer was given.
+//
+// A signature written on one line stops parsing when the line gets long and the
+// error lands far from the cause, so this one is split in two.
+export fn main(source:buf<u8>,mode:u64,index:u64,ntir_out:buf<u64>,
+        ntir_count:u64,out:buf<u64>,out_count:u64,text:buf<u8>,
+        text_length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<32 || len(text_length)<1 { return 800; }
+    report[0]=0;report[1]=0;report[2]=0;report[3]=0;
+    text_length[0]=0;
+    if mode==7 {
+        if len(out)<machine_ir.HEADER_WORDS() { return 800; }
+        return machine_ir.serialize(out,out[3],text,text_length);
+    }
+    if mode==5 {
+        if len(out)<machine_ir.HEADER_WORDS() { return 800; }
+        return machine_x64.constraints(out,out[3],report);
+    }
+    if mode==6 {
+        if len(out)<machine_ir.HEADER_WORDS() { return 800; }
+        return machine_x64.emit_text(out,out[3],text,text_length,report);
+    }
+    if mode==8 {
+        // The OBJECT, not the text: machine_x64.build_object over the image
+        // already in `out`. `source` is needed because a `mir_symbol` record
+        // carries a byte SPAN and not the bytes, exactly as machine_ir records
+        // it: the name of a symbol is a range of the source text.
+        if len(out)<machine_ir.HEADER_WORDS() { return 800; }
+        return machine_x64.build_object(out,out[3],source,text,text_length,report);
+    }
+    if mode==3 || mode==4 {
+        if len(ntir_out)<8 { return 800; }
+        let mut lowered:u64=machine_ir.lower(source,ntir_out,ntir_out[3],out,out_count,report);
+        if lowered!=0 { return lowered; }
+        if mode==4 { report[0]=out[3];report[1]=out[6];report[2]=out[7];return 0; }
+        let mut verdict:u64=machine_ir.verify(out,out[3],report);
+        if verdict!=0 { return verdict; }
+        return machine_x64.constraints(out,out[3],report);
+    }
+    if len(ntir_out)<ntir.HEADER_WORDS() { return 800; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree); return 800; }
+    if ntir_count<ntir.HEADER_WORDS() { ntasm_ast.release(tree); return 800; }
+    let mut built:u64=ntir.build(source,tree,ntir_out,ntir_count);
+    if built!=0 { ntasm_ast.release(tree); return built; }
+    if mode==2 {
+        report[0]=ntir_out[3];report[1]=ntir_out[7];report[2]=0;report[3]=0;
+        ntasm_ast.release(tree);
+        return 0;
+    }
+    if out_count<machine_ir.HEADER_WORDS() { ntasm_ast.release(tree); return 800; }
+    let mut lowered:u64=machine_ir.lower(source,ntir_out,ntir_out[3],out,out_count,report);
+    if lowered!=0 { ntasm_ast.release(tree); return lowered; }
+    let mut verdict:u64=machine_ir.verify(out,out[3],report);
+    if verdict!=0 { ntasm_ast.release(tree); return verdict; }
+    if mode==0 {
+        let mut checked:u64=machine_x64.constraints(out,out[3],report);
+        if checked!=0 { ntasm_ast.release(tree); return checked; }
+        let mut saved0:u64=report[0];
+        let mut saved2:u64=report[2];
+        report[0]=out[3];report[1]=out[6];report[2]=saved2;report[3]=0;
+        let mut unused:u64=saved0;
+        ntasm_ast.release(tree);
+        return 0;
+    }
+    if mode==1 {
+        let mut emitted:u64=machine_x64.emit_text(out,out[3],text,text_length,report);
+        ntasm_ast.release(tree);
+        if emitted!=0 { return emitted; }
+        let mut keep:u64=text_length[0];
+        report[0]=out[3];report[1]=out[6];report[2]=keep;report[3]=0;
+        return 0;
+    }
+    ntasm_ast.release(tree);
+    return 800;
+}

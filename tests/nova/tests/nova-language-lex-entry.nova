@@ -1,0 +1,22 @@
+module nova_language_lex_entry;
+import nova_language_lex;
+
+// LOT 139. The C bootstrap's entry point for the Nova language lexer.
+//
+// THREE parameters, and the count is not a style choice: `buf<u8>` crosses
+// the boundary as TWO slots, so this signature is five flat slots, and the
+// host refuses any other count. Measured on this tree, 2026-10-03, by
+// sweeping the count from 1 to 16 against this exact entry: argc 5 is the
+// only value that runs (err=0), and every other value 1..4 and 6..16 is
+// refused with NV2_ARGUMENT (10) before the body executes. An earlier version
+// of the harness packed sixteen slots as the brief suggested and read that
+// refusal as "the Nova module is broken"; the sweep is what showed it was the
+// CALL that was wrong.
+//
+// Two modes, selected by the last slot:
+//   mode 0  scan(source,out): lex the buffer and report the eight bits.
+//   mode 1  table(out):        copy the eight-keyword table out, byte per word.
+export fn main(source:buf<u8>,out:buf<u64>,mode:u64)->u64 {
+    if mode==1 { return nova_language_lex.keyword_read_back(out,2); }
+    return nova_language_lex.scan(source,out);
+}

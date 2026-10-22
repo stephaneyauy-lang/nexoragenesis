@@ -1,0 +1,64 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line,golden_hex
+instructions-reg,IR-B0,file,legacy/ntasm-s0/instructions-reg/IR-B0.ntasm,98,a7663e8d9bc77ae713581a89a9a0480f9d941202271d7fb16785d978a8fb6514,NG_S0_T12_OK,90
+instructions-reg,IR-B1,file,legacy/ntasm-s0/instructions-reg/IR-B1.ntasm,98,4f748fa2c3d4870099bfce58ecfa59576ce1620d9912a070d516582fa342582b,NG_S0_T12_OK,c3
+instructions-reg,IR-B2,file,legacy/ntasm-s0/instructions-reg/IR-B2.ntasm,103,64fc3ed824a626972bf2ace644b4d5ebf9fe43c84f786e0d1e2841949843002b,NG_S0_T12_OK,50
+instructions-reg,IR-B3,file,legacy/ntasm-s0/instructions-reg/IR-B3.ntasm,103,156892535db191a73f1462971e4769eb6268b84ddb8b6d7d42ee99cffd337e59,NG_S0_T12_OK,4157
+instructions-reg,IR-B4,file,legacy/ntasm-s0/instructions-reg/IR-B4.ntasm,102,a35fc143c15b04ce9a2b34e08917c5f61c25e617344651f53f8794e6162c6cc9,NG_S0_T12_OK,5d
+instructions-reg,IR-B5,file,legacy/ntasm-s0/instructions-reg/IR-B5.ntasm,102,86ca7983131279a438732af0db10510629b6cef84875fb9bdc45e6a4e33f843e,NG_S0_T12_OK,415c
+instructions-reg,IR-B6,file,legacy/ntasm-s0/instructions-reg/IR-B6.ntasm,103,7250255d171cc13613eec8aea6eba6f5bc3a344153d9d8c420b6cc51540dc345,NG_S0_T12_OK,ffd0
+instructions-reg,IR-B7,file,legacy/ntasm-s0/instructions-reg/IR-B7.ntasm,103,d051c7ad8bd5ec73208ee9051e6e4e892042276725d1d73e61a0fdb615242b3b,NG_S0_T12_OK,41ffd2
+instructions-reg,IR-M00,file,legacy/ntasm-s0/instructions-reg/IR-M00.ntasm,107,dc672c773b4991a0f861b6dce1c4d8540a0ff08925171e78b2d72f3525f3f308,NG_S0_T12_OK,4889f8
+instructions-reg,IR-M01,file,legacy/ntasm-s0/instructions-reg/IR-M01.ntasm,106,d6327fabd809bce515b56bf5307d2d3a6f5b1a5218c2646d7f85a886ce62d9c6,NG_S0_T12_OK,4c89c1
+instructions-reg,IR-M02,file,legacy/ntasm-s0/instructions-reg/IR-M02.ntasm,106,37923595b3cb194ac75f5e96c2c4ae3e2db22c1dc1326669317b7c7458a600d3,NG_S0_T12_OK,4c89ca
+instructions-reg,IR-M03,file,legacy/ntasm-s0/instructions-reg/IR-M03.ntasm,107,7b2c3ab16f71d1968b1303889b0b2bee481e19abd4c059bdf576b59bf0ef94e8,NG_S0_T12_OK,4c89d3
+instructions-reg,IR-M04,file,legacy/ntasm-s0/instructions-reg/IR-M04.ntasm,107,32a6da8cc55b3fcaa1a746c8c865bb3ab0751f06f41d30648997418141a84402,NG_S0_T12_OK,4c89dc
+instructions-reg,IR-M05,file,legacy/ntasm-s0/instructions-reg/IR-M05.ntasm,107,e715c41e7c51591d5caed34ed89bc2925722f7039e9d712b437470e2a7455e53,NG_S0_T12_OK,4c89e5
+instructions-reg,IR-M06,file,legacy/ntasm-s0/instructions-reg/IR-M06.ntasm,107,fd4dc34c96ef52b7ddd532741371fcfc3e8c2129f486448beec6aebe53d439d2,NG_S0_T12_OK,4c89ee
+instructions-reg,IR-M07,file,legacy/ntasm-s0/instructions-reg/IR-M07.ntasm,107,afc239bc70c69873350552d91935858f7b4d3b2142561e87a0e25de5a9ea7939,NG_S0_T12_OK,4c89f7
+instructions-reg,IR-M08,file,legacy/ntasm-s0/instructions-reg/IR-M08.ntasm,106,278d710f00c89061144ef66280a4b929a9e2538760a5dd737742a59e17ce7cdf,NG_S0_T12_OK,4d89f8
+instructions-reg,IR-M09,file,legacy/ntasm-s0/instructions-reg/IR-M09.ntasm,106,39fd4f6e4100e05e0877317512524a20a13710a4a957839f49e568a01bb53146,NG_S0_T12_OK,4989c1
+instructions-reg,IR-M10,file,legacy/ntasm-s0/instructions-reg/IR-M10.ntasm,107,135890393462c0e74cd3059767ecbdd8eab854f2f889e104ff98df771ec30a1f,NG_S0_T12_OK,4989ca
+instructions-reg,IR-M11,file,legacy/ntasm-s0/instructions-reg/IR-M11.ntasm,107,19e4ddf2460ffc09b647e0c382e098d390bbab6aacccb6ad29d177b8e2461e6d,NG_S0_T12_OK,4989d3
+instructions-reg,IR-M12,file,legacy/ntasm-s0/instructions-reg/IR-M12.ntasm,107,e9bbecebf4b7f15841b6955b408430765aa67e4576ea3fba2f051d674897c630,NG_S0_T12_OK,4989dc
+instructions-reg,IR-M13,file,legacy/ntasm-s0/instructions-reg/IR-M13.ntasm,107,078b211f8d055b03aa6f345b8a5491e6d6ab5c03723ffc70e06858bdcfb40a90,NG_S0_T12_OK,4989e5
+instructions-reg,IR-M14,file,legacy/ntasm-s0/instructions-reg/IR-M14.ntasm,107,c0fb88d85a8c57d0e7872e4e2b78c5f1866bffe4bc57f30babadbcbce408551a,NG_S0_T12_OK,4989ee
+instructions-reg,IR-M15,file,legacy/ntasm-s0/instructions-reg/IR-M15.ntasm,107,479a072da146df6626edebc46f85e5fc4478bfb308c5ad4c68100f6b56ecee70,NG_S0_T12_OK,4989f7
+instructions-reg,IR-V0,file,legacy/ntasm-s0/instructions-reg/IR-V0.ntasm,105,0f0e0b1a14158120d934be07afd158a7c23773672760ae65da251e41d32f937c,NG_S0_T12_OK,48b80000000000000000
+instructions-reg,IR-V1,file,legacy/ntasm-s0/instructions-reg/IR-V1.ntasm,120,03e83ed13123fd4ae89d075feb3bb57827a7bd71eb7c1d9664879646abce45d4,NG_S0_T12_OK,49b8efcdab8967452301
+instructions-reg,IR-V2,file,legacy/ntasm-s0/instructions-reg/IR-V2.ntasm,106,cebfe16ca04467462166d17a765743f869b8af60357c138018f8d68687af31cd,NG_S0_T12_OK,49bfffffffffffffffff
+instructions-reg,IR-V3,file,legacy/ntasm-s0/instructions-reg/IR-V3.ntasm,124,cedf452e1a2c90f39c1e3dbafdee824c03d2db2288109d89db15d3db19697529,NG_S0_T12_OK,48b9ffffffffffffffff
+instructions-reg,IR-A0,file,legacy/ntasm-s0/instructions-reg/IR-A0.ntasm,106,4a53598077b823d44e8a85b02a4c1d7992bf55bdf81798aae2c1be2ba3ab5bb3,NG_S0_T12_OK,4d01d1
+instructions-reg,IR-I0,file,legacy/ntasm-s0/instructions-reg/IR-I0.ntasm,114,73f92638241fdc3139dda2a96a9eabb64c810153c703ed68a56842e4cbeae408,NG_S0_T12_OK,4981c100000080
+instructions-reg,IR-A1,file,legacy/ntasm-s0/instructions-reg/IR-A1.ntasm,106,b3a9a51ae082cfa696f2b429f3b8b7f99d8e7a656e80fa28074be91bea0853f1,NG_S0_T12_OK,4d29d1
+instructions-reg,IR-I1,file,legacy/ntasm-s0/instructions-reg/IR-I1.ntasm,114,1467201d36619ce89005f47a50bb88ba7ebbd12cc13a9055317e028bd2bc3467,NG_S0_T12_OK,4981e900000080
+instructions-reg,IR-A2,file,legacy/ntasm-s0/instructions-reg/IR-A2.ntasm,106,7ad1339afa58ad97f5ee2694268d5d9181ffa40006b21ffbe789a4b3b0bab9b4,NG_S0_T12_OK,4d21d1
+instructions-reg,IR-I2,file,legacy/ntasm-s0/instructions-reg/IR-I2.ntasm,114,fbc67196515fdc56792729a34d360217fc291947d11c090b71b61b7ab6411a13,NG_S0_T12_OK,4981e100000080
+instructions-reg,IR-A3,file,legacy/ntasm-s0/instructions-reg/IR-A3.ntasm,105,7a987b4b48e5e63a19c79095f67ffb0e3386049ec61ffe970c4bf5f4c44a3803,NG_S0_T12_OK,4d09d1
+instructions-reg,IR-I3,file,legacy/ntasm-s0/instructions-reg/IR-I3.ntasm,113,63c863c041cd33e8adf4638710355f569e5af0ed9f4118c4e4211aa4eef0fa1e,NG_S0_T12_OK,4981c900000080
+instructions-reg,IR-A4,file,legacy/ntasm-s0/instructions-reg/IR-A4.ntasm,106,a6296ef6d49975ad5e800023e294ddf8d3298b016a8bf30f763dc1a160f4527e,NG_S0_T12_OK,4d31d1
+instructions-reg,IR-I4,file,legacy/ntasm-s0/instructions-reg/IR-I4.ntasm,114,48c7d42ccc6dcefdd6e9f8e927a214708e76595c6dce88738ae75cd3e6f2f09a,NG_S0_T12_OK,4981f100000080
+instructions-reg,IR-A5,file,legacy/ntasm-s0/instructions-reg/IR-A5.ntasm,106,83726036cb48ff144b1c2aa3d926617dd819f597f102f1ed1a12f31d38f5edea,NG_S0_T12_OK,4d39d1
+instructions-reg,IR-I5,file,legacy/ntasm-s0/instructions-reg/IR-I5.ntasm,114,ecad8a064323e06b7f9554f64ad958c63afdc02f6aaa129d3ac608610e6bd9e7,NG_S0_T12_OK,4981f900000080
+instructions-reg,IR-T0,file,legacy/ntasm-s0/instructions-reg/IR-T0.ntasm,108,3f5b3ecb0eb4dedd12ccccd9c68d059328e0a9788cfad77ce64bd472edc8725f,NG_S0_T12_OK,4c85eb
+instructions-reg,IR-S0,file,legacy/ntasm-s0/instructions-reg/IR-S0.ntasm,105,ec9499e0ee02e6255a54e930c0e1ebdcb30ddc9fba84bff3b04ab9b7417fceaf,NG_S0_T12_OK,49c1e03f
+instructions-reg,IR-S1,file,legacy/ntasm-s0/instructions-reg/IR-S1.ntasm,105,0573a5e8679e215c5e03666eddf0e304fb1f773a843129eef76191119357ef59,NG_S0_T12_OK,49c1ef01
+instructions-reg,IR-S2,file,legacy/ntasm-s0/instructions-reg/IR-S2.ntasm,105,ad2ab787627f45fdec46c1678cd250f18df81c540a254c34ce8c88434006bf77,NG_S0_T12_OK,48c1e000
+instructions-reg,IR-U0,file,legacy/ntasm-s0/instructions-reg/IR-U0.ntasm,110,e4d4dbb832da558f737834ca26fe101bc47f3420835d849b5069c16721a1169b,NG_S0_T12_OK,4d69c1feffffff
+instructions-reg,IR-K0,file,legacy/ntasm-s0/instructions-reg/IR-K0.ntasm,118,aa0cadf9c01bbd9662f2e1c6c1d2dd803cef4ae21b5957564d57dabdfa879316,NG_S0_T12_OK,4881c0ffffffff
+instructions-reg,IR-R00,file,legacy/ntasm-s0/instructions-reg/IR-R00.ntasm,105,95e664bcf66616e58c4e25b56b063b8afe2a667dd0cafdcc548e01b2d822789e,NGS0 E400 L0006 C0005 O00000040,
+instructions-reg,IR-R01,file,legacy/ntasm-s0/instructions-reg/IR-R01.ntasm,107,730acc3eb2cae30cdf737b473ecef11141a0ebdcba68a2649a4e218ea1c54f5d,NGS0 E400 L0006 C000A O00000045,
+instructions-reg,IR-R02,file,legacy/ntasm-s0/instructions-reg/IR-R02.ntasm,102,94fa814f31cd1b7086346eb2828ff94ca21f3966e629027bccfe21a396d63e30,NGS0 E201 L0006 C0008 O00000043,
+instructions-reg,IR-R03,file,legacy/ntasm-s0/instructions-reg/IR-R03.ntasm,106,778359a1fe2694e8181912314839d8b9c9de2aef22e7a3cacf6b014ad751312f,NGS0 E201 L0006 C0009 O00000044,
+instructions-reg,IR-R04,file,legacy/ntasm-s0/instructions-reg/IR-R04.ntasm,102,d26445b8a673a16c050e01656b7f0c7d3db303dff2e3d6ae3c21995af9cbe3a7,NGS0 E201 L0006 C0005 O00000040,
+instructions-reg,IR-R05,file,legacy/ntasm-s0/instructions-reg/IR-R05.ntasm,108,0d34d8ad1cc2957ad441c4fa9d083b0eba89222ee4a97f9a2b83d18cc9d07228,NGS0 E201 L0006 C0009 O00000044,
+instructions-reg,IR-R06,file,legacy/ntasm-s0/instructions-reg/IR-R06.ntasm,114,80fd50bb5e83083b162f6f119917951bd80b5eea2f9c14ae622a6f9b3afa651b,NGS0 E401 L0006 C000A O00000045,
+instructions-reg,IR-R07,file,legacy/ntasm-s0/instructions-reg/IR-R07.ntasm,115,808612005724adf08c178e068c0a7b6c543367110cc052de7c4a5d11c325c3ae,NGS0 E401 L0006 C000A O00000045,
+instructions-reg,IR-R08,file,legacy/ntasm-s0/instructions-reg/IR-R08.ntasm,106,d602c3b9a74a420e9a1b513621e588c647c85c8774cbbc3945c5775ae73a3815,NGS0 E401 L0006 C000A O00000045,
+instructions-reg,IR-R09,file,legacy/ntasm-s0/instructions-reg/IR-R09.ntasm,106,e288596e0c5df6c26b2939d9c8be6180291c6f33fa85168cb4889b7fd1d4f09a,NGS0 E401 L0006 C000A O00000045,
+instructions-reg,IR-R10,file,legacy/ntasm-s0/instructions-reg/IR-R10.ntasm,107,def29e126b821aec46e649bd675e5149b1e5d2fe025607c9f2e0319005f6be82,NGS0 E400 L0006 C000A O00000045,
+instructions-reg,IR-R11,file,legacy/ntasm-s0/instructions-reg/IR-R11.ntasm,111,929740ea3bc704e70b060546897aa1958ea2352835d1a1d3c52c44a70efd8b93,NGS0 E301 L0006 C000A O00000045,
+instructions-reg,IR-R12,file,legacy/ntasm-s0/instructions-reg/IR-R12.ntasm,113,5610b2260aa2003f832b80a46f85a0b81f5db4871e1b846a100c5009d5ab2399,NGS0 E400 L0006 C0006 O00000041,
+instructions-reg,IR-R13,file,legacy/ntasm-s0/instructions-reg/IR-R13.ntasm,109,338986839ca0f19ffb6634142eca53d21fdae2a1e114561c09969fe58be5b792,NGS0 E400 L0006 C000A O00000045,
+instructions-reg,IR-R14,file,legacy/ntasm-s0/instructions-reg/IR-R14.ntasm,108,659e9a70221ff7b302c1a939e30c22e545b5e3f2d28a7bc44db4a4ceeb6f77df,NGS0 E201 L0006 C000E O00000049,
+instructions-reg,IR-R15,file,legacy/ntasm-s0/instructions-reg/IR-R15.ntasm,106,c59ca7f282b92090504d4313745fe51c406d000a0b750f7566339a49a00926f4,NGS0 E201 L0006 C000A O00000045,
+instructions-reg,IR-R16,file,legacy/ntasm-s0/instructions-reg/IR-R16.ntasm,98,ee9b9689979b48bf96be669c472a2d1fba9aa0b8ec2fa984a780d3f6f8461b19,NGS0 E400 L0006 C0001 O0000003C,

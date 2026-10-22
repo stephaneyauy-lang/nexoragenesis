@@ -1,0 +1,75 @@
+module comptime_entry;
+import ntasm_ast;import ntasm_parser;import ntasm_nxo;import x64_lower_nxo;import constant_eval;
+
+// Lot 30, `comptime` reel. Two modes over one product path.
+//
+// MODE 0 — THE PRODUCT PATH. x64_lower_nxo.build_function_bodies, the entry
+// the shipped lowering uses (x64_lower_nxo_pe.nova:108), over the caller's own
+// source. out[0]=object length in bytes, out[1..]=the object bytes packed eight
+// per u64 word. The caller reads those bytes back with nt_object_read,
+// materializes them with nt_object_materialize and RUNS them. Nothing here
+// computes a value for the harness: the only number that reaches the caller is
+// the object the producer emitted.
+//
+// MODE 1 — THE EVALUATOR'S OWN ANSWER, and it is a SECOND MODE rather than
+// part of mode 0 on purpose. out[0]=constant_eval.evaluate's status, out[1]=the
+// negative flag, out[2]=the magnitude. This is what makes the refusal table
+// legible: the product path collapses several distinct evaluator statuses onto
+// one answer, and a gate that only saw the product answer could not tell a
+// nonconstant expression from an out of range one. Mode 1 names WHICH, mode 0
+// names WHAT THE PRODUCT DID WITH IT.
+//
+// THE TWO MODES SHARE ONE PARSE AND ONE TREE SHAPE on purpose, so the refusal
+// table compares two answers about the same source and not two sources.
+
+fn put64(out:buf<u64>,at:u64,value:u64)->u64{out[at]=value;return 0;}
+
+export fn main(source:buf<u8>,mode:u64,out:buf<u64>)->u64 {
+    let zero:u64=0;
+    if mode==1 {
+        if len(out)<4{return 800;}
+        out[0]=zero;out[1]=zero;out[2]=zero;
+        let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+        if tree.ok==false{ntasm_ast.release(tree);return 800;}
+        // The operand of the single `return` in the body, found by the node
+        // kind the parser gives a return statement. Not by spelling: a source
+        // that declares no such statement answers 800 rather than evaluating
+        // a node the caller did not name.
+        let mut id:u64=1;let mut operand:u64=0;
+        while id<=tree.node_count {
+            let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+            if n.kind==29&&n.first_child!=0{operand=n.first_child;break;}
+            id=id+1;
+        }
+        if operand==0{ntasm_ast.release(tree);return 800;}
+        let r:constant_eval.Value=constant_eval.evaluate(tree,operand);
+        ntasm_ast.release(tree);
+        let one:u64=1;
+        if r.status!=zero{out[0]=r.status;return zero;}
+        if r.negative{out[1]=one;out[2]=zero-r.magnitude;}else{out[1]=zero;out[2]=r.magnitude;}
+        return zero;
+    }
+    if len(out)<2{return 800;}
+    out[0]=zero;out[1]=zero;
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false{ntasm_ast.release(tree);return 800;}
+    let written:ntasm_nxo.WriteResult=x64_lower_nxo.build_function_bodies(source,tree,1,3);
+    ntasm_ast.release(tree);
+    let bytes:buf<u8>=written.bytes;
+    if written.code!=zero{rt_free(runtime(),bytes);return written.code;}
+    let size:u64=len(bytes);
+    let words:u64=(size+7)/8;
+    if len(out)<2+words{rt_free(runtime(),bytes);return 800;}
+    out[0]=size;
+    let mut w:u64=0;
+    while w<words{
+        let mut acc:u64=0;let mut k:u64=0;
+        while k<8{
+            let at:u64=w*8+k;
+            if at<size{acc=acc+(u64(bytes[at])<<(k*8));}
+            k=k+1;
+        }
+        out[1+w]=acc;w=w+1;
+    }
+    rt_free(runtime(),bytes);return zero;
+}

@@ -1,0 +1,6 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+diagnostic-priority,ENTRY-absent,file,legacy/ntasm-s0/diagnostic-priority/ENTRY-absent.ntasm,132,a00ccd251f3acb85a13ef03ab53468b500d9bd032a0241fcbeae19fe429c433a,NGS0 E302 L0003 C0007 O0000001E
+diagnostic-priority,ENTRY-data,file,legacy/ntasm-s0/diagnostic-priority/ENTRY-data.ntasm,132,528c9481bf41a990e5da12aa008eed48cb6ecf79004a3e6e861ce87fb2eb3f13,NGS0 E302 L0003 C0007 O0000001E
+diagnostic-priority,ENTRY-padding,file,legacy/ntasm-s0/diagnostic-priority/ENTRY-padding.ntasm,153,a9503e8f0ca594490310b1c503be6b5c2493abe4526a44de81628402964112cb,NGS0 E302 L0003 C0007 O0000001E
+diagnostic-priority,ENTRY-forward,file,legacy/ntasm-s0/diagnostic-priority/ENTRY-forward.ntasm,135,c388a9da0165d280354f837ef81f9a5475db3e7868bbc4c1e9659ac7dd231434,NGS0 E301 L0005 C0005 O00000039
+diagnostic-priority,ENTRY-valid,file,legacy/ntasm-s0/diagnostic-priority/ENTRY-valid.ntasm,131,b4a27201c363f6fb5947a828289cd71db2b886a4447e6b7453b42a73923c26d5,NGS0 E301 L0006 C0005 O00000040

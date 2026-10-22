@@ -1,0 +1,29 @@
+module splice_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import validate;
+
+// The spliced tree, measured. One entry, one job: parse a module, run the
+// expansion stage, and report the shape of the tree the later passes are
+// handed. It exists because no pass of the pipeline can witness its own id
+// space, and validate.spliced_shape is the one export that can. See that
+// function for the ten words and what each of them means.
+//
+// The pipeline verdict itself is NOT read here: a gate that wants it asks
+// validate.validate through validate-entry.nova, so the number this gate
+// compares against the IR is the number the product publishes and not a
+// number this module recomputed.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<10 { return 800; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false {
+        let mut i:u64=0;
+        while i<10 { out[i]=0; i=i+1; }
+        out[0]=800;
+        return 800;
+    }
+    let code:u64=validate.spliced_shape(source,tree,out);
+    ntasm_ast.release(tree);
+    return code;
+}

@@ -1,0 +1,18 @@
+module app
+target x86_64-nexora-uefi
+comptime(fuel=16,call_depth=4,arena_bytes=262144,ast_nodes=256,expansion_depth=4,constant_bytes=64) {
+    return (5+3)*4;
+}
+import math.add as add: fn(in a:u64 @rcx,in b:u64 @rdx)->u64
+effects {}
+clobbers {}
+macro twice_plus(v:ast.expr)->ast.stmt {
+    return quote(stmt) { return add($v,$v); };
+}
+section .text {
+    export fn main()->u64
+    effects {}
+    clobbers {rax} {
+        expand twice_plus(21)
+    }
+}

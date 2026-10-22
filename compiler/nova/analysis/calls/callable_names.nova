@@ -1,0 +1,187 @@
+module callable_names;
+
+import ntasm_ast;
+
+// Node kinds: import 9, function declaration 18, comptime 11, macro 13,
+// quote 43.
+fn k_comptime()->u64 { return 11; }
+fn k_macro()->u64 { return 13; }
+fn k_quote()->u64 { return 43; }
+
+// --------------------------------------------------- the template exclusion
+// spec/ntasm/ntasm.md 13 develops a macro before the final verification of types
+// and contracts, so a comptime(11), a macro(13) and a quote(43) subtree is a
+// template and not code: what it spells is either replaced by an expansion
+// or refused by the expander, and never declared in the module. The scan
+// below is a flat node id sweep, so it has to be told where the templates
+// are: mask[id] is 1 for a node a template owns, and a function declaration
+// or an import belongs to this namespace only when its node is not masked.
+// Running the expansion first does not help, because a template that no
+// invocation developed stays in the tree, which is why the exclusion belongs
+// here and not in the caller.
+//
+// The mask is a whole pass of its own, done before the sweep below, and it
+// marks a template root together with everything under it, so it assumes
+// nothing about where a subtree sits in the id order: every root is found,
+// and each is marked in full before the sweep that consults the mask starts.
+// Marking is idempotent, so a nested root costs one compare and a cyclic
+// child chain terminates. The recursion is bounded by the depth of a template
+// subtree, a handful of levels, the same shape control_flow.nova already
+// walks recursively. Two locals and no buffer: this module shares a program
+// wide budget with the thirty nine other modules the diagnostics gate
+// compiles, and that budget is the next wall the tree is on.
+fn mask_below(tree:ntasm_ast.Tree,mask:buf<u64>,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 800; }
+    if mask[id]==1 { return 0; }
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    mask[id]=1;
+    let mut at:u64=n.first_child;
+    while at!=0 {
+        if at>tree.node_count { return 800; }
+        mask_below(tree,mask,at);
+        at=ntasm_ast.node_at(tree,at).next_sibling;
+    }
+    return 0;
+}
+fn template_mask(tree:ntasm_ast.Tree,mask:buf<u64>)->u64 {
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==k_comptime() || n.kind==k_macro() || n.kind==k_quote() {
+            let refused:u64=mask_below(tree,mask,id);
+            if refused!=0 { return refused; }
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// Byte-wise name comparison over the real source text with bounds.
+fn same_name(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Direct child of parent at the given ordinal, or 0 when the chain is invalid.
+//
+// THE "OR THE TREE IS INVALID" HALF WAS HERE AND WAS FALSE, and that is worth
+// writing down because the false half is what made this copy read as guarded.
+// MEASURED 2026-10-02 on this exact body with parent=0 and with
+// parent=node_count+1: there was NO entry guard, so both reached
+// ntasm_ast.node_at, which REFUSES the run --
+//   ntasm_ast.node_at: id is not a node (id=0, node_count=27)
+// -- instead of answering 0. A comment promising a 0 the code refuses to give
+// is worse than no comment: it tells the next reader the check is already in.
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);
+    let mut id:u64=p.first_child;
+    let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;
+        index=index+1;
+    }
+    if id>tree.node_count { return 0; }
+    return id;
+}
+
+// Name node id of a global callable: first child for a function
+// declaration, second child (the alias, after the qualified path) for
+// an import. Returns 0 when the tree does not carry a usable name.
+fn name_id(tree:ntasm_ast.Tree,kind:u64,decl_id:u64)->u64 {
+    if kind==18 { return child(tree,decl_id,0); }
+    if kind==9 { return child(tree,decl_id,1); }
+    return 0;
+}
+
+// Check the global callable namespace of an NTASM tree: function names
+// (kind 18, first child) and import aliases (kind 9, second child) must
+// be pairwise distinct byte strings. A declaration that a comptime(11), a
+// macro(13) or a quote(43) subtree owns is not a declaration of the module
+// and is neither counted nor compared.
+// Returns 0 on success, writing out[0]=functions, out[1]=imports,
+// out[2]=unique names. Returns 313 on a second global occurrence of the
+// same name (two identical aliases, or an alias equal to a function
+// name), writing the line and column of the second name to out[0..1].
+// Returns 800 with no write to out on an invalid tree, an invalid span
+// or child chain, or an output buffer shorter than three words. The
+// scratch, mask and stack buffers are always freed; neither source nor
+// tree is released.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    let n_import:u64=9;
+    let n_function:u64=18;
+    let entry_words:u64=2;
+    if tree.ok==false { return 800; }
+    if tree.node_count==0 { return 800; }
+    if len(out)<3 { return 800; }
+
+    let slots:u64=tree.node_count+1;
+    let scratch:buf<u64>=alloc(runtime(),tree.node_count*entry_words);
+    let mask:buf<u64>=alloc(runtime(),slots);
+    let mut i:u64=0;
+    while i<slots { mask[i]=0;i=i+1; }
+    let mut used:u64=0;
+    let mut imports:u64=0;
+    let mut functions:u64=0;
+    let mut code:u64=template_mask(tree,mask);
+    let mut dup_line:u64=0;
+    let mut dup_column:u64=0;
+
+    let mut id:u64=1;
+    while id<=tree.node_count && code==0 {
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if (node.kind==n_import || node.kind==n_function) && mask[id]!=1 {
+            let nid:u64=name_id(tree,node.kind,id);
+            if nid==0 { code=800; }
+            else {
+                let name:ntasm_ast.Node=ntasm_ast.node_at(tree,nid);
+                if name.start>name.end || name.end>len(source) { code=800; }
+                else {
+                    // Duplicate scan: global namespace, identical bytes.
+                    let mut j:u64=0;
+                    while j<used {
+                        let at:u64=j*entry_words;
+                        if same_name(source,scratch[at],scratch[at+1],
+                                     name.start,name.end) {
+                            code=313;
+                            dup_line=name.line;
+                            dup_column=name.column;
+                        }
+                        j=j+1;
+                    }
+                    if code==0 {
+                        let at:u64=used*entry_words;
+                        scratch[at]=name.start;
+                        scratch[at+1]=name.end;
+                        used=used+1;
+                        if node.kind==n_function { functions=functions+1; }
+                        else { imports=imports+1; }
+                    }
+                }
+            }
+        }
+        id=id+1;
+    }
+
+    if code==0 {
+        out[0]=functions;
+        out[1]=imports;
+        out[2]=functions+imports;
+    } else if code==313 && len(out)>=2 {
+        out[0]=dup_line;
+        out[1]=dup_column;
+    }
+    rt_free(runtime(),scratch);
+    rt_free(runtime(),mask);
+    return code;
+}

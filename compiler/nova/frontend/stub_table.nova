@@ -1,0 +1,2386 @@
+module stub_table;
+
+import ntasm_ast;
+import ntasm_nxo;
+import ntasm_nxo_pe;
+import ntasm_pe;
+import register_widths;
+
+// Structured stub declarations of spec/ntasm/ntasm.md section 11: the declaration
+// rules, and the generated-stub lowering that turns the typed AST into ordered
+// records plus an abstract body plan. Nothing here re-lexes the source and
+// nothing here concatenates NTASM text. Every value read is a parsed node and
+// every value produced is an integer record.
+//
+// The node words are read straight out of tree.node_words instead of through
+// ntasm_ast.node_at. That is deliberate and load bearing: a record returned by
+// value across a module boundary is a runtime allocation that this bootstrap
+// never reclaims, so a pass that reads every node through node_at exhausts the
+// runtime buffer table on a large tree. Direct word reads allocate nothing.
+// macro_expand and validate read the same buffer directly for the same reason.
+//
+// Node kinds: stub table 15, stub entry 16, name 90, qualified 91, dashed 92,
+// section name 93, literal 94, stub field 95, binding set 44, function
+// declaration 18, import 9, clobbers set 21.
+//
+// Entry child ordinals, fixed by parser.nova stub_table_decl: 0 the `stub`
+// name, 1 the integer key, 2 handler, 3 entry_abi, 4 exit_abi, 5 exit,
+// 6 frame, 7 bindings, 8 hardware_error_code, 9 save, 10 clobbers,
+// 11 stack_align, 12 swapgs, 13 interrupts, 14 section, 15 visibility,
+// 16 symbol. A stub field (95) always carries exactly one value child, which
+// is its FIRST child: an empty set or an empty binding set is a node with no
+// child of its own and would read as a missing field from the last child.
+//
+// Diagnostic families, both inside the Nova semantic band: 300 to 386.
+// The 365 this block used to name is CADUQUE, raised by 17.6 because the
+// macro hygiene band 370 to 386 was already published outside it. Only
+// 300 holds, the C oracle enum owning 300 to 303 (NTF_E_DUPLICATE, NAME,
+// IMPORT, TARGET) and Nova none of those four. Neither is used elsewhere.
+//   305 declaration refusal, reasons 1..23, documented on collect.
+//   306 lowering refusal, 1..3 on lower and 4..5 on plan_for, disjoint.
+//   800 UNANSWERABLE -- one name, for every site, and the rule that makes it one.
+// The clause this line used to carry, "the shared invalid-tree and short-output
+// refusal, as everywhere", named two shapes and claimed universality. The
+// claim is false in the direction that matters: the largest family of 800 is
+// neither. It is the caller-supplied IDENTIFIER that names nothing this module
+// can read -- `id==0`, `id>tree.node_count`, a `.kind` that is not the one the
+// query needs, a span that ends past `len(source)`. "as everywhere" was a
+// sentence about two sites written as a sentence about six hundred.
+// WHAT ALL OF THEM SHARE IS A POSTURE, NOT A CONDITION. This product will not
+// answer the request as it was posed, and it publishes no answer to it.
+// abi.nova says it in one sentence, at the place where the difference from a
+// verdict matters: "800 means the query was malformed, 0 means the answer is
+// no." That is the name -- not malformed-input, because a dangling id is not
+// malformed input, and not out-of-domain, because a short buffer is not out of
+// domain. The name has to be the posture, and the posture is what a caller can
+// actually observe, because 800 is the one code in this band that carries no
+// verdict to disagree with.
+// WHY ONE, AND NOT FIVE. The tree's own criterion is written in
+// nova_language_parse.nova, where 803 was held out of the 80x block on purpose:
+// "keeping it separate is what lets the gate tell 801 from 803". A split is
+// earned only when two refusals must stay distinguishable TO A CONSUMER, and no
+// consumer is owed that here -- 800 publishes no verdict, so there is nothing
+// downstream to branch on. The tree also already wrote the answer to the same
+// question at clobbers.nova, in code rather than in prose: one `if` carrying
+// `tree.ok==false`, `set_id==0`, `set_id>tree.node_count` and `len(out)<4`, and
+// one `return 800;` behind all four. Four different refusals, one number, and
+// that prologue is byte-identical in 14 modules.
+// WHAT IS LEFT IMPRECISE, STATED RATHER THAN FIXED. For the readers -- nxo,
+// pe_inspect, ntir_inspect -- 800 also covers "the BYTES you asked me to read
+// are malformed", where the caller's pointer was fine and the content was not.
+// UNANSWERABLE covers that too, and a caller who needs to separate "your
+// pointer is wrong" from "your bytes are wrong" still cannot. Where this tree
+// wants a distinction below a code it says so in the REASON slot, not in a new
+// number: 305 carries 1..23, 328 carries 1..7, and 800 already uses it at the
+// 24 `fail(env,800,reason,...)` sites of macro_expand. The honest residual is
+// therefore a reason vocabulary to be written across the band, not a code to
+// be minted -- and reasons do not change any emitted value.
+
+// Kind ids written in the emitted records.
+fn kind_interrupt()->u64 { return 1; }
+fn kind_syscall()->u64 { return 2; }
+
+// Plan opcodes. Three words per step: opcode, operand a, operand b.
+fn op_push()->u64 { return 1; }
+fn op_load_saved_rip()->u64 { return 2; }
+fn op_advance_saved_rip()->u64 { return 3; }
+fn op_store_saved_rip()->u64 { return 4; }
+fn op_pop()->u64 { return 5; }
+fn op_adjust_rsp()->u64 { return 6; }
+fn op_iretq()->u64 { return 7; }
+fn op_return_handler()->u64 { return 8; }
+
+// The saved RIP sits eight bytes above RSP for a same-CPL frame the CPU
+// pushed without an error code, and sixteen for the frame it pushed with one.
+// The error-code slot itself is eight bytes wide and is discarded before the
+// terminal transfer when the frame carried one.
+fn slot_bytes()->u64 { return 8; }
+fn scratch_rax()->u64 { return 1; }   // register_widths.family of rax
+fn family_rsp()->u64 { return 5; }    // register_widths.family of rsp
+
+// Per-entry record stride and the capacity of the record and save areas.
+fn record()->u64 { return 16; }
+fn capacity()->u64 { return 1024; }
+fn save_slots()->u64 { return 16; }
+
+// A vector indexes one IDT entry, so an interrupt key must fit eight bits.
+// The structured syscall table is bounded at the 512 entries the C reference
+// accepts, checked before the increment.
+fn vector_max()->u64 { return 255; }
+fn table_max()->u64 { return 512; }
+
+// A name count no real module reaches, used as the failure answer of the
+// global-name collector.
+fn failed()->u64 { return 18446744073709551615; }
+
+// Work area layout, one allocation per pass:
+//   [0] tables  [1] entries  [2] plan steps  [3] reserved zero
+//   record area: record() words per entry
+//   save area: save_slots() words per entry slot
+//   name area: three words per name, start, end and declaration id, zero for a
+//   name a generated stub introduced
+fn record_base()->u64 { return 4; }
+fn save_base()->u64 { return record_base()+record()*capacity(); }
+fn name_base(tree:ntasm_ast.Tree)->u64 {
+    return save_base()+save_slots()*capacity();
+}
+fn work_words(tree:ntasm_ast.Tree)->u64 {
+    return name_base(tree)+3*(tree.node_count+capacity())+8;
+}
+
+// --------------------------------------------------- direct node word reads
+
+fn nkind(tree:ntasm_ast.Tree,id:u64)->u64 { return tree.node_words[(id-1)*12]; }
+fn nfirst(tree:ntasm_ast.Tree,id:u64)->u64 {
+    return tree.node_words[(id-1)*12+8];
+}
+fn nlast(tree:ntasm_ast.Tree,id:u64)->u64 {
+    return tree.node_words[(id-1)*12+9];
+}
+fn nnext(tree:ntasm_ast.Tree,id:u64)->u64 {
+    return tree.node_words[(id-1)*12+10];
+}
+fn nstart(tree:ntasm_ast.Tree,id:u64)->u64 {
+    return tree.node_words[(id-1)*12+6];
+}
+fn nend(tree:ntasm_ast.Tree,id:u64)->u64 {
+    return tree.node_words[(id-1)*12+7];
+}
+fn nline(tree:ntasm_ast.Tree,id:u64)->u64 {
+    return tree.node_words[(id-1)*12+4];
+}
+fn ncolumn(tree:ntasm_ast.Tree,id:u64)->u64 {
+    return tree.node_words[(id-1)*12+5];
+}
+fn naux(tree:ntasm_ast.Tree,id:u64)->u64 {
+    return tree.node_words[(id-1)*12+11];
+}
+
+// 1 when the node carries a bounded span inside the source.
+fn text_ok(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+    if id==0 || id>tree.node_count { return false; }
+    let start:u64=nstart(tree,id);
+    let end:u64=nend(tree,id);
+    if start>end { return false; }
+    if end>len(source) { return false; }
+    return true;
+}
+
+// First child of a node, 0 when it has none.
+fn head(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let first:u64=nfirst(tree,id);
+    if first>tree.node_count { return 0; }
+    return first;
+}
+
+// Last child of a node, 0 when it has none.
+fn tail(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let last:u64=nlast(tree,id);
+    if last>tree.node_count { return 0; }
+    return last;
+}
+
+// Next sibling of a node, 0 at the end of the chain or out of range.
+fn sibling(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let next:u64=nnext(tree,id);
+    if next>tree.node_count { return 0; }
+    return next;
+}
+
+// Direct child of parent at the given ordinal, 0 when absent or out of range.
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let mut id:u64=head(tree,parent);
+    let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        id=sibling(tree,id);
+        index=index+1;
+    }
+    return id;
+}
+
+// Number of direct children of a node, 0 for an absent or broken chain.
+fn child_count(tree:ntasm_ast.Tree,id:u64)->u64 {
+    let mut count:u64=0;
+    let mut at:u64=head(tree,id);
+    while at!=0 {
+        count=count+1;
+        at=sibling(tree,at);
+    }
+    return count;
+}
+
+// ------------------------------------------------------------------ text
+
+// Byte-wise comparison of a source span against a constant word.
+fn same(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    if start>end || end>len(source) || (end-start)!=len(text) { return false; }
+    let mut i:u64=0;
+    while i<len(text) {
+        if source[start+i]!=text[i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Byte-wise comparison of two source spans.
+fn same_span(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// The value node of the stub field at the given entry ordinal. 0 when the
+// field, its value or the chain is missing.
+fn field_value(tree:ntasm_ast.Tree,entry:u64,ordinal:u64)->u64 {
+    let field_id:u64=child(tree,entry,ordinal);
+    if field_id==0 { return 0; }
+    if nkind(tree,field_id)!=95 { return 0; }
+    let value:u64=head(tree,field_id);
+    if value==0 { return 0; }
+    if tail(tree,field_id)!=value { return 0; }
+    return value;
+}
+
+// Name node of a global callable: first child of a function declaration,
+// second child, the alias, of an import.
+fn decl_name_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+    let kind:u64=nkind(tree,id);
+    if kind==18 { return child(tree,id,0); }
+    if kind==9 { return child(tree,id,1); }
+    return 0;
+}
+
+// The declared clobbers set of a declaration, 0 when it has none.
+fn decl_clobbers(tree:ntasm_ast.Tree,decl_id:u64)->u64 {
+    let mut at:u64=head(tree,decl_id);
+    while at!=0 {
+        if nkind(tree,at)==21 { return at; }
+        at=sibling(tree,at);
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------- name table
+
+// Collect every declared global name into the name area and return the
+// count, or failed() when a declaration carries no usable name. Collecting
+// the declared globals before any stub is what makes the duplicate-symbol rule
+// independent of the order of the two declarations in the file.
+fn collect_globals(source:buf<u8>,tree:ntasm_ast.Tree,work:buf<u64>)->u64 {
+    let mut used:u64=0;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let kind:u64=nkind(tree,id);
+        if kind==18 || kind==9 {
+            let name_id:u64=decl_name_id(tree,id);
+            if name_id==0 { return failed(); }
+            if nkind(tree,name_id)!=90 { return failed(); }
+            if text_ok(source,tree,name_id)==false { return failed(); }
+            used=name_append(tree,work,used,nstart(tree,name_id),
+                             nend(tree,name_id),id);
+        }
+        id=id+1;
+    }
+    return used;
+}
+
+// One-based index in the name area of the name spelled exactly start..end, or
+// zero when the area does not hold it. The comparison is over the bytes: the
+// same identifier spelled twice in one module is the same name.
+fn name_index(source:buf<u8>,tree:ntasm_ast.Tree,work:buf<u64>,used:u64,
+              start:u64,end:u64)->u64 {
+    let base:u64=name_base(tree);
+    let mut at:u64=0;
+    while at<used {
+        if same_span(source,work[base+at*3],work[base+at*3+1],start,end) {
+            return at+1;
+        }
+        at=at+1;
+    }
+    return 0;
+}
+
+// Append a name to the name area and answer the new count. A declaration id
+// of zero marks a name a generated stub introduced.
+fn name_append(tree:ntasm_ast.Tree,work:buf<u64>,used:u64,start:u64,end:u64,
+               decl:u64)->u64 {
+    let base:u64=name_base(tree);
+    let slot:u64=base+used*3;
+    work[slot]=start;
+    work[slot+1]=end;
+    work[slot+2]=decl;
+    return used+1;
+}
+
+// Declaration node of the name spelled start..end, 0 when the name was
+// introduced by a generated stub or is unknown.
+fn name_decl(source:buf<u8>,tree:ntasm_ast.Tree,work:buf<u64>,used:u64,
+             start:u64,end:u64)->u64 {
+    let base:u64=name_base(tree);
+    let index:u64=name_index(source,tree,work,used,start,end);
+    if index==0 { return 0; }
+    return work[base+(index-1)*3+2];
+}
+
+// ----------------------------------------------------------------- sorting
+
+// Insertion sort of one table's record range by ascending key. Stable, so a
+// table's canonical order is its numeric order and nothing else.
+fn sort_range(work:buf<u64>,base:u64,count:u64)->u64 {
+    let mut i:u64=1;
+    while i<count {
+        let mut j:u64=i;
+        while j>0 {
+            let here:u64=base+j*record();
+            let before:u64=base+(j-1)*record();
+            if work[here]<work[before] {
+                let mut k:u64=0;
+                while k<record() {
+                    let tmp:u64=work[before+k];
+                    work[before+k]=work[here+k];
+                    work[here+k]=tmp;
+                    k=k+1;
+                }
+                j=j-1;
+            } else { j=0; }
+        }
+        i=i+1;
+    }
+    return 0;
+}
+
+// Insertion sort of one save set into ascending register family, so the
+// generated prologue is canonical and independent of declaration order. The
+// shift moves every larger element one place up and the value lands where the
+// scan stopped, so the smallest family keeps its place.
+fn sort_families(work:buf<u64>,base:u64,count:u64)->u64 {
+    let mut i:u64=1;
+    while i<count {
+        let value:u64=work[base+i];
+        let mut j:u64=i;
+        while j>0 {
+            if work[base+j-1]>value {
+                work[base+j]=work[base+j-1];
+                j=j-1;
+            } else { break; }
+        }
+        work[base+j]=value;
+        i=i+1;
+    }
+    return 0;
+}
+
+// Integer spelled by the bytes start..end. 0 when the span is empty, is not
+// all decimal digits, or is wider than nine digits.
+fn digits(source:buf<u8>,start:u64,end:u64)->u64 {
+    if start>=end || end>len(source) { return 0; }
+    if end-start>9 { return 0; }
+    let mut value:u64=0;
+    let mut at:u64=start;
+    while at<end {
+        let byte:u64=source[at];
+        if byte<48 || byte>57 { return 0; }
+        value=value*10+(byte-48);
+        at=at+1;
+    }
+    return value;
+}
+
+// The interrupt handler policy advance_saved_rip_<N> yields the number of
+// bytes the handler advances the saved RIP. 0 for any other spelling, so an
+// unknown policy is refused instead of assumed to advance by two.
+fn handler_advance(source:buf<u8>,start:u64,end:u64)->u64 {
+    if start>end || end>len(source) { return 0; }
+    let prefix:buf<u8>="advance_saved_rip_";
+    if (end-start)<=len(prefix) { return 0; }
+    if same(source,start,start+len(prefix),prefix)==false { return 0; }
+    if source[start+len(prefix)]==48 { return 0; }
+    return digits(source,start+len(prefix),end);
+}
+
+// ------------------------------------------------------------ entry checks
+
+// Validate one stub entry against the section 11 rules of its kind and fill
+// its record. verdict[0..1] receive the line and column of the offending
+// node, verdict[2] the reason and verdict[3] the offending key or family.
+// Returns 0, 305 or 800, and writes the record only on success, so a refused
+// entry publishes nothing.
+fn scan_entry(source:buf<u8>,tree:ntasm_ast.Tree,entry:u64,kind_id:u64,
+              work:buf<u64>,slot:u64,names:u64,verdict:buf<u64>)->u64 {
+    let mut i:u64=0;
+    while i<4 { verdict[i]=0; i=i+1; }
+    verdict[0]=nline(tree,entry);
+    verdict[1]=ncolumn(tree,entry);
+    let key_id:u64=child(tree,entry,1);
+    if key_id==0 { return 800; }
+    if nkind(tree,key_id)!=94 { return 800; }
+    let key:u64=naux(tree,key_id);
+    verdict[3]=key;
+    if kind_id==kind_interrupt() && key>vector_max() {
+        verdict[2]=5;
+        return 305;
+    }
+
+    // The fifteen fields, in the fixed parser order.
+    let handler_id:u64=field_value(tree,entry,2);
+    let entry_abi_id:u64=field_value(tree,entry,3);
+    let exit_abi_id:u64=field_value(tree,entry,4);
+    let exit_id:u64=field_value(tree,entry,5);
+    let frame_id:u64=field_value(tree,entry,6);
+    let bindings_id:u64=field_value(tree,entry,7);
+    let error_id:u64=field_value(tree,entry,8);
+    let save_id:u64=field_value(tree,entry,9);
+    let clobbers_id:u64=field_value(tree,entry,10);
+    let align_id:u64=field_value(tree,entry,11);
+    let swapgs_id:u64=field_value(tree,entry,12);
+    let interrupts_id:u64=field_value(tree,entry,13);
+    let section_id:u64=field_value(tree,entry,14);
+    let visibility_id:u64=field_value(tree,entry,15);
+    let symbol_id:u64=field_value(tree,entry,16);
+    if handler_id==0 || entry_abi_id==0 || exit_abi_id==0 || exit_id==0
+       || frame_id==0 || bindings_id==0 || error_id==0 || save_id==0
+       || clobbers_id==0 || align_id==0 || swapgs_id==0 || interrupts_id==0
+       || section_id==0 || visibility_id==0 || symbol_id==0 { return 800; }
+    if nkind(tree,handler_id)!=91 || nkind(tree,entry_abi_id)!=92
+       || nkind(tree,exit_abi_id)!=92 || nkind(tree,exit_id)!=90
+       || nkind(tree,frame_id)!=91 || nkind(tree,bindings_id)!=44
+       || nkind(tree,error_id)!=90 || nkind(tree,save_id)!=95
+       || nkind(tree,clobbers_id)!=95 || nkind(tree,align_id)!=94
+       || nkind(tree,swapgs_id)!=90 || nkind(tree,interrupts_id)!=90
+       || nkind(tree,section_id)!=93 || nkind(tree,visibility_id)!=90
+       || nkind(tree,symbol_id)!=90 { return 800; }
+    if text_ok(source,tree,handler_id)==false
+       || text_ok(source,tree,entry_abi_id)==false
+       || text_ok(source,tree,exit_abi_id)==false
+       || text_ok(source,tree,exit_id)==false
+       || text_ok(source,tree,frame_id)==false
+       || text_ok(source,tree,error_id)==false
+       || text_ok(source,tree,swapgs_id)==false
+       || text_ok(source,tree,interrupts_id)==false
+       || text_ok(source,tree,section_id)==false
+       || text_ok(source,tree,visibility_id)==false
+       || text_ok(source,tree,symbol_id)==false { return 800; }
+    let section_name_id:u64=tail(tree,section_id);
+    if section_name_id==0 || nkind(tree,section_name_id)!=90 { return 800; }
+    if text_ok(source,tree,section_name_id)==false { return 800; }
+
+    // hardware_error_code is a name node, so it may spell anything; only the
+    // two booleans exist and the value must be the one the frame implies.
+    let false_text:buf<u8>="false";
+    let true_text:buf<u8>="true";
+    let error_start:u64=nstart(tree,error_id);
+    let mut error_code:u64=1;
+    if same(source,error_start,nend(tree,error_id),false_text) { error_code=0; }
+    else if same(source,error_start,nend(tree,error_id),true_text) {
+        error_code=1;
+    } else {
+        verdict[0]=nline(tree,error_id);verdict[1]=ncolumn(tree,error_id);
+        verdict[2]=9;
+        return 305;
+    }
+
+    // The frame carries the error-code shape of the profile.
+    let mut frame_class:u64=0;
+    let no_error:buf<u8>="x86_64.frame.no_error.same_cpl";
+    let with_error:buf<u8>="x86_64.frame.error.same_cpl";
+    let syscall_frame:buf<u8>="syscall.frame";
+    let frame_start:u64=nstart(tree,frame_id);
+    if kind_id==kind_interrupt() {
+        if same(source,frame_start,nend(tree,frame_id),no_error) {
+            frame_class=0;
+        } else if same(source,frame_start,nend(tree,frame_id),with_error) {
+            frame_class=1;
+        } else {
+            verdict[0]=nline(tree,frame_id);verdict[1]=ncolumn(tree,frame_id);
+            verdict[2]=8;
+            return 305;
+        }
+    } else {
+        if same(source,frame_start,nend(tree,frame_id),syscall_frame)==false {
+            verdict[0]=nline(tree,frame_id);verdict[1]=ncolumn(tree,frame_id);
+            verdict[2]=8;
+            return 305;
+        }
+        frame_class=0;
+    }
+
+    // Entry and exit ABI of the frozen profile, tied to the frame class.
+    let interrupt_entry:buf<u8>="nx64-interrupt-same-cpl-v0";
+    let interrupt_entry_error:buf<u8>="nx64-interrupt-same-cpl-error-v0";
+    let interrupt_exit:buf<u8>="nx64-iretq-same-cpl-v0";
+    let interrupt_exit_error:buf<u8>="nx64-iretq-same-cpl-error-v0";
+    let syscall_abi:buf<u8>="nx64-abi-v0";
+    let entry_start:u64=nstart(tree,entry_abi_id);
+    let exit_abi_start:u64=nstart(tree,exit_abi_id);
+    if kind_id==kind_interrupt() {
+        if frame_class==0 {
+            if same(source,entry_start,nend(tree,entry_abi_id),interrupt_entry)==false
+               || same(source,exit_abi_start,nend(tree,exit_abi_id),interrupt_exit)==false {
+                verdict[0]=nline(tree,entry_abi_id);
+                verdict[1]=ncolumn(tree,entry_abi_id);
+                verdict[2]=6;
+                return 305;
+            }
+        } else {
+            if same(source,entry_start,nend(tree,entry_abi_id),interrupt_entry_error)==false
+               || same(source,exit_abi_start,nend(tree,exit_abi_id),interrupt_exit_error)==false {
+                verdict[0]=nline(tree,entry_abi_id);
+                verdict[1]=ncolumn(tree,entry_abi_id);
+                verdict[2]=6;
+                return 305;
+            }
+        }
+    } else {
+        if same(source,entry_start,nend(tree,entry_abi_id),syscall_abi)==false
+           || same(source,exit_abi_start,nend(tree,exit_abi_id),syscall_abi)==false {
+            verdict[0]=nline(tree,entry_abi_id);
+            verdict[1]=ncolumn(tree,entry_abi_id);
+            verdict[2]=6;
+            return 305;
+        }
+    }
+
+    // The declared hardware error code must be the one its frame implies.
+    if error_code!=frame_class {
+        verdict[0]=nline(tree,error_id);verdict[1]=ncolumn(tree,error_id);
+        verdict[2]=9;
+        return 305;
+    }
+
+    // The terminal transfer policy of the frozen profile.
+    let iretq:buf<u8>="iretq";
+    let return_policy:buf<u8>="return";
+    let exit_start:u64=nstart(tree,exit_id);
+    if kind_id==kind_interrupt() {
+        if same(source,exit_start,nend(tree,exit_id),iretq)==false {
+            verdict[0]=nline(tree,exit_id);verdict[1]=ncolumn(tree,exit_id);
+            verdict[2]=7;
+            return 305;
+        }
+    } else {
+        if same(source,exit_start,nend(tree,exit_id),return_policy)==false {
+            verdict[0]=nline(tree,exit_id);verdict[1]=ncolumn(tree,exit_id);
+            verdict[2]=7;
+            return 305;
+        }
+    }
+
+    // Stack alignment. An interrupt stub never returns normally: it ends in
+    // iretq on the frame it entered, so the profile requires stack_align 0.
+    // A safe-return syscall stub calls and returns, so it requires the
+    // aligned entry stack_align 16.
+    let mut required_align:u64=0;
+    if kind_id==kind_syscall() { required_align=16; }
+    if naux(tree,align_id)!=required_align {
+        verdict[0]=nline(tree,align_id);verdict[1]=ncolumn(tree,align_id);
+        verdict[2]=10;verdict[3]=naux(tree,align_id);
+        return 305;
+    }
+
+    // swapgs and interrupt-state policies.
+    let never:buf<u8>="never";
+    if same(source,nstart(tree,swapgs_id),nend(tree,swapgs_id),never)==false {
+        verdict[0]=nline(tree,swapgs_id);verdict[1]=ncolumn(tree,swapgs_id);
+        verdict[2]=11;
+        return 305;
+    }
+    let preserve:buf<u8>="preserve";
+    if same(source,nstart(tree,interrupts_id),nend(tree,interrupts_id),preserve)==false {
+        verdict[0]=nline(tree,interrupts_id);
+        verdict[1]=ncolumn(tree,interrupts_id);
+        verdict[2]=12;
+        return 305;
+    }
+
+    // Section and visibility.
+    let text:buf<u8>="text";
+    if same(source,nstart(tree,section_name_id),nend(tree,section_name_id),text)==false {
+        verdict[0]=nline(tree,section_name_id);
+        verdict[1]=ncolumn(tree,section_name_id);
+        verdict[2]=13;
+        return 305;
+    }
+    let local:buf<u8>="local";
+    let export:buf<u8>="export";
+    let visibility_start:u64=nstart(tree,visibility_id);
+    let mut exported:u64=0;
+    if same(source,visibility_start,nend(tree,visibility_id),export) {
+        exported=1;
+    } else if same(source,visibility_start,nend(tree,visibility_id),local)==false {
+        verdict[0]=nline(tree,visibility_id);
+        verdict[1]=ncolumn(tree,visibility_id);
+        verdict[2]=14;
+        return 305;
+    }
+
+    // A generated stub binds no material parameter and clobbers nothing: its
+    // whole preservation story is the save set.
+    if child_count(tree,bindings_id)!=0 {
+        verdict[0]=nline(tree,bindings_id);verdict[1]=ncolumn(tree,bindings_id);
+        verdict[2]=19;
+        return 305;
+    }
+    if child_count(tree,clobbers_id)!=0 {
+        verdict[0]=nline(tree,clobbers_id);
+        verdict[1]=ncolumn(tree,clobbers_id);
+        verdict[2]=20;
+        return 305;
+    }
+
+    // The save set, canonicalised into ascending register families.
+    let save_at:u64=save_base()+slot*save_slots();
+    let mut save_count:u64=0;
+    let mut save_mask:u64=0;
+    let mut at:u64=head(tree,save_id);
+    while at!=0 {
+        if save_count>=save_slots() {
+            verdict[0]=nline(tree,save_id);verdict[1]=ncolumn(tree,save_id);
+            verdict[2]=22;
+            return 305;
+        }
+        let name_id:u64=tail(tree,at);
+        if name_id==0 || head(tree,at)!=name_id { return 800; }
+        if nkind(tree,name_id)!=90 { return 800; }
+        if text_ok(source,tree,name_id)==false { return 800; }
+        let family:u64=register_widths.family(source,nstart(tree,name_id),
+                                              nend(tree,name_id));
+        if family==0 || family>16 {
+            verdict[0]=nline(tree,name_id);verdict[1]=ncolumn(tree,name_id);
+            verdict[2]=22;verdict[3]=family;
+            return 305;
+        }
+        work[save_at+save_count]=family;
+        save_mask=save_mask|(1<<family);
+        save_count=save_count+1;
+        at=sibling(tree,at);
+    }
+    sort_families(work,save_at,save_count);
+    if kind_id==kind_interrupt() && save_count==0 {
+        verdict[0]=nline(tree,save_id);verdict[1]=ncolumn(tree,save_id);
+        verdict[2]=21;
+        return 305;
+    }
+    if kind_id==kind_syscall() && save_count!=0 {
+        verdict[0]=nline(tree,save_id);verdict[1]=ncolumn(tree,save_id);
+        verdict[2]=21;
+        return 305;
+    }
+
+    // The handler contract. An interrupt handler is a policy name, so the
+    // advance it performs is read from the policy itself. A syscall handler
+    // becomes a call, so it must name a declared callable of this module, and
+    // whatever that callable declares as clobbered must be inside the save
+    // set: the generated body has no other way to preserve it.
+    let handler_start:u64=nstart(tree,handler_id);
+    let mut advance:u64=0;
+    if kind_id==kind_interrupt() {
+        advance=handler_advance(source,handler_start,nend(tree,handler_id));
+        if advance==0 {
+            verdict[0]=nline(tree,handler_id);
+            verdict[1]=ncolumn(tree,handler_id);
+            verdict[2]=23;
+            return 305;
+        }
+    }
+    let callee:u64=name_decl(source,tree,work,names,handler_start,
+                             nend(tree,handler_id));
+    if kind_id==kind_syscall() && callee==0 {
+        // The C oracle reports this at the entry, not at the handler name, so
+        // the position is the entry node and the detail is the key.
+        verdict[0]=nline(tree,entry);verdict[1]=ncolumn(tree,entry);
+        verdict[2]=18;
+        return 305;
+    }
+    if callee!=0 {
+        let set_id:u64=decl_clobbers(tree,callee);
+        let mut clobbered:u64=head(tree,set_id);
+        while clobbered!=0 {
+            let name_id:u64=tail(tree,clobbered);
+            if name_id==0 || head(tree,clobbered)!=name_id { return 800; }
+            if nkind(tree,name_id)!=90 { return 800; }
+            if text_ok(source,tree,name_id)==false { return 800; }
+            let family:u64=register_widths.family(source,nstart(tree,name_id),
+                                                  nend(tree,name_id));
+            if family==0 || (save_mask&(1<<family))==0 {
+                // The C oracle reports the contract mismatch at the entry, so
+                // the position is the entry node and the detail the family.
+                verdict[0]=nline(tree,entry);verdict[1]=ncolumn(tree,entry);
+                verdict[2]=17;verdict[3]=family;
+                return 305;
+            }
+            clobbered=sibling(tree,clobbered);
+        }
+    }
+
+    let base:u64=record_base()+slot*record();
+    work[base]=key;
+    work[base+1]=entry;
+    work[base+2]=verdict[0];
+    work[base+3]=verdict[1];
+    work[base+4]=nstart(tree,symbol_id);
+    work[base+5]=nend(tree,symbol_id);
+    work[base+6]=handler_start;
+    work[base+7]=nend(tree,handler_id);
+    work[base+8]=kind_id;
+    work[base+9]=frame_class;
+    work[base+10]=error_code;
+    work[base+11]=save_count;
+    work[base+12]=save_mask;
+    work[base+13]=advance;
+    work[base+14]=exported;
+    work[base+15]=save_at;
+    return 0;
+}
+
+// ---------------------------------------------------------------- the plan
+
+// Plan steps one record generates. The prologue and the epilogue are a
+// function of the save-set size and of the error-code slot, never of the
+// vector: push every saved register, load the saved RIP through the scratch
+// register, advance it by the handler policy amount, store it back, pop in
+// reverse order, discard the error-code slot when the frame carried one, then
+// the terminal transfer. A structured syscall stub is one terminal call.
+fn plan_steps(work:buf<u64>,base:u64)->u64 {
+    if work[base+8]==kind_syscall() { return 1; }
+    let mut steps:u64=2*work[base+11]+4;
+    if work[base+9]==1 { steps=steps+1; }
+    return steps;
+}
+
+// 1 when the proven encoding can emit this record. The backend proves exactly
+// two interrupt witness profiles, #UD vector 6 without error code and #GP
+// vector 13 with one, both advancing the saved RIP by two and both preserving
+// rax alone. Every other declaration is refused by lower, never approximated.
+fn encodable(work:buf<u64>,base:u64)->bool {
+    if work[base+8]==kind_syscall() { return true; }
+    if work[base+11]!=1 { return false; }
+    if work[work[base+15]]!=scratch_rax() { return false; }
+    if work[base+13]!=2 { return false; }
+    if work[base+9]==0 && work[base]==6 { return true; }
+    if work[base+9]==1 && work[base]==13 { return true; }
+    return false;
+}
+
+// Write the plan steps of one record at the given word offset of out and
+// answer the number of words written.
+fn emit_plan(work:buf<u64>,base:u64,out:buf<u64>,at:u64)->u64 {
+    if work[base+8]==kind_syscall() {
+        out[at]=op_return_handler();
+        out[at+1]=0;
+        out[at+2]=0;
+        return 3;
+    }
+    let saves:u64=work[base+15];
+    let mut cursor:u64=at;
+    let mut i:u64=0;
+    while i<work[base+11] {
+        out[cursor]=op_push();
+        out[cursor+1]=work[saves+i];
+        out[cursor+2]=0;
+        cursor=cursor+3;
+        i=i+1;
+    }
+    let displacement:u64=slot_bytes()+slot_bytes()*work[base+9];
+    out[cursor]=op_load_saved_rip();
+    out[cursor+1]=scratch_rax();
+    out[cursor+2]=displacement;
+    cursor=cursor+3;
+    out[cursor]=op_advance_saved_rip();
+    out[cursor+1]=scratch_rax();
+    out[cursor+2]=work[base+13];
+    cursor=cursor+3;
+    out[cursor]=op_store_saved_rip();
+    out[cursor+1]=displacement;
+    out[cursor+2]=scratch_rax();
+    cursor=cursor+3;
+    i=work[base+11];
+    while i>0 {
+        out[cursor]=op_pop();
+        out[cursor+1]=work[saves+i-1];
+        out[cursor+2]=0;
+        cursor=cursor+3;
+        i=i-1;
+    }
+    if work[base+9]==1 {
+        out[cursor]=op_adjust_rsp();
+        out[cursor+1]=family_rsp();
+        out[cursor+2]=slot_bytes();
+        cursor=cursor+3;
+    }
+    out[cursor]=op_iretq();
+    out[cursor+1]=0;
+    out[cursor+2]=0;
+    cursor=cursor+3;
+    return cursor-at;
+}
+
+// ------------------------------------------------------------- the traversal
+
+// Walk every stub table of the tree, apply the section 11 declaration rules
+// and fill the work area. On success work[0] is the table count, work[1] the
+// entry count and work[2] the total plan step count, and the records are
+// sorted into canonical numeric order. On refusal the verdict is written to
+// out[0..3] as line, column, reason and offending key or family, and 305 is
+// returned; 800 leaves out untouched. Reasons: 1 unknown table kind,
+// 2 empty interrupt table, 3 duplicate key, 4 table entry limit, 5 key outside
+// the architecture range, 6 entry or exit ABI, 7 exit policy, 8 frame,
+// 9 hardware error code, 10 stack_align, 11 swapgs, 12 interrupt
+// preservation, 13 section, 14 visibility, 15 duplicate generated symbol,
+// 16 forbidden gap in the canonical numeric key, 17 handler clobber outside
+// the save set, 18 handler is not a declared callable, 19 bindings,
+// 20 clobbers, 21 save set, 22 unknown saved register, 23 unknown interrupt
+// handler policy.
+fn collect(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>,work:buf<u64>)->u64 {
+    let verdict:buf<u64>=alloc(runtime(),4);
+    let mut i:u64=0;
+    while i<4 { verdict[i]=0; i=i+1; }
+    work[0]=0;
+    work[1]=0;
+    work[2]=0;
+    work[3]=0;
+    let mut names:u64=collect_globals(source,tree,work);
+    if names==failed() {
+        rt_free(runtime(),verdict);
+        return 800;
+    }
+    let mut tables:u64=0;
+    let mut entries:u64=0;
+    let mut steps:u64=0;
+    let mut code:u64=0;
+    let mut reason:u64=0;
+    let mut line:u64=0;
+    let mut column:u64=0;
+    let mut detail:u64=0;
+
+    let mut id:u64=1;
+    while id<=tree.node_count && code==0 {
+        if nkind(tree,id)==15 {
+            let kind_id_node:u64=child(tree,id,1);
+            if kind_id_node==0 || nkind(tree,kind_id_node)!=90
+               || text_ok(source,tree,kind_id_node)==false { code=800; }
+            else {
+                let kind_start:u64=nstart(tree,kind_id_node);
+                let interrupt:buf<u8>="interrupt";
+                let syscall:buf<u8>="syscall";
+                let mut kind_id:u64=0;
+                if same(source,kind_start,nend(tree,kind_id_node),interrupt) {
+                    kind_id=kind_interrupt();
+                } else if same(source,kind_start,nend(tree,kind_id_node),syscall) {
+                    kind_id=kind_syscall();
+                } else {
+                    code=305;reason=1;line=nline(tree,kind_id_node);
+                    column=ncolumn(tree,kind_id_node);
+                }
+                if code==0 {
+                    tables=tables+1;
+                    let first:u64=child(tree,id,2);
+                    if kind_id==kind_interrupt() && first==0 {
+                        code=305;reason=2;line=nline(tree,id);
+                        column=ncolumn(tree,id);
+                    }
+                    let start_slot:u64=entries;
+                    let mut count:u64=0;
+                    let mut at:u64=first;
+                    while at!=0 && code==0 {
+                        if nkind(tree,at)!=16 { code=800; }
+                        else if count>=table_max() || entries>=capacity() {
+                            code=305;reason=4;line=nline(tree,at);
+                            column=ncolumn(tree,at);detail=count;
+                        } else {
+                            let found:u64=scan_entry(source,tree,at,kind_id,
+                                work,entries,names,verdict);
+                            if found==800 { code=800; }
+                            else if found!=0 {
+                                code=305;reason=verdict[2];
+                                line=verdict[0];column=verdict[1];
+                                detail=verdict[3];
+                            } else {
+                                steps=steps+plan_steps(work,
+                                    record_base()+entries*record());
+                                entries=entries+1;
+                                count=count+1;
+                            }
+                        }
+                        at=sibling(tree,at);
+                    }
+                    if code==0 {
+                        // Canonical numeric order first, then the key rules
+                        // section 11 requires before any emission.
+                        sort_range(work,record_base()+start_slot*record(),count);
+                        let mut index:u64=1;
+                        while index<count && code==0 {
+                            let here:u64=record_base()
+                                +(start_slot+index)*record();
+                            let before:u64=record_base()
+                                +(start_slot+index-1)*record();
+                            if work[here]==work[before] {
+                                code=305;reason=3;line=work[here+2];
+                                column=work[here+3];detail=work[here];
+                            } else if work[here]!=work[before]+1 {
+                                code=305;reason=16;line=work[here+2];
+                                column=work[here+3];detail=work[before]+1;
+                            }
+                            index=index+1;
+                        }
+                        let mut at2:u64=0;
+                        while at2<count && code==0 {
+                            let rec:u64=record_base()+(start_slot+at2)*record();
+                            if name_index(source,tree,work,names,work[rec+4],
+                                          work[rec+5])!=0 {
+                                code=305;reason=15;line=work[rec+2];
+                                column=work[rec+3];
+                            } else {
+                                names=name_append(tree,work,names,work[rec+4],
+                                                  work[rec+5],0);
+                            }
+                            at2=at2+1;
+                        }
+                    }
+                }
+            }
+        }
+        id=id+1;
+    }
+
+    if code==0 {
+        work[0]=tables;
+        work[1]=entries;
+        work[2]=steps;
+    } else if code==305 {
+        // The detail word carries the offending key or the offending family,
+        // and only for the rules whose defect is one: the duplicate key, the
+        // table limit, the key outside the range, the required alignment, the
+        // missing key of a gap, the family a handler clobbers outside the
+        // save set and the unknown saved family. Every other rule reports
+        // zero there, so the field never leaks an unrelated number.
+        if reason!=3 && reason!=4 && reason!=5 && reason!=10 && reason!=16
+           && reason!=17 && reason!=22 { detail=0; }
+        out[0]=line;
+        out[1]=column;
+        out[2]=reason;
+        out[3]=detail;
+    }
+    rt_free(runtime(),verdict);
+    return code;
+}
+
+// ------------------------------------------------------------- the exports
+
+// Validate every structured stub declaration of an NTASM tree against
+// spec/ntasm/ntasm.md section 11. Returns 0 writing out[0]=tables,
+// out[1]=entries, out[2]=0, out[3]=0. Returns 305 writing the line, column,
+// reason and offending key or family of the first refusal to out[0..3], in
+// the order collect lists them. Returns 800 with no write to out on an
+// invalid tree, a malformed declaration or an output buffer shorter than
+// four words. The work buffer is always freed; neither source nor tree is
+// owned or released by this module.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+    let work:buf<u64>=alloc(runtime(),work_words(tree));
+    let code:u64=collect(source,tree,out,work);
+    if code==0 {
+        out[0]=work[0];
+        out[1]=work[1];
+        out[2]=0;
+        out[3]=0;
+    }
+    rt_free(runtime(),work);
+    return code;
+}
+
+// Measure the exact output lower needs: out[0]=tables, out[1]=entries,
+// out[2]=plan steps, out[3]=0. A 305 refusal answers the same verdict as
+// check and writes nothing else, so a caller can size once and lower once.
+export fn measure(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+    let work:buf<u64>=alloc(runtime(),work_words(tree));
+    let code:u64=collect(source,tree,out,work);
+    if code==0 {
+        out[0]=work[0];
+        out[1]=work[1];
+        out[2]=work[2];
+        out[3]=0;
+    }
+    rt_free(runtime(),work);
+    return code;
+}
+
+// Write the record and the body plan of exactly one stub, addressed by its
+// canonical position across all tables, WITHOUT the proven-encoding gate of
+// lower. This is the general generator's query channel: it answers what the
+// generator derives from a declaration, including a declaration no proven
+// profile covers, so a caller can inspect the derivation itself. Layout of
+// out: out[0]=kind, out[1]=key, out[2]=frame class, out[3]=step count,
+// out[4]=zero, out[5]=save count, out[6]=symbol start, out[7]=symbol end,
+// out[8]=handler start, out[9]=handler end, out[10]=flags, out[11]=zero, then
+// three words per plan step. Flag bit 1 still says whether the proven
+// encoding can emit the record.
+//
+// Returns 0 on success, 305 for a declaration refusal with the same verdict as
+// check, 306 when the answer cannot be produced: reason 4 with
+// out[0]=records and out[1]=the ordinal asked for when that ordinal is past
+// the last record, reason 5 with out[0]=words needed and out[1]=words
+// available when the caller output is too small, both with out[2]=the reason
+// and out[3]=0. Returns 800 with no write to out on an invalid tree or a
+// buffer shorter than twelve words. The work buffer is always freed.
+export fn plan_for(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>,
+                   index:u64)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<12 { return 800; }
+    let work:buf<u64>=alloc(runtime(),work_words(tree));
+    let code:u64=collect(source,tree,out,work);
+    if code!=0 {
+        rt_free(runtime(),work);
+        return code;
+    }
+    let entries:u64=work[1];
+    if index>=entries {
+        out[0]=entries;
+        out[1]=index;
+        out[2]=4;
+        out[3]=0;
+        rt_free(runtime(),work);
+        return 306;
+    }
+    let base:u64=record_base()+index*record();
+    let steps:u64=plan_steps(work,base);
+    if 12+3*steps>len(out) {
+        out[0]=12+3*steps;
+        out[1]=len(out);
+        out[2]=5;
+        out[3]=0;
+        rt_free(runtime(),work);
+        return 306;
+    }
+    out[0]=work[base+8];
+    out[1]=work[base];
+    out[2]=work[base+9];
+    out[3]=steps;
+    out[4]=0;
+    out[5]=work[base+11];
+    out[6]=work[base+4];
+    out[7]=work[base+5];
+    out[8]=work[base+6];
+    out[9]=work[base+7];
+    out[10]=work[base+14];
+    if encodable(work,base) { out[10]=out[10]|2; }
+    out[11]=0;
+    emit_plan(work,base,out,12);
+    rt_free(runtime(),work);
+    return 0;
+}
+
+// Lower every validated stub declaration into canonical order, writing the
+// records and their body plans. Layout of out: out[0]=tables, out[1]=records,
+// out[2]=plan steps, out[3]=0, then twelve words per record, then three words
+// per plan step. Record words: kind, key, frame class, step count, step
+// offset, save count, symbol start, symbol end, handler start, handler end,
+// flags, zero. Flag bit 0 is the declared export visibility and bit 1 says
+// the proven encoding can emit this record.
+//
+// Returns 0 on success. Returns 305 for a declaration refusal with the same
+// verdict as check and nothing written past out[0..3]. Returns 306 when no
+// record can be emitted: reason 1 for a declaration no proven profile
+// covers, reason 2 for a save set the proven profile does not preserve,
+// reason 3 when the caller output cannot hold the records and the plans,
+// with out[0]=words needed, out[1]=words available, out[2]=the reason and
+// out[3]=0. Returns 800 with no write to out on an invalid tree or a buffer
+// shorter than eight words. The work buffer is always freed.
+export fn lower(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<8 { return 800; }
+    let work:buf<u64>=alloc(runtime(),work_words(tree));
+    let code:u64=collect(source,tree,out,work);
+    if code!=0 {
+        rt_free(runtime(),work);
+        return code;
+    }
+    let tables:u64=work[0];
+    let entries:u64=work[1];
+    let steps:u64=work[2];
+    let needed:u64=4+12*entries+3*steps;
+    let mut refusal:u64=0;
+    let mut at:u64=0;
+    while at<entries && refusal==0 {
+        let base:u64=record_base()+at*record();
+        if encodable(work,base)==false {
+            if work[base+11]!=1 || work[work[base+15]]!=scratch_rax() {
+                refusal=2;
+            } else { refusal=1; }
+        }
+        at=at+1;
+    }
+    if refusal==0 && needed>len(out) { refusal=3; }
+    if refusal!=0 {
+        out[0]=needed;
+        out[1]=len(out);
+        out[2]=refusal;
+        out[3]=0;
+        rt_free(runtime(),work);
+        return 306;
+    }
+
+    out[0]=tables;
+    out[1]=entries;
+    out[2]=steps;
+    out[3]=0;
+    let mut cursor:u64=4;
+    let mut plan_cursor:u64=4+12*entries;
+    at=0;
+    while at<entries {
+        let base:u64=record_base()+at*record();
+        out[cursor]=work[base+8];
+        out[cursor+1]=work[base];
+        out[cursor+2]=work[base+9];
+        out[cursor+3]=plan_steps(work,base);
+        out[cursor+4]=plan_cursor;
+        out[cursor+5]=work[base+11];
+        out[cursor+6]=work[base+4];
+        out[cursor+7]=work[base+5];
+        out[cursor+8]=work[base+6];
+        out[cursor+9]=work[base+7];
+        out[cursor+10]=work[base+14];
+        if encodable(work,base) { out[cursor+10]=out[cursor+10]|2; }
+        out[cursor+11]=0;
+        cursor=cursor+12;
+        plan_cursor=plan_cursor+emit_plan(work,base,out,plan_cursor);
+        at=at+1;
+    }
+    rt_free(runtime(),work);
+    return 0;
+}
+
+// ---------------------------------------------------------- the encoding
+//
+// Everything above derives a body PLAN. Nothing above produces a byte. This
+// section is the encoder, the symbol table, and the image writer, so a
+// structured declaration reaches a PE file the way a lowered function body
+// reaches one.
+//
+// It encodes exactly what encodable has already proved and nothing else: the
+// two interrupt witness profiles, #UD vector 6 without an error code and #GP
+// vector 13 with one, both advancing the saved RIP by two and both preserving
+// rax alone. A step outside that set is never guessed: emit_step answers zero
+// bytes and the image is refused. The one plan step neither profile covers is
+// the terminal handler call of a structured syscall stub, which is a call
+// rel32 naming a symbol this emitter does not link; that refusal is reason 6
+// of the 306 family, and it is measured, not assumed: the C oracle lowers the
+// same declaration to 360 bytes carrying one REL32.
+//
+// No byte below is a literal copied out of the C. push and pop are the opcode
+// plus the register number, the two memory forms are the disp8 SIB encoding
+// of a base rsp operand, add is the sign extended imm8 form, and iretq is the
+// one fixed opcode pair the plan ends with. Every one of them is confronted
+// with the frozen C encoder, nt_x64_encode, byte for byte, on every gate run.
+
+// The x86-64 register number of a register_widths family: family one is rax,
+// so the number is the family minus one. A family this module does not know
+// answers sixteen, which every emitter below refuses, so an unknown saved
+// register can never borrow the encoding of a real one.
+fn reg_number(family:u64)->u64 {
+    if family==0 || family>16 { return 16; }
+    return family-1;
+}
+
+// REX.W plus the extension bit a register number above seven needs. REX.R
+// extends the reg field of the modrm, REX.B the r/m field and the opcode of a
+// push or a pop.
+fn rex(bit:u64,reg:u64)->u64 {
+    if reg>=8 { return 72+bit; }
+    return 72;
+}
+
+fn emit_push(reg:u64,text:buf<u8>,at:u64)->u64 {
+    if reg>15 { return 0; }
+    let mut cursor:u64=at;
+    if reg>=8 { text[at]=65; cursor=at+1; }
+    text[cursor]=u8(80+reg);
+    return cursor-at+1;
+}
+
+fn emit_pop(reg:u64,text:buf<u8>,at:u64)->u64 {
+    if reg>15 { return 0; }
+    let mut cursor:u64=at;
+    if reg>=8 { text[at]=65; cursor=at+1; }
+    text[cursor]=u8(88+reg);
+    return cursor-at+1;
+}
+
+// mov r64, [rsp + disp8]: REX.W, 8B, mod=01 reg=r rm=100 so a SIB byte
+// follows, SIB scale one with no index and base rsp, then the displacement.
+fn emit_load_saved_rip(reg:u64,disp:u64,text:buf<u8>,at:u64)->u64 {
+    if reg>15 || disp>127 { return 0; }
+    text[at]=u8(rex(4,reg));
+    text[at+1]=u8(139);
+    text[at+2]=u8(68+((reg&7)*8));
+    text[at+3]=u8(36);
+    text[at+4]=u8(disp);
+    return 5;
+}
+
+// mov [rsp + disp8], r64: the same frame with the store opcode 89. The
+// register is still the modrm reg field, so it still needs REX.R.
+fn emit_store_saved_rip(reg:u64,disp:u64,text:buf<u8>,at:u64)->u64 {
+    if reg>15 || disp>127 { return 0; }
+    text[at]=u8(rex(4,reg));
+    text[at+1]=u8(137);
+    text[at+2]=u8(68+((reg&7)*8));
+    text[at+3]=u8(36);
+    text[at+4]=u8(disp);
+    return 5;
+}
+
+// add r64, imm8: REX.W, 83, mod=11 reg=000 rm=r, then the immediate. The
+// register is the r/m field here, so this one needs REX.B.
+fn emit_add_imm8(reg:u64,amount:u64,text:buf<u8>,at:u64)->u64 {
+    if reg>15 || amount>127 { return 0; }
+    text[at]=u8(rex(1,reg));
+    text[at+1]=u8(131);
+    text[at+2]=u8(192+(reg&7));
+    text[at+3]=u8(amount);
+    return 4;
+}
+
+fn emit_iretq(text:buf<u8>,at:u64)->u64 {
+    text[at]=u8(72);
+    text[at+1]=u8(207);
+    return 2;
+}
+
+// The bytes of one plan step, or zero when this emitter does not cover it.
+// The operand roles are the ones emit_plan writes: a push and a pop name the
+// saved family, a load and an advance name the scratch family, a store names
+// the displacement first and the scratch family second, an adjust names the
+// stack family and the slot width, and a terminal transfer names nothing.
+fn emit_step(op:u64,a:u64,b:u64,text:buf<u8>,at:u64)->u64 {
+    if op==op_push() { return emit_push(reg_number(a),text,at); }
+    if op==op_pop() { return emit_pop(reg_number(a),text,at); }
+    if op==op_load_saved_rip() {
+        return emit_load_saved_rip(reg_number(a),b,text,at);
+    }
+    if op==op_advance_saved_rip() {
+        return emit_add_imm8(reg_number(a),b,text,at);
+    }
+    if op==op_store_saved_rip() {
+        return emit_store_saved_rip(reg_number(b),a,text,at);
+    }
+    if op==op_adjust_rsp() { return emit_add_imm8(reg_number(a),b,text,at); }
+    if op==op_iretq() { return emit_iretq(text,at); }
+    return 0;
+}
+
+// The widest body an encodable record can produce: seven steps of five bytes.
+// A ceiling, never a target: the body is measured, and the measurement is what
+// the caller lays out.
+fn body_bound()->u64 { return 40; }
+fn step_bound()->u64 { return 3*(2*save_slots()+5); }
+
+// Encode one record by running the same emit_plan lower publishes and encoding
+// each of its steps, so the image cannot drift from the plan the module already
+// emits. Zero bytes means a step this emitter does not cover.
+fn encode_body(work:buf<u64>,base:u64,steps:buf<u64>,text:buf<u8>,at:u64)->u64 {
+    let count:u64=plan_steps(work,base);
+    if 3*count>len(steps) { return 0; }
+    emit_plan(work,base,steps,0);
+    let mut cursor:u64=at;
+    let mut i:u64=0;
+    while i<count {
+        let written:u64=emit_step(steps[i*3],steps[i*3+1],steps[i*3+2],
+                                  text,cursor);
+        if written==0 { return 0; }
+        cursor=cursor+written;
+        i=i+1;
+    }
+    return cursor-at;
+}
+
+// The contract a generated stub symbol carries is the entry ABI its own
+// declaration spelled, read back out of the tree through the entry node every
+// record kept. It is the text the C reference writes as the function ABI, so
+// the two objects describe the same contract in the same words.
+fn contract_node(source:buf<u8>,tree:ntasm_ast.Tree,work:buf<u64>,
+                 base:u64)->u64 {
+    let abi:u64=field_value(tree,work[base+1],3);
+    if abi==0 { return 0; }
+    if text_ok(source,tree,abi)==false { return 0; }
+    return abi;
+}
+
+fn contract_length(source:buf<u8>,tree:ntasm_ast.Tree,work:buf<u64>,
+                   base:u64)->u64 {
+    let abi:u64=contract_node(source,tree,work,base);
+    if abi==0 { return 0; }
+    return nend(tree,abi)-nstart(tree,abi);
+}
+
+// True when the name at a_start of length al sorts strictly before the name at
+// b_start of length bl, over one buffer. This is the ascending order an object
+// requires of a symbol table, and same_span cannot express it because
+// same_span only answers equality.
+fn bytes_before(names:buf<u8>,a_start:u64,al:u64,b_start:u64,bl:u64)->bool {
+    let mut i:u64=0;
+    while i<(al) && i<(bl) {
+        if names[a_start+i]!=names[b_start+i] {
+            return names[a_start+i]<names[b_start+i];
+        }
+        i=i+1;
+    }
+    return al<bl;
+}
+
+// Copy len bytes of source from start to names at at, and answer at + len.
+fn strings_copy(names:buf<u8>,at:u64,source:buf<u8>,start:u64,len:u64)->u64 {
+    let mut i:u64=0;
+    while i<len { names[at+i]=source[start+i]; i=i+1; }
+    return at+len;
+}
+
+// The symbol table in the ascending name order an object requires, which is not
+// the canonical key order the records are produced in. Each symbol is nine
+// scratch words: the two names as offsets into the name buffer, the name length,
+// the .text offset, the body size, the flags, and the two source offsets the
+// strings are rewritten from. Insertion sort over those words, so the order is
+// derived from the names the declarations spell and the probe spells, never from
+// a table of literals. A repeated name answers one, which collect already
+// prevents between records.
+fn sort_symbols(names:buf<u8>,order:buf<u64>,count:u64)->u64 {
+    let mut j:u64=1;
+    while j<count {
+        let mut k:u64=j*9;
+        while k>=9 {
+            let before:u64=k-9;
+            let a:u64=order[before];
+            let al:u64=order[before+2];
+            let b:u64=order[k];
+            let bl:u64=order[k+2];
+            if bytes_before(names,b,bl,a,al)==false {
+                if bytes_before(names,a,al,b,bl)==false { return 1; }
+                break;
+            }
+            let mut t:u64=0;
+            while t<9 {
+                let saved:u64=order[before+t];
+                order[before+t]=order[k+t];
+                order[k+t]=saved;
+                t=t+1;
+            }
+            k=k-9;
+        }
+        j=j+1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- the probe
+//
+// The probe is the fixed machine code that takes a real #UD through the
+// generated stub, so a structured declaration can be EXECUTED by a firmware
+// and not only compared byte for byte. It is not a declaration and derives
+// nothing from one: it is the observation harness.
+//
+// It does four things, in this order. It reserves an aligned block on the
+// stack and describes the generated stub in the one IDT entry its declared
+// vector names. It loads that table. It plants a value in rax. It executes the
+// instruction that raises the declared vector. The generated stub then runs on
+// the frame the CPU pushed, advances the saved RIP by the two bytes the trigger
+// occupies, and iretqs to the instruction after it.
+//
+// The value the caller finally reads is therefore one the stub carried across a
+// real interrupt frame: the stub pushes rax, rewrites the saved RIP, pops rax
+// and returns, so a stub that dropped rax, that advanced by the wrong amount,
+// or that never returned at all cannot produce that value.
+//
+// The IDT slot is the only thing the vector decides. It is written with the
+// disp8 frame, which is why the probe is stated for vector 6 and refuses any
+// other: a slot past 127 needs the disp32 frame, a second layout, and a second
+// measurement, and the #GP profile is already confronted byte for byte with the
+// C oracle by build_pe.
+//
+// No byte below is a literal taken from a disassembly. Each is an opcode, a
+// modrm built from its three fields, a SIB byte and a displacement, and the
+// gate confronts every one of them with the frozen C encoder nt_x64_encode on
+// every run.
+fn witness_vector()->u64 { return 6; }
+fn witness_len()->u64 { return 124; }
+// The frame is the table and the descriptor: gate_stride()*table entries of
+// gate, plus the ten byte descriptor the lidt reads, rounded up. It is
+// subtracted and added by the same constant, which is what makes the frame
+// symmetric.
+fn witness_frame()->u64 { return 8224; }
+// The IDT limit is table entries times the entry width, less one. With a
+// sixteen byte entry that is 512*16-1, and the 4095 this carried was the
+// eight byte arithmetic: it described a table half the size the gate stride
+// implies, so the CPU believed the table ended before its own last entry.
+fn witness_limit()->u64 { return 8191; }
+// Where the running IDT descriptor is built inside the frame, clear of the
+// table the gate lives in and inside the frame the sub reserved.
+fn witness_desc()->u64 { return 8192; }
+// The width of one IDT entry in 64 bit mode. It is SIXTEEN bytes, not eight:
+// the gate descriptor carries offset[15:0], selector, IST, type, offset[31:16]
+// AND offset[63:32] in a further four bytes, so the CPU addresses vector N at
+// base + N*16. A probe that writes its gate eight bytes per vector puts it
+// twelve entries away from the trap it is meant to take, and the entry the CPU
+// reads is untouched frame: a type byte of zero, which is not present, which
+// is exactly the #GP(vector*8+2) this probe used to die of. The reference
+// GATE in compiler/c/ntasm/formats/ud2_probe.c is sixteen bytes wide for
+// the same reason.
+fn gate_stride()->u64 { return 16; }
+// Where the probe keeps the running IDT descriptor it reads. It is read BEFORE
+// the sub, so it must stay small: at the frame size this probe now reserves,
+// an offset of the table's own magnitude would land above the caller's stack
+// pointer and scribble on live data.
+fn witness_scratch()->u64 { return 4080; }
+// The type byte of the gate: present, DPL 0, 64 bit interrupt gate. The probe
+// runs in firmware at CPL 0, and a gate whose DPL is numerically greater than
+// the caller's CPL is not accessible: the CPU refuses the transfer with a
+// #GP whose error code is vector*8+2, the same code a not present entry
+// raises, which is why a DPL 3 gate was read here for years as a missing
+// one. 0xEE is DPL 3; 0x8E is DPL 0.
+fn gate_type()->u64 { return 142; }
+// The offset the call/pop/add block starts at. sidt is eight, the load of its
+// base is eight, the load of the selector is four, the sub is seven and the
+// selector store is five, so the block begins at thirty two. It is named so
+// the probe can change shape without a displacement silently drifting away
+// from the layout it is supposed to describe.
+fn witness_pc()->u64 { return 32; }
+// The call is five bytes, so the pop is at witness_pc + 5, and that is where
+// rax ends up: the call pushes the address of the byte AFTER itself, which is
+// the pop, NOT the add that follows it. The stub the gate names sits at
+// witness_len, so the add carries witness_len minus this.
+//
+// Reading the distance as the ADD's own offset put the gate one byte low, on
+// the probe's own ret rather than on the stub. A ret in the gate target pops
+// the saved RIP and returns to the instruction that raised the vector, so the
+// trap re-armed itself: the boot showed 646000 identical #UDs at one address
+// and a steady descent of the stack, and the read-back of the gate's own
+// offset_low, 0x73 where the stub is at 0x74, is what named it.
+fn witness_stub_from()->u64 { return witness_pc()+5; }
+fn witness_marker()->u64 { return 42; }
+// The entry the CPU addresses for the declared vector, which is where the
+// diagnostic reads the gate back from.
+fn gate_slot()->u64 { return witness_vector()*gate_stride(); }
+// Where the probe's own table ended up once the frame is subtracted again: the
+// running IDT descriptor was read into the frame BEFORE the sub, so from
+// inside the frame it sits at the scratch plus the frame. The probe puts the
+// firmware's own table back through it before returning, because a probe that
+// leaves its table installed breaks the firmware: the entries it never built
+// are whatever the frame held, and the first timer interrupt after the return
+// vectors through them into a triple fault.
+fn witness_restore()->u64 { return witness_scratch()+witness_frame(); }
+
+// The modrm byte of a mod/reg/rm triple, and the SIB byte of scale one with no
+// index and base rsp, which is the only memory form the probe needs.
+fn modrm(mod:u64,reg:u64,rm:u64)->u64 { return (mod*64)+(reg*8)+rm; }
+fn sib_rsp()->u64 { return 36; }
+
+fn byte_at(text:buf<u8>,at:u64,value:u64)->u64 { text[at]=u8(value); return at+1; }
+fn word_at(text:buf<u8>,at:u64,value:u64)->u64 {
+    let mut cursor:u64=at;
+    let mut i:u64=0;
+    while i<2 { text[cursor]=u8((value>>(i*8))&255); cursor=cursor+1; i=i+1; }
+    return cursor;
+}
+fn long_at(text:buf<u8>,at:u64,value:u64)->u64 {
+    let mut cursor:u64=at;
+    let mut i:u64=0;
+    while i<4 { text[cursor]=u8((value>>(i*8))&255); cursor=cursor+1; i=i+1; }
+    return cursor;
+}
+
+// The early-return diagnostic. It is NOT the product and it never ships: it is
+// a six byte image whose only job is to answer one question a boot can answer
+// and a byte comparison cannot, namely whether the entry of a PE this emitter
+// produced is entered and returns at all. It writes the marker and returns
+// before any table is loaded and before any trap is raised, so a run that
+// reports the marker has proved the consumer path, the image and the call
+// convention, and has proved nothing about the trap. The gate pins these six
+// bytes against the same frozen encoder that pins the real probe, so the
+// diagnostic is measured rather than trusted, and the real witness image never
+// contains them.
+fn early_len()->u64 { return 6; }
+
+fn emit_early(text:buf<u8>,at:u64)->u64 {
+    let mut c:u64=at;
+    // mov eax, marker : B8+r id
+    c=byte_at(text,c,184);c=long_at(text,c,witness_marker());
+    // ret
+    c=byte_at(text,c,195);
+    return c-at;
+}
+
+// The whole probe, at the declared vector, and the number of bytes it wrote.
+fn emit_probe(text:buf<u8>,at:u64,
+               early:u64)->u64 {
+    let slot:u64=witness_vector()*gate_stride();
+    let mut c:u64=at;
+    // The code segment selector is READ, never written as a literal. The CPU
+    // will load CS from the gate, and a gate that names a selector the firmware
+    // is not running in is refused with a #GP whose error code is that
+    // selector: the shipped probe carried the literal 8 and every boot died
+    // exactly that way, with the firmware at CS 0x0038. What the probe reads is
+    // the selector out of a gate the firmware itself installed - the entry for
+    // vector 0, which a long mode system must have, at this privilege level and
+    // in this mode - so the value is a property of the machine and not of this
+    // file. Reading it is a load from a mapped descriptor, not a guess.
+    // sidt [rsp + 4080] : 0F 01, /1, disp32 frame
+    c=byte_at(text,c,15);c=byte_at(text,c,1);
+    c=byte_at(text,c,modrm(2,1,4));c=byte_at(text,c,sib_rsp());
+    c=long_at(text,c,witness_scratch());
+    // mov rdx, [rsp + 4082] : REX.W, 8B, /2, disp32 frame. A descriptor is a
+    // two byte limit and then the base, so the base is at the scratch plus two,
+    // the same place the lidt descriptor below puts it.
+    c=byte_at(text,c,72);c=byte_at(text,c,139);
+    c=byte_at(text,c,modrm(2,2,4));c=byte_at(text,c,sib_rsp());
+    c=long_at(text,c,witness_scratch()+2);
+    // mov ax, [rdx + 2] : 66, 8B, /0, disp8 : the selector field of that gate
+    c=byte_at(text,c,102);c=byte_at(text,c,139);
+    c=byte_at(text,c,modrm(1,0,2));c=byte_at(text,c,2);
+    // The probe does not align rsp, and does not need to. It is entered through
+    // a call, and the alignment the caller left is not a property this file may
+    // assume: the established consumer enters it with rsp already 16 byte
+    // aligned, which is the case an `and rsp, -16` with a larger `add rsp` gets
+    // wrong, because the mask then costs nothing and the add still moves the
+    // stack. A sub and an add of the same size return to whatever they found,
+    // for every entry, and the mask is load bearing for no path: the interrupt
+    // witness profile this probe serves declares stack_align 0.
+    // sub rsp, frame : REX.W, 81, /5, rsp, imm32
+    c=byte_at(text,c,72);c=byte_at(text,c,129);
+    c=byte_at(text,c,modrm(3,5,4));c=long_at(text,c,witness_frame());
+    // mov word [rsp + slot + 2], ax : the code segment selector, read above
+    c=byte_at(text,c,102);c=byte_at(text,c,137);
+    c=byte_at(text,c,modrm(1,0,4));c=byte_at(text,c,sib_rsp());
+    c=byte_at(text,c,slot+2);
+    // The gate names a LINEAR address, not a code offset. `lea rax, [rip + d]`
+    // yields the distance from the load base to the stub - a small number like
+    // 104 - and storing that sends the trap to the first page, which is where
+    // this probe was dying after every other fault was fixed. The address the
+    // CPU jumps to is absolute, and the image is not loaded at a known one, so
+    // rax has to be built at run time:
+    //   call +0  : pushes the linear address of the byte after the call
+    //   pop rax  : takes it, so rax is linear and position independent
+    //   add rax, d: moves it from there to the stub, which is at witness_len
+    // call rel32 with a zero displacement, REX-free: E8, 00 00 00 00
+    c=byte_at(text,c,232);c=long_at(text,c,0);
+    // pop rax
+    c=byte_at(text,c,88);
+    // add rax, witness_len - witness_stub_from : REX.W, 83, /0, rax, imm8.
+    // The sign extended four byte form, which is what the frozen encoder
+    // chooses for a distance this small and which the gate pins byte for byte.
+    c=byte_at(text,c,72);c=byte_at(text,c,131);
+    c=byte_at(text,c,modrm(3,0,0));
+    c=byte_at(text,c,witness_len()-witness_stub_from());
+    // mov word [rsp + slot], ax : offset[15:0]
+    c=byte_at(text,c,102);c=byte_at(text,c,137);
+    c=byte_at(text,c,modrm(1,0,4));c=byte_at(text,c,sib_rsp());
+    c=byte_at(text,c,slot);
+    // mov byte [rsp + slot + 4], 0 : the interrupt stack table
+    c=byte_at(text,c,198);c=byte_at(text,c,modrm(1,0,4));
+    c=byte_at(text,c,sib_rsp());c=byte_at(text,c,slot+4);c=byte_at(text,c,0);
+    // mov byte [rsp + slot + 5], gate_type : present, DPL 0, 64 bit interrupt
+    // gate. 0xEE reads as DPL 3, which a CPL 0 firmware may not enter, and the
+    // refusal is a #GP(vector*8+2) indistinguishable from a missing gate.
+    c=byte_at(text,c,198);c=byte_at(text,c,modrm(1,0,4));
+    c=byte_at(text,c,sib_rsp());c=byte_at(text,c,slot+5);
+    c=byte_at(text,c,gate_type());
+    // mov qword [rsp + slot + 8], 0 : offset[63:32] and the reserved qword.
+    // A 0x8E gate has a thirty two bit offset and the CPU never reads them,
+    // but the entry is sixteen bytes and the reference make_gate zeroes them,
+    // so a read back of the whole gate is a read back of an entry, not of a
+    // field surrounded by whatever the frame happened to hold.
+    c=byte_at(text,c,72);c=byte_at(text,c,199);
+    c=byte_at(text,c,modrm(1,0,4));c=byte_at(text,c,sib_rsp());
+    c=byte_at(text,c,slot+8);c=long_at(text,c,0);
+    // shr rax, 16 : REX.W, C1, /5, rax, 0x10. rax now holds the linear address
+    // of the stub, so the two halves of the thirty two bit offset the gate
+    // carries are SIXTEEN bits apart: offset[15:0] is stored above from the low
+    // half, and after this shift the low half holds offset[31:16]. Shifting by
+    // thirty two, as this probe did, stored the bits above what a gate can
+    // name, which for every image the firmware loads is zero.
+    c=byte_at(text,c,72);c=byte_at(text,c,193);
+    c=byte_at(text,c,modrm(3,5,0));c=byte_at(text,c,16);
+    // mov word [rsp + slot + 6], ax : offset[31:16]
+    c=byte_at(text,c,102);c=byte_at(text,c,137);
+    c=byte_at(text,c,modrm(1,0,4));c=byte_at(text,c,sib_rsp());
+    c=byte_at(text,c,slot+6);
+    // mov word [rsp + desc], limit : the IDT descriptor limit, disp32 frame
+    c=byte_at(text,c,102);c=byte_at(text,c,199);
+    c=byte_at(text,c,modrm(2,0,4));c=byte_at(text,c,sib_rsp());
+    c=long_at(text,c,witness_desc());c=word_at(text,c,witness_limit());
+    // mov [rsp + desc + 2], rsp : the descriptor base, disp32 frame
+    c=byte_at(text,c,72);c=byte_at(text,c,137);
+    c=byte_at(text,c,modrm(2,4,4));c=byte_at(text,c,sib_rsp());
+    c=long_at(text,c,witness_desc()+2);
+    // lidt [rsp + desc] : 0F 01, /3, disp32 frame
+    c=byte_at(text,c,15);c=byte_at(text,c,1);
+    c=byte_at(text,c,modrm(2,3,4));c=byte_at(text,c,sib_rsp());
+    c=long_at(text,c,witness_desc());
+    let installed:u64=c;
+    // mov eax, marker : the value the stub has to carry across the frame
+    c=byte_at(text,c,184);c=long_at(text,c,witness_marker());
+    // ud2 : the instruction that raises vector 6, two bytes, which is exactly
+    // the advance the proven profile declares.
+    c=byte_at(text,c,15);c=byte_at(text,c,11);
+    // add rsp, frame : REX.W, 81, /0, rsp, imm32, the same size the sub took
+    c=byte_at(text,c,72);c=byte_at(text,c,129);
+    c=byte_at(text,c,modrm(3,0,4));c=long_at(text,c,witness_frame());
+    // lidt [rsp + restore] : put the firmware's own table back before leaving.
+    // The probe owns the IDT only while it runs. Returning with its own table
+    // still installed leaves 511 entries that are whatever the frame held, and
+    // the first timer interrupt after the return vectors through them.
+    c=byte_at(text,c,15);c=byte_at(text,c,1);
+    c=byte_at(text,c,modrm(2,3,4));c=byte_at(text,c,sib_rsp());
+    c=long_at(text,c,witness_restore());
+    // ret
+    c=byte_at(text,c,195);
+    // The early return is a CONTENT change over the same length: the first six
+    // bytes become mov eax, marker; ret, so the entry returns before any table
+    // is loaded. Every size, offset, bound and alignment in the object is byte
+    // identical to the real witness, which is the whole point: a difference in
+    // the refusal between the two can only be about content.
+    // The early return, which is a measurement aid and never ships. It runs
+    // AFTER the table is installed and returns the base the CPU now holds, read
+    // back with a second sidt, so a boot can say whether the lidt took without a
+    // monitor. The sub is unwound by the same add the real probe uses, because a
+    // return that skips it pops the middle of the frame and says nothing about
+    // the table.
+    if early!=0 {
+        let mut k:u64=installed;
+        // The diagnostic reads back the gate the CPU will actually use, at
+        // the entry the CPU will actually address, and returns the word the
+        // CPU reads first: offset[15:0] in the low half, the selector in the
+        // high half. This is a measurement and not a restatement of the
+        // arithmetic that built the gate: where the two disagree, the
+        // arithmetic is what is wrong and the gate is what the machine says.
+        // mov eax, [rsp + slot] : 8B, /0, disp8 frame
+        k=byte_at(text,k,139);k=byte_at(text,k,modrm(1,0,4));
+        k=byte_at(text,k,sib_rsp());k=byte_at(text,k,gate_slot());
+        // add rsp, frame : the sub is unwound by the same size it took
+        k=byte_at(text,k,72);k=byte_at(text,k,129);
+        k=byte_at(text,k,modrm(3,0,4));k=long_at(text,k,witness_frame());
+        // lidt [rsp + restore] : the diagnostic restores the firmware's table
+        // too, so a measurement run does not leave the firmware running on a
+        // table whose other 511 entries are frame
+        k=byte_at(text,k,15);k=byte_at(text,k,1);
+        k=byte_at(text,k,modrm(2,3,4));k=byte_at(text,k,sib_rsp());
+        k=long_at(text,k,witness_restore());
+        // ret : back to the consumer, which prints the word
+        k=byte_at(text,k,195);
+        return witness_len()+16;
+    }
+    return witness_len();
+}
+
+// Encode every record and lay the closed object out. text receives the encoded
+// bodies, strings the name and contract bytes of every symbol, order the seven
+// scratch words of every symbol, and out the record directory. answer receives
+// the one based index of the entry symbol.
+//
+// A witness image carries one more symbol than it has records: the probe is the
+// image entry, and an object names its entry. The probe is named for what it
+// is, and it carries the entry ABI of the single record the witness route
+// accepts, because that is the ABI the image is entered under.
+fn build_object(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>,work:buf<u64>,
+                text:buf<u8>,strings:buf<u8>,symbols:buf<u64>,
+                order:buf<u64>,steps:buf<u64>,prefix:u64,witness:u64,
+                answer:buf<u64>)->u64 {
+    let entries:u64=work[1];
+    let mut cursor:u64=prefix;
+    let mut names_at:u64=0;
+    let mut i:u64=0;
+    while i<entries {
+        let base:u64=record_base()+i*record();
+        let size:u64=encode_body(work,base,steps,text,cursor);
+        if size==0 { return 1; }
+        out[4+i*4]=cursor;
+        out[5+i*4]=size;
+        out[6+i*4]=work[base+4];
+        out[7+i*4]=work[base+5];
+        let name_length:u64=work[base+5]-work[base+4];
+        let contract:u64=contract_length(source,tree,work,base);
+        if contract==0 { return 8; }
+        let abi:u64=contract_node(source,tree,work,base);
+        let word:u64=i*9;
+        order[word]=names_at;
+        order[word+1]=name_length;
+        order[word+2]=contract;
+        order[word+3]=cursor;
+        order[word+4]=size;
+        order[word+5]=2+work[base+14];
+        order[word+6]=work[base+4];
+        order[word+7]=nstart(tree,abi);
+        names_at=names_at+name_length;
+        let mut j:u64=0;
+        while j<name_length { strings[order[word]+j]=source[work[base+4]+j]; j=j+1; }
+        cursor=cursor+size;
+        i=i+1;
+    }
+    let mut count:u64=entries;
+    if witness!=0 {
+        let name:buf<u8>="witness";
+        let name_length:u64=7;
+        let base:u64=record_base();
+        let contract:u64=contract_length(source,tree,work,base);
+        if contract==0 { return 8; }
+        let abi:u64=contract_node(source,tree,work,base);
+        let word:u64=count*9;
+        order[word]=names_at;
+        order[word+1]=name_length;
+        order[word+2]=contract;
+        order[word+3]=0;
+        order[word+4]=prefix;
+        order[word+5]=3;
+        order[word+6]=0;
+        order[word+7]=nstart(tree,abi);
+        let mut j:u64=0;
+        while j<name_length { strings[names_at+j]=name[j]; j=j+1; }
+        names_at=names_at+name_length;
+        count=count+1;
+    }
+    if sort_symbols(strings,order,count)!=0 { return 6; }
+    // The string table is written in SYMBOL order, because an object walks it
+    // in symbol order and refuses a name offset that is not the running cursor.
+    // A table written in canonical key order would hold the same bytes and be
+    // refused, so it is rewritten here from the source spans the sort kept.
+    let mut strings_at:u64=0;
+    let mut entry:u64=1;
+    i=0;
+    while i<count {
+        let word:u64=i*9;
+        let name_length:u64=order[word+1];
+        let contract:u64=order[word+2];
+        let name_at:u64=strings_at;
+        let mut j:u64=0;
+        if order[word+6]==0 {
+            let literal:buf<u8>="witness";
+            while j<name_length { strings[strings_at+j]=literal[j]; j=j+1; }
+        } else {
+            while j<name_length {
+                strings[strings_at+j]=source[order[word+6]+j];
+                j=j+1;
+            }
+        }
+        strings_at=strings_at+name_length;
+        let contract_at:u64=strings_at;
+        j=0;
+        while j<contract {
+            strings[strings_at+j]=source[order[word+7]+j];
+            j=j+1;
+        }
+        strings_at=strings_at+contract;
+        if order[word+3]==0 { entry=i+1; }
+        let out_word:u64=i*8;
+        symbols[out_word]=name_at;
+        symbols[out_word+1]=name_length;
+        symbols[out_word+2]=1;
+        symbols[out_word+3]=order[word+5];
+        symbols[out_word+4]=order[word+3];
+        symbols[out_word+5]=order[word+4];
+        symbols[out_word+6]=contract_at;
+        symbols[out_word+7]=contract;
+        i=i+1;
+    }
+    answer[0]=entry;
+    return 0;
+}
+
+// ------------------------------------------------------------ the image route
+//
+// Two exports and a witness pair, one image. build_pe answers the bytes to a
+// caller buffer and build_pe_and_write answers them to a file through
+// rt_open_new, rt_write and rt_close, the frozen runtime intrinsics
+// x64_lower_nxo_pe writes its images with, so this adds no new host
+// capability. Every refusal happens before any path is opened, so a rejected
+// declaration never creates a file.
+
+fn refuse_image(out:buf<u64>,entries:u64,why:u64)->u64 {
+    out[0]=0;out[1]=entries;out[2]=why;out[3]=0;return 0;
+}
+
+fn empty_image(code:u64)->ntasm_nxo_pe.ConvertResult {
+    let empty:buf<u8>=alloc(runtime(),0);
+    return ntasm_nxo_pe.ConvertResult{code:code,bytes:empty};
+}
+
+// The refusal gate the image route shares with lower, plus the ones the image
+// adds: a structured syscall stub names a handler this emitter does not link,
+// and a module with no record has no entry to start at.
+fn image_refusal(work:buf<u64>,entries:u64,witness:u64)->u64 {
+    let mut at:u64=0;
+    while at<entries {
+        let base:u64=record_base()+at*record();
+        if encodable(work,base)==false {
+            if work[base+11]!=1 || work[work[base+15]]!=scratch_rax() {
+                return 2;
+            }
+            return 1;
+        }
+        at=at+1;
+    }
+    at=0;
+    while at<entries {
+        let base:u64=record_base()+at*record();
+        if work[base+8]==kind_syscall() { return 6; }
+        at=at+1;
+    }
+    if entries==0 { return 7; }
+    // The probe raises vector 6 through a ud2, so a witness image is a single
+    // record and that record names that vector. Anything else is refused with
+    // reason 10 rather than described by a probe that would raise a different
+    // exception than the declaration asks for.
+    if witness!=0 {
+        if entries!=1 { return 10; }
+        if work[record_base()]!=witness_vector() { return 10; }
+    }
+    return 0;
+}
+
+// The whole image, owned by the caller: an empty byte buffer and the refusal
+// code on any failure. out carries the size, the record count, the .text
+// offset of the image entry, and four words per record from out[4].
+fn emit_image(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>,
+              witness:u64)->ntasm_nxo_pe.ConvertResult {
+    if tree.ok==false || tree.node_count==0 || len(out)<8 { return empty_image(800); }
+    let work:buf<u64>=alloc(runtime(),work_words(tree));
+    let code:u64=collect(source,tree,out,work);
+    if code!=0 { rt_free(runtime(),work); return empty_image(code); }
+    let entries:u64=work[1];
+    if 8+4*entries>len(out) {
+        out[0]=8+4*entries;out[1]=len(out);out[2]=3;out[3]=0;
+        rt_free(runtime(),work);return empty_image(306);
+    }
+    let why:u64=image_refusal(work,entries,witness);
+    if why!=0 {
+        rt_free(runtime(),work);
+        refuse_image(out,entries,why);
+        return empty_image(306);
+    }
+    let mut strings_needed:u64=0;
+    let mut at:u64=0;
+    while at<entries {
+        let base:u64=record_base()+at*record();
+        strings_needed=strings_needed+(work[base+5]-work[base+4])
+                               +contract_length(source,tree,work,base);
+        at=at+1;
+    }
+    if witness!=0 {
+        strings_needed=strings_needed+7
+                               +contract_length(source,tree,work,record_base());
+    }
+    // The symbol and order tables carry one row per record and one more for the
+    // probe of a witness image, so their length is a SYMBOL COUNT. Sizing them
+    // by the witness code instead is invisible on the shipped witness, where
+    // the code happens to be 1 and 1+1 is the count, and refused by
+    // ntasm_nxo.validate on every other code: validate walks the whole of
+    // len(symbols)/8 rows and reads the unbuilt tail as names.
+    let mut extra:u64=0;
+    if witness!=0 { extra=1; }
+    let mut rows:u64=entries+extra;
+    let mut prefix:u64=0;
+    let mut early:u64=0;
+    if witness==1 { prefix=witness_len(); }
+    if witness==3 { prefix=witness_len()+16;early=1; }
+    let scratch:buf<u8>=alloc(runtime(),prefix+body_bound()*entries);
+    if witness==1 || witness==3 { emit_probe(scratch,0,early); }
+    if witness==2 { emit_early(scratch,0); }
+    let strings:buf<u8>=alloc(runtime(),strings_needed);
+    let symbols:buf<u64>=alloc(runtime(),8*rows);
+    let order:buf<u64>=alloc(runtime(),9*rows);
+    let steps:buf<u64>=alloc(runtime(),step_bound());
+    let answer:buf<u64>=alloc(runtime(),1);
+    let built:u64=build_object(source,tree,out,work,scratch,strings,symbols,
+                               order,steps,prefix,witness,answer);
+    if built!=0 {
+        rt_free(runtime(),steps);rt_free(runtime(),order);
+        rt_free(runtime(),symbols);rt_free(runtime(),strings);
+        rt_free(runtime(),answer);rt_free(runtime(),scratch);
+        rt_free(runtime(),work);
+        refuse_image(out,entries,built);
+        return empty_image(306);
+    }
+    // The object carries exactly the bytes the records measured, never the
+    // ceiling the encoder reserved: a .text that kept its padding would put a
+    // run of zero bytes between the last stub and the end of the section, and
+    // the PE the C writer builds for the same object would not have them.
+    let mut used:u64=prefix;
+    if entries>0 { used=out[4+(entries-1)*4]+out[5+(entries-1)*4]; }
+    let text:buf<u8>=alloc(runtime(),used);
+    if used>0 {
+        let measured:buf<u8>=slice(scratch,0,used);
+        ntasm_pe.copy(text,0,measured);
+        rt_free(runtime(),measured);
+    }
+    rt_free(runtime(),scratch);
+    let rdata:buf<u8>=alloc(runtime(),0);
+    let data:buf<u8>=alloc(runtime(),0);
+    let relocations:buf<u64>=alloc(runtime(),0);
+    let object:ntasm_nxo.Object=ntasm_nxo.Object{
+        target:1,entry:answer[0],text:text,rdata:rdata,data:data,
+        symbols:symbols,relocations:relocations,strings:strings};
+    let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(object);
+    ntasm_nxo.release(object);
+    rt_free(runtime(),steps);rt_free(runtime(),order);
+    rt_free(runtime(),answer);rt_free(runtime(),work);
+    if converted.code!=0 {
+        let fault:buf<u8>=converted.bytes;
+        rt_free(runtime(),fault);
+        // The conversion code is published: a producer that refuses an object
+        // it built must say which of the object rules it broke.
+        out[0]=0;out[1]=entries;out[2]=8;out[3]=converted.code;
+        return empty_image(841);
+    }
+    let bytes:buf<u8>=converted.bytes;
+    out[0]=len(bytes);
+    out[1]=entries;
+    // The image entry is the first byte of the text: the probe of a witness
+    // image, and the first generated stub of a plain one, because the symbols
+    // go into the object in ascending name order and the first of them is the
+    // one laid out at offset zero.
+    out[2]=0;
+    out[3]=0;
+    return converted;
+}
+
+// Encode every structured declaration of an NTASM tree and lay the generated
+// stubs out as a PE image in the caller's byte buffer.
+// out[0]=image bytes, out[1]=records, out[2]=the .text offset of the image
+// entry, out[3]=0, then four words per record from out[4]: its .text offset,
+// its body size, and the start and end of its symbol in the caller source.
+//
+// Returns 0 on success. 305 is the declaration refusal of check with the same
+// verdict in out[0..3]. 306 is an image refusal: reason 1 when a record no
+// proven profile encodes, reason 2 when its save set is not one a profile
+// preserves, reason 3 when out is shorter than 8+4*records with out[0]=words
+// needed and out[1]=words available, reason 6 when a record is a structured
+// syscall stub whose handler call this emitter does not link, reason 7 when
+// the module declares no record, reason 8 when the object or its conversion
+// refuses, with out[3]=the conversion code; the reasons that carry no
+// capacity answer out[0]=0 and out[1]=records. 840 when the caller's buffer
+// is shorter than the image, with out[0]=image bytes. 800 with no write on an
+// invalid tree or an out shorter than eight words. Neither source nor tree is
+// owned or released.
+export fn build_pe(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>,
+                   pe:buf<u8>)->u64 {
+    let converted:ntasm_nxo_pe.ConvertResult=emit_image(source,tree,out,0);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 { rt_free(runtime(),bytes); return converted.code; }
+    let size:u64=len(bytes);
+    if size>len(pe) {
+        rt_free(runtime(),bytes);
+        out[0]=size;out[2]=9;out[3]=0;
+        return 840;
+    }
+    ntasm_pe.copy(pe,0,bytes);
+    rt_free(runtime(),bytes);
+    return 0;
+}
+
+// The same image, written to a file. 830 open refused, 831 short write and 832
+// close refused, the codes of the file route of x64_lower_nxo_pe. out carries
+// the same answer build_pe publishes, so a caller can compare the size the
+// producer claims with the length of the file on disk.
+export fn build_pe_and_write(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>,
+                             path:buf<u8>)->u64 {
+    let converted:ntasm_nxo_pe.ConvertResult=emit_image(source,tree,out,0);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 { rt_free(runtime(),bytes); return converted.code; }
+    let size:u64=len(bytes);
+    let handle:u64=rt_open_new(runtime(),path);
+    if handle==0 { rt_free(runtime(),bytes); return 830; }
+    let written:u64=rt_write(runtime(),handle,bytes);
+    let closed:u64=rt_close(runtime(),handle);
+    rt_free(runtime(),bytes);
+    if written!=size { return 831; }
+    if closed!=0 { return 832; }
+    return 0;
+}
+
+// The witness image: the same generated stub, preceded by the probe that takes
+// a real #UD through it, so a firmware can execute the declaration rather than
+// only compare its bytes. out carries the same answer build_pe publishes, and
+// out[2] is the offset of the probe, which is the image entry.
+//
+// 306 reason 10 refuses anything the probe cannot raise honestly: a module
+// that does not declare exactly one record, or one whose vector is not the one
+// the probe triggers. Every other refusal is the one build_pe answers, because
+// it is the same encoder behind a different prefix.
+export fn build_witness_pe(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>,
+                           pe:buf<u8>)->u64 {
+    let converted:ntasm_nxo_pe.ConvertResult=emit_image(source,tree,out,1);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 { rt_free(runtime(),bytes); return converted.code; }
+    let size:u64=len(bytes);
+    if size>len(pe) {
+        rt_free(runtime(),bytes);
+        out[0]=size;out[2]=9;out[3]=0;
+        return 840;
+    }
+    ntasm_pe.copy(pe,0,bytes);
+    rt_free(runtime(),bytes);
+    return 0;
+}
+
+// The witness image written to a file, which is the route the QEMU campaign
+// boots. Same codes as build_pe_and_write.
+export fn build_witness_pe_and_write(source:buf<u8>,tree:ntasm_ast.Tree,
+                                     out:buf<u64>,path:buf<u8>)->u64 {
+    let converted:ntasm_nxo_pe.ConvertResult=emit_image(source,tree,out,1);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 { rt_free(runtime(),bytes); return converted.code; }
+    let size:u64=len(bytes);
+    let handle:u64=rt_open_new(runtime(),path);
+    if handle==0 { rt_free(runtime(),bytes); return 830; }
+    let written:u64=rt_write(runtime(),handle,bytes);
+    let closed:u64=rt_close(runtime(),handle);
+    rt_free(runtime(),bytes);
+    if written!=size { return 831; }
+    if closed!=0 { return 832; }
+    return 0;
+}
+
+// The DIAGNOSTIC image, and its file route. It is a measurement aid, not a
+// deliverable: the probe is the real 106 byte probe with its first six bytes
+// replaced by mov eax, marker; ret, so the entry returns before any table is
+// loaded. Same length, same offsets, same symbol table as the real witness, so
+// a boot that reports the marker proves the consumer path, the image and the
+// call convention, and proves nothing about the trap. Nothing in the shipped
+// witness image contains these bytes, and the gate pins only the real probe.
+export fn build_diagnostic_pe(source:buf<u8>,tree:ntasm_ast.Tree,
+                              out:buf<u64>,pe:buf<u8>)->u64 {
+    let converted:ntasm_nxo_pe.ConvertResult=emit_image(source,tree,out,3);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 { rt_free(runtime(),bytes); return converted.code; }
+    let size:u64=len(bytes);
+    if size>len(pe) {
+        rt_free(runtime(),bytes);
+        out[0]=size;out[2]=9;out[3]=0;
+        return 840;
+    }
+    ntasm_pe.copy(pe,0,bytes);
+    rt_free(runtime(),bytes);
+    return 0;
+}
+
+export fn build_diagnostic_pe_and_write(source:buf<u8>,tree:ntasm_ast.Tree,
+                                        out:buf<u64>,path:buf<u8>)->u64 {
+    let converted:ntasm_nxo_pe.ConvertResult=emit_image(source,tree,out,3);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 { rt_free(runtime(),bytes); return converted.code; }
+    let size:u64=len(bytes);
+    let handle:u64=rt_open_new(runtime(),path);
+    if handle==0 { rt_free(runtime(),bytes); return 830; }
+    let written:u64=rt_write(runtime(),handle,bytes);
+    let closed:u64=rt_close(runtime(),handle);
+    rt_free(runtime(),bytes);
+    if written!=size { return 831; }
+    if closed!=0 { return 832; }
+    return 0;
+}
+
+
+// ------------------------------------------------------ the graft route (A6)
+//
+// A6, 13 October 2026 (Claude). THE SAFE-RETURN SYSCALL STUB IS AN ORDINARY
+// FUNCTION, and the reference says so: frontend.c builds, for each entry of a
+// `stub_table t kind syscall`, the function `SYMBOL()->u64 { return HANDLER() }`
+// and compiles it like any other. `graft` gives the common chain the same
+// function AS TREE NODES, never as text: the declaration is read from the AST
+// (section 11: "lue depuis l'AST, jamais reconstruite par concatenation de texte
+// et jamais re-lexee"), validated by `collect` with its own positions, and every
+// grafted node cites a span the source already holds --
+//
+//   fn         the entry node (its position is the declaration's)
+//   name       a copy of the entry's `symbol` node
+//   -> u64     a copy of the handler's result type, which must spell `u64`:
+//              C gives the stub the type u64 and refuses a handler of any
+//              other result; the declaration itself carries no type text
+//   abi        a clause whose name is a copy of the entry's `entry_abi`
+//              (nx64-abi-v0, the only one collect admits), so a module
+//              `default_abi` never reaches the stub -- C sets fn->abi to it
+//   effects {} and clobbers {}: EMPTY sets, as C declares them (the generated
+//              function is an ordinary one; frontend.c then refuses, E501
+//              "omits an inferred effect", a handler that has effects). An
+//              empty set is a node without children; it carries the
+//              declaration's position and no text
+//   { return HANDLER() }  block, return and call nodes at the entry, the call
+//              head a copy of the entry's `handler` subtree
+//
+// -- so no byte of text is produced and the lexer is never called. The table
+// node is unlinked from the unit in the copy; the caller's tree is not touched.
+// The grafted functions are appended to the module's `.text` section.
+//
+// AN INTERRUPT TABLE IS NOT GRAFTED. Its body ends in IRETQ, which the Machine
+// IR does not carry; it is produced by build_pe and its witness. A module that
+// holds one is refused here with 306 reason 11 rather than lowered without it.
+// Reasons added to 306: 11 interrupt table, 12 handler declaration or one of
+// its parts unreadable, 14 no `.text` section to graft into, 15 a handler
+// whose result type is not exactly `u64`.
+
+export struct Grafted { code:u64, owned:bool, tree:ntasm_ast.Tree }
+
+// True when the tree declares a structured stub table.
+export fn has_tables(tree:ntasm_ast.Tree)->bool {
+    if tree.ok==false { return false; }
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        if nkind(tree,id)==15 { return true; }
+        id=id+1;
+    }
+    return false;
+}
+
+// The declaration of the callable spelled start..end, 0 when there is none.
+fn declaration_of(source:buf<u8>,tree:ntasm_ast.Tree,start:u64,end:u64)->u64 {
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let kind:u64=nkind(tree,id);
+        if kind==18 || kind==9 {
+            let name_id:u64=decl_name_id(tree,id);
+            if name_id!=0 && same_span(source,nstart(tree,name_id),nend(tree,name_id),start,end) {
+                return id;
+            }
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// The first child of a declaration with the given node kind (36 the result
+// type, 20 effects, 21 clobbers), 0 when it has none.
+fn decl_part(tree:ntasm_ast.Tree,decl_id:u64,kind:u64)->u64 {
+    let mut at:u64=nfirst(tree,decl_id);
+    while at!=0 {
+        if nkind(tree,at)==kind { return at; }
+        at=nnext(tree,at);
+    }
+    return 0;
+}
+
+// The `.text` section node of the unit, 0 when there is none.
+fn text_section(source:buf<u8>,tree:ntasm_ast.Tree)->u64 {
+    let text:buf<u8>="text";
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        if nkind(tree,id)==17 {
+            let label:u64=nfirst(tree,id);
+            if label!=0 && nkind(tree,label)==93 {
+                let word:u64=nfirst(tree,label);
+                if word!=0 && same(source,nstart(tree,word),nend(tree,word),text) { return id; }
+            }
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// True when the type node spells exactly `u64`.
+fn spells_u64(source:buf<u8>,tree:ntasm_ast.Tree,type_id:u64)->bool {
+    if type_id==0 || nkind(tree,type_id)!=36 || naux(tree,type_id)!=0 { return false; }
+    let word:u64=nfirst(tree,type_id);
+    if word==0 || nnext(tree,word)!=0 { return false; }
+    let u64_text:buf<u8>="u64";
+    return same(source,nstart(tree,word),nend(tree,word),u64_text);
+}
+
+fn subtree_nodes(tree:ntasm_ast.Tree,id:u64)->u64 {
+    let mut total:u64=1;
+    let mut at:u64=nfirst(tree,id);
+    while at!=0 { total=total+subtree_nodes(tree,at); at=nnext(tree,at); }
+    return total;
+}
+// The same count with every stub table subtree (kind 15) left out.
+fn kept_nodes(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if nkind(tree,id)==15 { return 0; }
+    let mut total:u64=1;
+    let mut at:u64=nfirst(tree,id);
+    while at!=0 { total=total+kept_nodes(tree,at); at=nnext(tree,at); }
+    return total;
+}
+
+// Node words of the grafted array, by one-based id.
+fn gset(nodes:buf<u64>,id:u64,field:u64,value:u64)->u64 {
+    nodes[(id-1)*12+field]=value;
+    return 0;
+}
+fn gget(nodes:buf<u64>,id:u64,field:u64)->u64 { return nodes[(id-1)*12+field]; }
+fn gattach(nodes:buf<u64>,parent:u64,child:u64)->u64 {
+    let last:u64=gget(nodes,parent,9);
+    if last==0 { gset(nodes,parent,8,child); } else { gset(nodes,last,10,child); }
+    gset(nodes,parent,9,child);
+    return child;
+}
+// A new node of `kind` at slot `id`, carrying the position words (token range,
+// source, line, column and span) of the original node `like`.
+fn gnew(tree:ntasm_ast.Tree,nodes:buf<u64>,id:u64,kind:u64,like:u64,aux_value:u64)->u64 {
+    let mut f:u64=1;
+    while f<8 { gset(nodes,id,f,tree.node_words[(like-1)*12+f]); f=f+1; }
+    gset(nodes,id,0,kind);
+    gset(nodes,id,8,0);gset(nodes,id,9,0);gset(nodes,id,10,0);
+    gset(nodes,id,11,aux_value);
+    return id;
+}
+// A copy of the subtree at `from` placed from slot `at` onward; answers the
+// next free slot. The root of the copy is `at`.
+fn gclone(tree:ntasm_ast.Tree,nodes:buf<u64>,at:u64,from:u64)->u64 {
+    let mut f:u64=0;
+    while f<12 { gset(nodes,at,f,tree.node_words[(from-1)*12+f]); f=f+1; }
+    gset(nodes,at,8,0);gset(nodes,at,9,0);gset(nodes,at,10,0);
+    let mut next:u64=at+1;
+    let mut child:u64=nfirst(tree,from);
+    while child!=0 {
+        let root:u64=next;
+        next=gclone(tree,nodes,next,child);
+        gattach(nodes,at,root);
+        child=nnext(tree,child);
+    }
+    return next;
+}
+
+// A copy of the subtree at `from`, stub tables left out, placed from slot `at`
+// in pre-order (the parser's own numbering order); answers the next free slot.
+// `want` is an original node id whose new id is published in found[0].
+fn gclone_kept(source:buf<u8>,tree:ntasm_ast.Tree,nodes:buf<u64>,at:u64,from:u64,
+               want:u64,found:buf<u64>,work:buf<u64>,entries:u64)->u64 {
+    let mut f:u64=0;
+    while f<12 { gset(nodes,at,f,tree.node_words[(from-1)*12+f]); f=f+1; }
+    gset(nodes,at,8,0);gset(nodes,at,9,0);gset(nodes,at,10,0);
+    if from==want { found[0]=at; }
+    let mut next:u64=at+1;
+    let mut child:u64=nfirst(tree,from);
+    while child!=0 {
+        if nkind(tree,child)!=15 {
+            let root:u64=next;
+            next=gclone_kept(source,tree,nodes,next,child,want,found,work,entries);
+            gattach(nodes,at,root);
+        }
+        child=nnext(tree,child);
+    }
+    // THE GRAFTS COME RIGHT AFTER THE SECTION'S OWN DESCENDANTS, so the
+    // numbering stays a true pre-order: semantics.index walks ids 1..n and
+    // gives each function the LAST section node it met, so a function
+    // numbered after a later `.data` would be filed under it.
+    if from==want { next=graft_entries(source,tree,nodes,next,at,work,entries); }
+    return next;
+}
+
+// One function per syscall entry, numbered from `first` and appended to the
+// section node `section` of the new array; answers the next free slot.
+fn graft_entries(source:buf<u8>,tree:ntasm_ast.Tree,nodes:buf<u64>,first:u64,
+                 section:u64,work:buf<u64>,entries:u64)->u64 {
+    let mut at:u64=0;
+    let mut next:u64=first;
+    while at<entries {
+        let base:u64=record_base()+at*record();
+        let entry:u64=work[base+1];
+        let handler:u64=declaration_of(source,tree,work[base+6],work[base+7]);
+        let symbol_id:u64=field_value(tree,entry,16);
+        let handler_id:u64=field_value(tree,entry,2);
+        let abi_id:u64=field_value(tree,entry,3);
+        let mut exported:u64=0;
+        if work[base+14]!=0 { exported=1; }
+        let fn_node:u64=gnew(tree,nodes,next,18,entry,exported);
+        let name_node:u64=gnew(tree,nodes,next+1,90,symbol_id,0);
+        gattach(nodes,fn_node,name_node);
+        next=next+2;
+        let type_root:u64=next;
+        next=gclone(tree,nodes,next,decl_part(tree,handler,36));
+        gattach(nodes,fn_node,type_root);
+        let abi_node:u64=gnew(tree,nodes,next,28,entry,0);
+        next=next+1;
+        let abi_name:u64=next;
+        next=gclone(tree,nodes,next,abi_id);
+        gattach(nodes,abi_node,abi_name);
+        gattach(nodes,fn_node,abi_node);
+        let effects_node:u64=gnew(tree,nodes,next,20,entry,0);
+        let clobbers_node:u64=gnew(tree,nodes,next+1,21,entry,0);
+        next=next+2;
+        gattach(nodes,fn_node,effects_node);
+        gattach(nodes,fn_node,clobbers_node);
+        let block_node:u64=gnew(tree,nodes,next,25,entry,0);
+        let ret_node:u64=gnew(tree,nodes,next+1,29,entry,0);
+        let call_node:u64=gnew(tree,nodes,next+2,35,handler_id,1);
+        next=next+3;
+        let head_root:u64=next;
+        next=gclone(tree,nodes,next,handler_id);
+        gattach(nodes,call_node,head_root);
+        gattach(nodes,ret_node,call_node);
+        gattach(nodes,block_node,ret_node);
+        gattach(nodes,fn_node,block_node);
+        gattach(nodes,section,fn_node);
+        at=at+1;
+    }
+    return next;
+}
+
+// The tree the common chain lowers for this source: the caller's own tree
+// (owned=false) when it declares no stub table, else a copy with every table
+// unlinked and one function grafted per syscall entry (owned=true: the caller
+// frees `tree.node_words`; the token words stay the caller's). report[0..3]
+// carry the refusal: 305 from collect with its line, column, reason and detail,
+// or 306 with report[2] the reason above and the entry's line and column.
+export fn graft(source:buf<u8>,tree:ntasm_ast.Tree,report:buf<u64>)->Grafted {
+    if tree.ok==false || len(report)<4 { return Grafted{code:800,owned:false,tree:tree}; }
+    report[0]=0;report[1]=0;report[2]=0;report[3]=0;
+    if has_tables(tree)==false { return Grafted{code:0,owned:false,tree:tree}; }
+    let work:buf<u64>=alloc(runtime(),work_words(tree));
+    let code:u64=collect(source,tree,report,work);
+    if code!=0 { rt_free(runtime(),work); return Grafted{code:code,owned:false,tree:tree}; }
+    let entries:u64=work[1];
+    let section:u64=text_section(source,tree);
+    let mut extra:u64=0;
+    let mut at:u64=0;
+    while at<entries {
+        let base:u64=record_base()+at*record();
+        let entry:u64=work[base+1];
+        let mut why:u64=0;
+        if work[base+8]!=kind_syscall() { why=11; }
+        let handler:u64=declaration_of(source,tree,work[base+6],work[base+7]);
+        let symbol_id:u64=field_value(tree,entry,16);
+        let handler_id:u64=field_value(tree,entry,2);
+        let abi_id:u64=field_value(tree,entry,3);
+        let mut result:u64=0;
+        if handler!=0 { result=decl_part(tree,handler,36); }
+        if why==0 && (handler==0 || symbol_id==0 || handler_id==0 || abi_id==0
+                      || result==0) { why=12; }
+        if why==0 && spells_u64(source,tree,result)==false { why=15; }
+        if why==0 && section==0 { why=14; }
+        if why!=0 {
+            report[0]=work[base+2];report[1]=work[base+3];report[2]=why;report[3]=0;
+            rt_free(runtime(),work);
+            return Grafted{code:306,owned:false,tree:tree};
+        }
+        // fn, name, abi, effects, clobbers, block, return, call, plus the
+        // three copied subtrees (result type, entry_abi name, handler head)
+        extra=extra+8+subtree_nodes(tree,result)+subtree_nodes(tree,abi_id)
+                   +subtree_nodes(tree,handler_id);
+        at=at+1;
+    }
+    // The kept tree: every node reachable from the unit (node 1) except the
+    // stub tables, renumbered in pre-order, so no orphan of a table survives
+    // for a pass that walks node ids rather than links.
+    let count:u64=kept_nodes(tree,1);
+    let nodes:buf<u64>=alloc(runtime(),(count+extra)*12);
+    let found:buf<u64>=alloc(runtime(),1);
+    found[0]=0;
+    let next:u64=gclone_kept(source,tree,nodes,1,1,section,found,work,entries);
+    let new_section:u64=found[0];
+    rt_free(runtime(),found);
+    if next!=count+extra+1 || new_section==0 {
+        rt_free(runtime(),nodes);rt_free(runtime(),work);
+        report[2]=12;
+        return Grafted{code:306,owned:false,tree:tree};
+    }
+    rt_free(runtime(),work);
+    let grafted:ntasm_ast.Tree=ntasm_ast.Tree{ok:true,token_words:tree.token_words,
+        token_count:tree.token_count,node_words:nodes,node_count:count+extra,
+        code:0,reason:0,source:0,line:0,column:0,start:0,end:0};
+    return Grafted{code:0,owned:true,tree:grafted};
+}

@@ -1,0 +1,375 @@
+module c_conversion_entry;
+
+import ntasm_ast;
+import c_conversion;
+import ntir;
+
+// The entry for the C -> Nova conversion. Lot 62.
+//
+// It exists because a conversion whose only witness is a module cannot be
+// driven: a C harness has to reach `convert_variable` and `compare_variable`
+// with a real NtFProgram image, and a module exports no `main`. Every mode
+// below answers one question, and none of them parses: the source arrives as
+// bytes and the C record arrives as the flat image c_conversion's own offsets
+// describe.
+//
+// NO MODE PARSES, AND THAT IS THE POINT. The conversion's job is to move a C
+// record, and a parser in front of it would be a second way of getting the
+// same facts, so a mode that parsed could pass on a source whose tree was
+// right while the conversion was wrong. The C side is the reference here, and
+// the only source this file ever sees is the bytes a C record's spans index
+// into.
+//
+//   mode 0  the layout, read back: NODE_WORDS, the three record sizes, the
+//           verdict order, the refusal codes, the mechanism ids. The driver
+//           builds its images with these numbers, so an offset that moved here
+//           moves on the C side too and the two cannot drift by transcription.
+//   mode 1  convert one NtFVariable image. report[0] is the code and
+//           report[1..12] the twelve words of the parameter node.
+//   mode 2  convert one NtFVariable image's NAME. report[0] is 1 for a node,
+//           0 for NO NODE -- the negative -- or a refusal code.
+//   mode 3  convert one NtFType image. report[0] the code, report[1..12] the
+//           node.
+//   mode 4  convert one NtFFunction image's effects. report[0..8] the two
+//           triples and the flag count.
+//   mode 5  the M_DERIVED axis, asked directly: report[0] is
+//           direction_in_span over report's own start/end, which the driver
+//           sets from a span it chose.
+//   mode 6  DECISION G. report[0] is conflated_arm, report[1..4] the proof
+//           bytes it used, report[4] is conflated_arm_refuses as 0 or 1.
+//   mode 7  the field-by-field comparison, which is the acceptance.
+//           report[0] is its code and report[1..8] the per-field verdicts.
+//
+// `name` is a SEPARATE twelve-word buffer because the symbol is a separate
+// node on both sides; mode 2 writes it and mode 7 reads it, and mode 1 does
+// not touch it. That separation is the false-positive control's subject.
+// How many words mode 10 publishes: five of NtFType, twenty-one of
+// NtFVariable and thirty-five of NtFFunction. It is a CONSTANT rather than
+// something read back from the table itself, because a size derived from the
+// entries it is sizing cannot catch an entry that was left out.
+fn OFFSET_TABLE_WORDS()->u64 { return 5+21+35; }
+
+export fn main(source:buf<u8>,mode:u64,index:u64,cimg:buf<u64>,cimg_words:u64,
+        out:buf<u64>,out_words:u64,node:buf<u64>,name:buf<u64>,
+        report:buf<u64>,scratch:buf<u64>)->u64 {
+    if len(report)<16 { return 800; }
+    let mut i:u64=0;
+    while i<16 { report[i]=0; i=i+1; }
+
+    if mode==0 {
+        report[0]=c_conversion.NODE_WORDS();
+        report[1]=c_conversion.C_TYPE_WORDS();
+        report[2]=c_conversion.C_VAR_WORDS();
+        report[3]=c_conversion.C_FN_WORDS();
+        report[4]=c_conversion.VERDICT_WORDS();
+        report[5]=c_conversion.V_SYMBOL();
+        report[6]=c_conversion.V_TYPE();
+        report[7]=c_conversion.V_POSITION();
+        report[8]=c_conversion.V_EFFECT();
+        report[9]=c_conversion.V_SPACE();
+        report[10]=c_conversion.V_DIRECTION();
+        report[11]=c_conversion.V_CONFLATION();
+        report[12]=c_conversion.M_COPIED();
+        report[13]=c_conversion.M_ENUMS();
+        report[14]=c_conversion.M_DERIVED();
+        // THE REFUSAL CODES, published for the same reason as the offsets: a
+        // driver that wrote them down would drift the moment a code was
+        // renumbered, and a refusal is the one value a reader must not get
+        // wrong. A driver comparing against a stale 616 would report a
+        // refusal that is not the refusal.
+        report[20]=c_conversion.R_NO_SOURCE();
+        report[21]=c_conversion.R_BAD_SPAN();
+        report[22]=c_conversion.R_NO_TYPE_KIND();
+        report[23]=c_conversion.R_SHORT_IMAGE();
+        report[24]=c_conversion.R_EFFECT_LOSS();
+        report[25]=c_conversion.R_SPACE_CONFLICT();
+        report[26]=c_conversion.R_NO_DECL_SPAN();
+        report[16]=c_conversion.C_VAR_NAME_START();
+        report[17]=c_conversion.C_VAR_NAME_LEN();
+        report[18]=c_conversion.C_VAR_DECL_START();
+        report[19]=c_conversion.C_VAR_DECL_END();
+        // V_MECHANISM, AND THIS SLOT WAS MISSING WHILE SEVEN OF EIGHT SHIPPED.
+        //
+        // report[5..11] carry the first SEVEN verdict fields and report[12]
+        // begins the mechanism ids, so mode 0 published seven of the eight and
+        // never said which one was missing. A driver that assumed eight slots
+        // read report[12], received M_COPIED, and reported a verdict-field
+        // collision -- which names the DRIVER and not the module.
+        //
+        // A field the mode does not publish is a field nobody can cite. The
+        // gate worked around it by DERIVING V_MECHANISM as the one unclaimed
+        // value in [0, VERDICT_WORDS): a reader holding a torch in a room that
+        // should have a light switch. It works, it is not nothing, and it is
+        // worse than the switch. So here is the switch.
+        //
+        // report[27], not report[12]: the mechanism ids occupy 12..14, the
+        // C_VAR_ offsets 16..19 and the refusal codes 20..26, so 27 is the next
+        // free slot and nothing above it moves. The harness's derivation will
+        // now find NO unclaimed slot and go RED, which is the point -- it was
+        // written to fail when this gap closed, and this is that happening.
+        report[27]=c_conversion.V_MECHANISM();
+        if c_conversion.node_record_is_unchanged()==true { report[15]=1; }
+        else { report[15]=0; }
+        return 0;
+    }
+
+    if len(node)<c_conversion.NODE_WORDS() { return 800; }
+    if len(out)<c_conversion.VERDICT_WORDS() { return 800; }
+    if len(scratch)<8 { return 800; }
+    if len(name)<c_conversion.NODE_WORDS() { return 800; }
+
+    if mode==1 {
+        // `index` is the word offset of the NtFVariable record inside cimg,
+        // so the C side lays its records out by this module's own stride.
+        // `out` is the verdict scratch and is copied into report afterwards,
+        // because this language has no pointer arithmetic on a buf and a
+        // `report+1` would be a second convention for "the rest of".
+        let code:u64=c_conversion.convert_variable(source,cimg,index,node,out);
+        report[0]=code;
+        let mut j:u64=0;
+        while j<c_conversion.VERDICT_WORDS() { report[1+j]=out[j]; j=j+1; }
+        return 0;
+    }
+    if mode==2 {
+        let code:u64=c_conversion.convert_symbol(source,cimg,index,name);
+        report[0]=code;
+        if code==1 {
+            report[1]=name[0];report[2]=name[6];report[3]=name[7];
+        }
+        return 0;
+    }
+    if mode==3 {
+        let code:u64=c_conversion.convert_type(source,cimg,index,node);
+        report[0]=code;
+        report[1]=node[0];report[2]=node[11];
+        return 0;
+    }
+    if mode==4 {
+        let code:u64=c_conversion.convert_effects(cimg,index,out);
+        report[0]=code;
+        let mut j:u64=0;
+        while j<8 { report[1+j]=out[j]; j=j+1; }
+        return 0;
+    }
+    if mode==5 {
+        // The span comes from cimg[0] and cimg[1] so the driver can name a
+        // span it did not get from a converted node -- which is the only way
+        // to ask the DERIVED axis a question the conversion did not set up.
+        if cimg_words<2 { return 800; }
+        let start:u64=cimg[0];
+        let end:u64=cimg[1];
+        report[0]=c_conversion.direction_in_span(source,start,end);
+        report[1]=start;report[2]=end;
+        return 0;
+    }
+    if mode==6 {
+        if cimg_words<4 { return 800; }
+        let start:u64=cimg[0];
+        let end:u64=cimg[1];
+        let kind:u64=cimg[2];
+        let arm:u64=c_conversion.conflated_arm(source,start,end,kind,out);
+        report[0]=arm;
+        report[1]=out[0];report[2]=out[1];report[3]=out[2];
+        if c_conversion.conflated_arm_refuses(source,start,end,kind)==true {
+            report[4]=1;
+        } else { report[4]=0; }
+        return 0;
+    }
+    if mode==7 {
+        // THE ACCEPTANCE. `index` is the variable record's word offset and
+        // cimg[0] says whether a name node was written into `name`. The
+        // comparison walks the five preserved fields and returns the first
+        // that differs; `out` is the per-field verdict scratch.
+        if cimg_words<1 { return 800; }
+        let present:u64=cimg[0];
+        let code:u64=c_conversion.compare_variable(source,cimg,index,node,
+            name,present,out);
+        report[0]=code;
+        let mut j:u64=0;
+        while j<c_conversion.VERDICT_WORDS() { report[1+j]=out[j]; j=j+1; }
+        return 0;
+    }
+    if mode==10 {
+        // THE WHOLE OFFSET TABLE, in declaration order, into `out`.
+        //
+        // Mode 0 publishes the numbers the driver asks for ONE AT A TIME and
+        // the first version of the driver transcribed the other eighty into
+        // its own lay_var and lay_fn. That is the exact thing this module
+        // exists to replace -- a table of C field numbers that nobody can
+        // re-derive -- so the whole table is published and the driver reads
+        // every one of them. A number written down in the driver is a number
+        // that can be wrong, and the only defence against a wrong one is that
+        // it was never written down.
+        if len(out)<OFFSET_TABLE_WORDS() { return 800; }
+        let mut k:u64=0;
+        // NtFType, five words, in the struct's declaration order.
+        out[k]=c_conversion.C_TYPE_KIND();k=k+1;
+        out[k]=c_conversion.C_TYPE_SPACE();k=k+1;
+        out[k]=c_conversion.C_TYPE_ELEMENT();k=k+1;
+        out[k]=c_conversion.C_TYPE_COUNT();k=k+1;
+        out[k]=c_conversion.C_TYPE_BITS();k=k+1;
+        // NtFVariable, twenty-one.
+        out[k]=c_conversion.C_VAR_NAME_START();k=k+1;
+        out[k]=c_conversion.C_VAR_NAME_LEN();k=k+1;
+        out[k]=c_conversion.C_VAR_SPAN_SOURCE();k=k+1;
+        out[k]=c_conversion.C_VAR_SPAN_LINE();k=k+1;
+        out[k]=c_conversion.C_VAR_SPAN_COLUMN();k=k+1;
+        out[k]=c_conversion.C_VAR_SPAN_START();k=k+1;
+        out[k]=c_conversion.C_VAR_SPAN_END();k=k+1;
+        out[k]=c_conversion.C_VAR_TYPE();k=k+1;
+        out[k]=c_conversion.C_VAR_FUNCTION();k=k+1;
+        out[k]=c_conversion.C_VAR_MODULE();k=k+1;
+        out[k]=c_conversion.C_VAR_INITIALIZER();k=k+1;
+        out[k]=c_conversion.C_VAR_DIRECTION();k=k+1;
+        out[k]=c_conversion.C_VAR_REG_FAMILY();k=k+1;
+        out[k]=c_conversion.C_VAR_REG_BITS();k=k+1;
+        out[k]=c_conversion.C_VAR_REG_HIGH8();k=k+1;
+        out[k]=c_conversion.C_VAR_EXPORTED();k=k+1;
+        out[k]=c_conversion.C_VAR_SECTION_START();k=k+1;
+        out[k]=c_conversion.C_VAR_SECTION_LEN();k=k+1;
+        out[k]=c_conversion.C_VAR_SCOPE();k=k+1;
+        out[k]=c_conversion.C_VAR_DECL_START();k=k+1;
+        out[k]=c_conversion.C_VAR_DECL_END();k=k+1;
+        // NtFFunction, thirty-five.
+        out[k]=c_conversion.C_FN_NAME_START();k=k+1;
+        out[k]=c_conversion.C_FN_NAME_LEN();k=k+1;
+        out[k]=c_conversion.C_FN_ABI_START();k=k+1;
+        out[k]=c_conversion.C_FN_ABI_LEN();k=k+1;
+        out[k]=c_conversion.C_FN_SECTION_START();k=k+1;
+        out[k]=c_conversion.C_FN_SECTION_LEN();k=k+1;
+        out[k]=c_conversion.C_FN_SPAN_SOURCE();k=k+1;
+        out[k]=c_conversion.C_FN_SPAN_LINE();k=k+1;
+        out[k]=c_conversion.C_FN_SPAN_COLUMN();k=k+1;
+        out[k]=c_conversion.C_FN_SPAN_START();k=k+1;
+        out[k]=c_conversion.C_FN_SPAN_END();k=k+1;
+        out[k]=c_conversion.C_FN_MODULE();k=k+1;
+        out[k]=c_conversion.C_FN_RETURN_TYPE();k=k+1;
+        out[k]=c_conversion.C_FN_FIRST_PARAM();k=k+1;
+        out[k]=c_conversion.C_FN_BODY();k=k+1;
+        out[k]=c_conversion.C_FN_REQUIRES();k=k+1;
+        out[k]=c_conversion.C_FN_ENSURES();k=k+1;
+        out[k]=c_conversion.C_FN_PARAM_COUNT();k=k+1;
+        out[k]=c_conversion.C_FN_EFFECT_FLAGS();k=k+1;
+        out[k]=c_conversion.C_FN_EFFECT_READS();k=k+1;
+        out[k]=c_conversion.C_FN_EFFECT_WRITES();k=k+1;
+        out[k]=c_conversion.C_FN_INFERRED_FLAGS();k=k+1;
+        out[k]=c_conversion.C_FN_INFERRED_READS();k=k+1;
+        out[k]=c_conversion.C_FN_INFERRED_WRITES();k=k+1;
+        out[k]=c_conversion.C_FN_CLOBBERS();k=k+1;
+        out[k]=c_conversion.C_FN_WRITE_FOOTPRINT();k=k+1;
+        out[k]=c_conversion.C_FN_INFERRED_CLOBBERS();k=k+1;
+        out[k]=c_conversion.C_FN_EXPORTED();k=k+1;
+        out[k]=c_conversion.C_FN_IMPORTED();k=k+1;
+        out[k]=c_conversion.C_FN_IMPORT_NAME_START();k=k+1;
+        out[k]=c_conversion.C_FN_IMPORT_NAME_LEN();k=k+1;
+        out[k]=c_conversion.C_FN_RESOLVED();k=k+1;
+        out[k]=c_conversion.C_FN_GENERATED_STUB();k=k+1;
+        out[k]=c_conversion.C_FN_STUB_VECTOR();k=k+1;
+        out[k]=c_conversion.C_FN_HIGH_LEVEL_EXPRESSIONS();k=k+1;
+        report[0]=k;
+        return 0;
+    }
+    if mode==9 {
+        // THE DOWNSTREAM GATE, RUN ON WHATEVER IT IS HANDED.
+        //
+        // This is the other half of the neutral control and it exists because
+        // « the converted tree passes the downstream checks » is the false
+        // positive, so the only way to show it is false is to RUN the real
+        // check on a deliberately broken tree. ntir.nova is the module that
+        // takes an ast.Tree downstream, and ntir.verify is the check.
+        //
+        // The image is built from the node the harness hands in -- words 1..12
+        // of cimg -- with nothing repaired and nothing checked, because a
+        // repaired image would verify by construction and prove nothing. The
+        // caller damages a node; this reports what the real gate says.
+        //
+        // cimg: 0 node_count, 1..12 the node, 13 the child's kind (0 for a
+        // node with no children), 14 the child's kind (0 likewise).
+        if cimg_words<15 { return 800; }
+        let count:u64=cimg[0];
+        if count==0 || count!=1 { return 800; }
+        if len(out)<ntir.HEADER_WORDS()+ntir.NODE_WORDS() { return 800; }
+        let mut j:u64=0;
+        while j<ntir.HEADER_WORDS()+ntir.NODE_WORDS() { out[j]=0; j=j+1; }
+        out[0]=0x4E544952;   // NTIR_MAGIC, read off ntir.nova and not invented
+        out[1]=ntir.FORMAT_MAJOR();
+        out[2]=ntir.FORMAT_MINOR();
+        out[3]=count;
+        out[4]=1;           // root
+        out[5]=ntir.NODE_WORDS();
+        out[6]=count;       // ast_node_count
+        out[7]=0;           // typed_count
+        let base:u64=ntir.HEADER_WORDS();
+        let k:u64=cimg[1];
+        out[base+0]=k;                 // the kind the CALLER handed in
+        out[base+1]=cimg[4];           // source
+        out[base+2]=cimg[5];           // line
+        out[base+3]=cimg[6];           // column
+        out[base+4]=cimg[7];           // start
+        out[base+5]=cimg[8];           // end
+        out[base+6]=k;                 // ast_kind
+        out[base+7]=1;                 // ast_id
+        out[base+8]=0;                 // first_child
+        out[base+9]=0;                 // last_child
+        out[base+10]=0;                // next_sibling
+        out[base+11]=0;                // child_count
+        out[base+12]=0;                // type_width
+        out[base+13]=0;                // type_signed
+        out[base+14]=0;                // memory_space
+        out[base+15]=0;                // reg_class
+        // The verifier writes its own diagnostics, so it gets its own buffer:
+        // `scratch` is not the image and the image is not the report. An
+        // earlier version passed `report+4`, and pointer arithmetic on a buf
+        // is not in this language -- the compiler refuses it with 400
+        // "operator requires integer operands", which is the correct answer
+        // and the reason the offset form below is explicit.
+        let verdict:u64=ntir.verify(out,count,scratch);
+        let mut m:u64=0;
+        while m<4 { report[2+m]=scratch[m]; m=m+1; }
+        report[0]=verdict;
+        report[1]=k;
+        return 0;
+    }
+    if mode==8 {
+        // THE NEUTRAL CONTROL'S ENTRY. Modes 1 and 2 CONVERT and the harness
+        // holds the result; this mode does NOT convert, it takes a node and a
+        // name node the harness already has and compares them against a C
+        // record the harness already has.
+        //
+        // It exists because of a trap this file would otherwise walk into:
+        // the comparison reads the very buffers the conversion writes, so a
+        // harness that converts and then compares in one breath is comparing
+        // whatever the last write left, and cannot tell a good conversion
+        // from a damaged one. Here the three are SEPARATE inputs, so a
+        // deliberately damaged conversion reaches the comparison as data and
+        // the comparison has to refuse it on its own evidence.
+        //
+        // cimg layout, in words: 0 the name-present flag, 1..12 the parameter
+        // node, 13..24 the name node, 25.. the C record at its own stride.
+        if cimg_words<25+c_conversion.C_VAR_WORDS() { return 800; }
+        if len(node)<c_conversion.NODE_WORDS() { return 800; }
+        if len(name)<c_conversion.NODE_WORDS() { return 800; }
+        let present:u64=cimg[0];
+        // COPIED IN, NOT READ FROM THE CALLER. The first version of this mode
+        // handed compare_variable the `node` and `name` PARAMETERS, which the
+        // boundary hands over zeroed on every call, so the comparison ran
+        // against two empty records and reported a position and a symbol
+        // mismatch on a conversion that was correct. The mode was measuring
+        // its own uninitialised buffers and calling it a defect in the
+        // conversion -- the same shape as the false positive this lot exists
+        // to refuse, one level down.
+        let mut k:u64=0;
+        while k<c_conversion.NODE_WORDS() {
+            node[k]=cimg[1+k];
+            name[k]=cimg[13+k];
+            k=k+1;
+        }
+        let code:u64=c_conversion.compare_variable(source,cimg,25,node,name,
+            present,out);
+        report[0]=code;
+        let mut j:u64=0;
+        while j<c_conversion.VERDICT_WORDS() { report[1+j]=out[j]; j=j+1; }
+        return 0;
+    }
+    return 800;
+}

@@ -1,0 +1,52 @@
+module ntasm_nxo_link_pe_list_entry;
+import ntasm_nxo_pe;
+import ntasm_nxo_link_pe;
+import ntasm_pe;
+// `inputs` is one arena holding `count` 16-byte (offset,length) descriptors
+// followed by the NXO payloads: buf<u8> is the only shape that crosses the
+// Nova boundary, so a variable length link unit is described in band. This is
+// the same arena ntasm_nxo_merge.merge_list reads and the same one-field
+// wrapper it keeps per unit, because a read NXO views its sections through the
+// buffer it was given and rt_free only takes a simple name.
+// out layout matches the pairwise entry: bytes 0..8 = PE size (u64 little
+// endian), bytes 8.. = image. mode 0 links the whole arena with link_pe_list;
+// mode 1 links the first two descriptors with the pairwise link_pe, so one
+// entry can compare both widths on the same two units. 827: out is too short
+// to hold 8+size bytes; nothing is written and the PE bytes are freed, so the
+// call is transactional.
+struct Unit { file:buf<u8> }
+fn forward(result:ntasm_nxo_pe.ConvertResult,out:buf<u8>)->u64 {
+    let bytes:buf<u8>=result.bytes;
+    if result.code!=0 { rt_free(runtime(),bytes);return result.code; }
+    let size:u64=len(bytes);
+    if len(out)<8 || size>len(out)-8 { rt_free(runtime(),bytes);return 827; }
+    ntasm_pe.copy(out,8,bytes);
+    rt_free(runtime(),bytes);
+    ntasm_pe.put64(out,0,size);
+    return 0;
+}
+fn pair(inputs:buf<u8>,count:u64,out:buf<u8>)->u64 {
+    if count<2 || len(inputs)<32 { return 800; }
+    let lo:u64=ntasm_pe.read64(inputs,0);
+    let ll:u64=ntasm_pe.read64(inputs,8);
+    let ro:u64=ntasm_pe.read64(inputs,16);
+    let rl:u64=ntasm_pe.read64(inputs,24);
+    if lo>len(inputs) || ll>len(inputs)-lo { return 800; }
+    if ro>len(inputs) || rl>len(inputs)-ro { return 800; }
+    let units:buf<Unit>=alloc(runtime(),2);
+    let one:buf<u8>=slice(inputs,lo,ll);
+    let two:buf<u8>=slice(inputs,ro,rl);
+    units[0]=Unit{file:one};
+    units[1]=Unit{file:two};
+    let left:buf<u8>=units[0].file;
+    let right:buf<u8>=units[1].file;
+    let result:ntasm_nxo_pe.ConvertResult=ntasm_nxo_link_pe.link_pe(left,right);
+    rt_free(runtime(),left);
+    rt_free(runtime(),right);
+    rt_free(runtime(),units);
+    return forward(result,out);
+}
+export fn main(inputs:buf<u8>,count:u64,out:buf<u8>,mode:u64)->u64 {
+    if mode==1 { return pair(inputs,count,out); }
+    return forward(ntasm_nxo_link_pe.link_pe_list(inputs,count),out);
+}

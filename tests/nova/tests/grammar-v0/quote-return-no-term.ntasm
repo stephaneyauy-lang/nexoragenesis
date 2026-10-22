@@ -1,0 +1,3 @@
+module grammar.test
+target x86_64-nexora-none
+macro m()->ast.stmt { return quote(stmt){return }; }

@@ -1,0 +1,52 @@
+module abi_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import semantics;
+import callable_names;
+import parameters;
+import register_bindings;
+import register_widths;
+import clobbers;
+import abi;
+
+// out[0..3] always carries the four-word verdict of the pass selected by
+// out[4], which is read only when the caller passes at least eight words.
+// out[4]=0 or any value past 2 keeps the legacy abi.check contract; out[4]=1
+// runs abi.check and then answers the parameter query out[5]=declaration
+// ordinal, out[6]=parameter index in out[4..7] as architectural number,
+// family, bound family and consumes-argument flag; out[4]=2 runs
+// abi.collisions instead and answers in out[0..3]. A caller that passes
+// fewer than eight words cannot see the query channel, so the legacy
+// four-word contract, including 800 on a short buffer, is untouched.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    let mut mode:u64=0;let mut decl:u64=0;let mut index:u64=0;
+    if len(out)>=8 { mode=out[4];decl=out[5];index=out[6]; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree);return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut code:u64=semantics.index(source,tree,scratch);
+    if code==0 { code=callable_names.check(source,tree,scratch); }
+    if code==0 { code=parameters.check(source,tree,scratch); }
+    if code==0 { code=register_bindings.check(source,tree,scratch); }
+    if code==0 { code=register_widths.check(source,tree,scratch); }
+    if code==0 { code=clobbers.check(source,tree,scratch); }
+    if code==0 && mode==2 { code=abi.collisions(source,tree,out); }
+    else if code==0 { code=abi.check(source,tree,out); }
+    else if code!=800 {
+        out[0]=scratch[0];out[1]=scratch[1];
+        out[2]=scratch[2];out[3]=scratch[3];
+    }
+    if code==0 && mode==1 {
+        let query:buf<u64>=alloc(runtime(),4);
+        let id:u64=abi.declaration_at(tree,decl);
+        code=abi.argument(source,tree,id,index,query);
+        if code==0 {
+            out[4]=query[0];out[5]=query[1];
+            out[6]=query[2];out[7]=query[3];
+        }
+        rt_free(runtime(),query);
+    }
+    rt_free(runtime(),scratch);ntasm_ast.release(tree);return code;
+}

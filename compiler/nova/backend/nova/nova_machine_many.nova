@@ -1,0 +1,78 @@
+module nova_machine_many;
+import nova_machine_lower;
+
+// THE MULTI-SOURCE ADAPTER.
+//
+// THE FRONTEND HAS ALREADY DONE THE RESOLUTION: `parse_many` resolved the
+// modules, the imports, the types and the functions into ONE tree, with the
+// global ordinals, the global type ids and the spans of every source. This
+// adapter does NOT resolve anything and does NOT rewrite anything: it hands
+// those tables to the common backend, which is the same code the mono profile
+// runs. There is ONE backend and not a second one.
+//
+// THE ROOT IS A SOURCE INDEX, not a module: the unit table holds the module
+// id of every source, and the root's module id is `modules[root*9+2]`. The
+// program node is the tree's root, and the module nodes hang from it in
+// SOURCE ORDER, so a declaration's module is found by its parent.
+//
+// THE ROOT SELECTION IS REFUSED BY THE BACKEND (E_ROOT, 973): a root without
+// a main, a root with more than one main, and a root whose only main belongs
+// to another module are three different answers, and choosing one of them
+// silently would lower a program the caller did not ask for.
+export fn lower_many(blob:buf<u8>,spans:buf<u64>,count:u64,root:u64,
+                      nodes:buf<u64>,node_count:u64,program:u64,scopes:buf<u64>,binds:buf<u64>,
+                      fields:buf<u64>,modules:buf<u64>,
+                      words:buf<u64>,capacity:u64,
+                      text_out:buf<u8>,text_length:buf<u64>,
+                      out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>)->u64 {
+    // THE NORMAL MODE EMITS EVERY FUNCTION OF THE PROGRAM. The closed mode is
+    // a DIFFERENT ENTRY and not a flag folded into this one, so the mode a
+    // caller did not ask for is never the mode it gets.
+    return nova_machine_lower.lower_core(blob,nodes,node_count,program,spans,count,modules,root,1,
+                                          text_out,text_length,words,capacity,report,1,0);
+}
+// THE CLOSED APPLICATION MODE.
+//
+// A CLOSED APPLICATION IS ONE WHOSE WHOLE PROGRAM IS REACHABLE FROM THE MAIN
+// OF ITS ROOT MODULE. Only the functions that main can reach are emitted: not
+// their declarations, not their bodies, and not one record of their own. The
+// reachability is computed by the backend on the tree the frontend already
+// resolved, and the roots are the root module's main and nothing else.
+//
+// THE PROGRAM IS STILL A WHOLE PROGRAM: the types, the structs, the imports
+// and the ordinals are the frontend's and they are not touched, the wrapper
+// entry, the runtime signature and the helper are still emitted, and the
+// root selection's own refusals are the same refusals.
+export fn lower_many_closed(blob:buf<u8>,spans:buf<u64>,count:u64,root:u64,
+                             nodes:buf<u64>,node_count:u64,program:u64,scopes:buf<u64>,binds:buf<u64>,
+                             fields:buf<u64>,modules:buf<u64>,
+                             words:buf<u64>,capacity:u64,
+                             text_out:buf<u8>,text_length:buf<u64>,
+                             out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>)->u64 {
+    return nova_machine_lower.lower_core(blob,nodes,node_count,program,spans,count,modules,root,1,
+                                          text_out,text_length,words,capacity,report,1,1);
+}
+// THE BATCH.
+//
+// A BATCH IS A PART OF THE PROGRAM, COMPILED ALONE. The ranks are zero based
+// and they count the REACHABLE functions in ORDINAL ORDER, and the object
+// this produces DEFINES the functions of the range and IMPORTS their direct
+// callees outside that range, each with its own signature. The first batch
+// also imports the root main when its wrapper calls a main outside the range.
+// The runtime signature and helper keep their synthetic declarations. The
+// parts are joined afterwards, and the join matches the names, which are the global ordinals
+// and do not move.
+//
+// THE SIGNATURE IS THE CLOSED ONE PLUS THE TWO RANGE NUMBERS, and the range
+// is refused when it names nothing: a limit of zero and a start past the
+// last reachable function are both refusals and not an empty object.
+export fn lower_many_batch(blob:buf<u8>,spans:buf<u64>,count:u64,root:u64,
+                            nodes:buf<u64>,node_count:u64,program:u64,scopes:buf<u64>,binds:buf<u64>,
+                            fields:buf<u64>,modules:buf<u64>,
+                            words:buf<u64>,capacity:u64,
+                            text_out:buf<u8>,text_length:buf<u64>,
+                            out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>,
+                            batch_start:u64,batch_limit:u64)->u64 {
+    return nova_machine_lower.lower_core_batch(blob,nodes,node_count,program,spans,count,modules,root,1,
+                                                text_out,text_length,words,capacity,report,1,0,1,batch_start,batch_limit);
+}

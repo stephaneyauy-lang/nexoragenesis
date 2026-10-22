@@ -1,0 +1,41 @@
+module validate_expanded_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import validate;
+import ntasm_macro_splice;
+
+// Entry point: parse the source once, run the semantic pipeline, then
+// release the tree. The source and out buffers remain owned by the
+// caller.
+//
+// A seventh word in out carries a mode. Mode 0, and every out shorter than
+// seven words, runs the pipeline exactly as before. Mode 1 answers the order
+// of the stages of spec/ntasm/ntasm.md 17.7 instead: it copies the packed table
+// validate.stage_table publishes into the source buffer, which the caller
+// lends writable, and writes the byte count to out[0]. The byte count is the
+// check on the count of that order, the bytes are the check on the order, and
+// the selector is the seventh word because no pass of the pipeline writes it
+// and no caller of four, five or six words can reach it, so the pipeline
+// path is untouched.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    if len(out)>=7 && out[6]==1 {
+        let bytes:u64=validate.stage_table(source);
+        if bytes==0 { return 800; }
+        out[0]=bytes;
+        return 0;
+    }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false{ntasm_ast.release(tree);return 800;}
+    let scratch:buf<u64>=alloc(runtime(),6);
+    let mut j:u64=0;while j<6{scratch[j]=0;j=j+1;}
+    let prepared:ntasm_macro_splice.Splice=ntasm_macro_splice.blank_splice(source,tree);
+    let mut code:u64=ntasm_macro_splice.expand_stage(prepared,scratch);
+    let unit:ntasm_ast.Tree=ntasm_macro_splice.unit_of(prepared);
+    if code==0{code=validate.validate_expanded(prepared.text,unit,out);if code==0{out[1]=tree.token_count;}}
+    else{out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3];if len(out)>4{out[4]=scratch[4];}if len(out)>5{out[5]=scratch[5];}}
+    ntasm_macro_splice.splice_release(prepared);rt_free(runtime(),scratch);
+    ntasm_ast.release(tree);
+    return code;
+}

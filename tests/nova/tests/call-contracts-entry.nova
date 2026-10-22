@@ -1,0 +1,78 @@
+module call_contracts_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import semantics;
+import callable_names;
+import effects;
+import contracts;
+import features;
+import feature_requirements;
+import ntasm_refs;
+import calls;
+import body_effects;
+import body_intrinsics;
+import body_clobbers;
+import call_effects;
+import call_clobbers;
+import call_contracts;
+
+// Two modes over the same parsed tree.
+//
+// Mode 0 is the shipped pipeline and keeps the same order validate.validate
+// uses: body_effects refuses an undeclared load or store, body_intrinsics an
+// undeclared intrinsic atom, body_clobbers an undeclared register write, and
+// call_effects and call_clobbers a callee obligation the caller drops. Their
+// code is propagated verbatim, so call_contracts.check is reached only on a
+// declaration already proved against its body.
+//
+// Mode 1 calls call_contracts.check alone, with no pass in front of it, so a
+// test can ask what the pass proves by itself. That question used to have a
+// bad answer: the stack_in, interrupts_enabled, interrupts_disabled,
+// msr_initialized, mapping_present and valid_user_return rules read the caller
+// effects and clobbers sets as an invalidation guard, so a caller declaring
+// effects {} while its body stored, or clobbers {} while its body moved rsp,
+// was given a false proof. The guards are now each the declaration AND the
+// same predicate recomputed from the caller body, so mode 1 and mode 0 agree
+// on a lying declaration and the pipeline order is a defence in depth, not the
+// thing that makes check sound.
+//
+// The body half is asked once per call site, with that call node left out of
+// the walk, because a call and the return of its callee are the balanced frame
+// pair and charging the call under proof would make stack_in and
+// valid_user_return unprovable everywhere. Every other call statement in the
+// same body is charged.
+//
+// The out buffer keeps its four word convention: two, one, one, zero on
+// success, and otherwise the four words of the first stage that refused,
+// copied out of scratch. A stage returning 800 writes nothing.
+export fn main(source:buf<u8>,out:buf<u64>,mode:u64)->u64 {
+    if len(out)<4 { return 800; }
+    if mode>1 { return 800; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree);return 800; }
+    if mode==1 {
+        let code:u64=call_contracts.check(source,tree,out);
+        ntasm_ast.release(tree);return code;
+    }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut code:u64=semantics.index(source,tree,scratch);
+    if code==0 { code=callable_names.check(source,tree,scratch); }
+    if code==0 { code=effects.check(source,tree,scratch); }
+    if code==0 { code=contracts.check(source,tree,scratch); }
+    if code==0 { code=features.check(source,tree,scratch); }
+    if code==0 { code=feature_requirements.check(source,tree,scratch); }
+    if code==0 { code=ntasm_refs.resolve(source,tree,scratch); }
+    if code==0 { code=calls.check(source,tree,scratch); }
+    if code==0 { code=body_effects.check(source,tree,scratch); }
+    if code==0 { code=body_intrinsics.check(source,tree,scratch); }
+    if code==0 { code=body_clobbers.check(source,tree,scratch); }
+    if code==0 { code=call_effects.check(source,tree,scratch); }
+    if code==0 { code=call_clobbers.check(source,tree,scratch); }
+    if code==0 { code=call_contracts.check(source,tree,out); }
+    else if code!=800 {
+        out[0]=scratch[0];out[1]=scratch[1];
+        out[2]=scratch[2];out[3]=scratch[3];
+    }
+    rt_free(runtime(),scratch);ntasm_ast.release(tree);return code;
+}

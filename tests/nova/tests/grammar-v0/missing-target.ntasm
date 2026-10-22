@@ -1,0 +1,2 @@
+module grammar.test
+const x:u64=1;

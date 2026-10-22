@@ -1,0 +1,2848 @@
+module ntasm_macro_expand;
+
+import ntasm_parser;
+import ntasm_ast;
+import constant_eval;
+
+// Bounded hygienic expansion of NTASM v0 macro declarations.
+//
+// spec/ntasm/ntasm.md 13: a macro receives and returns typed AST nodes, never a
+// string to re-inject in the parser; hygiene applies a fresh deterministic
+// mark to every introduced symbol; the capture of a caller symbol is refused
+// by default; the six limits of 12 are the same as for comptime; a macro that
+// exceeds fuel, memory, nodes or depth fails without a usable partial AST;
+// the expansion order is lexical and stable.
+//
+// The hygiene marks reproduce compiler/c/ntasm/frontend/frontend.c exactly:
+//   let local        __ntm$<ordinal>$e<serial>$<name>     frontend.c:2384
+//   declaration      __ntd$<ordinal>$e<serial>$<name>     frontend.c:4818
+//   emitted list item
+//                    __ntd$<o>$e<s>$r<repeat>$t<item>$<n> frontend.c:4797
+//   fn parameter     __ntp$<ordinal>$e<serial>$p<i>$<n>  frontend.c:4938
+// <ordinal> is the one based declaration order of the macro in the module and
+// <serial> is incremented once per expansion, before any mark is built.
+
+// ------------------------------------------------------------------ limits
+// The frozen maxima of frontend.h:55-62. A comptime block may lower any of
+// them but never raise one.
+fn max_fuel()->u64 { return 1048576; }
+fn max_call_depth()->u64 { return 256; }
+fn max_arena()->u64 { return 16777216; }
+fn max_ast_nodes()->u64 { return 1048576; }
+fn max_expansion_depth()->u64 { return 128; }
+fn max_constant_bytes()->u64 { return 16777216; }
+// The eight declared bounds, and what each one is now. Before this module
+// read node words and spellings directly, FIVE of the SEVEN it had then were
+// shadowed: nothing reached them, because the host buffer table filled first
+// and the expander published nothing at all when it did. That shadow is
+// gone, so the answer is no longer "the bound exists" -- it is per bound, and
+// a bound that nothing can reach says so HERE rather than letting a caller
+// read it as a guarantee. All eight are ENFORCED in code. What differs is
+// whether a body can get there, and that is measured, not asserted.
+//
+// REACHABLE. The refusal is this module's own diagnostic, and a caller that
+// builds a body past the bound gets it.
+//   parameter_cap 8       372 reason 2.  Refuses at 9, accepts 8 and 7.
+//   walk_depth_cap 64     375 reason 9.  Refuses past 64, accepts below.
+//                          THE REFUSAL NOW NAMES ITS OWN QUANTITY: out[10] is
+//                          the walk depth that crossed the cap and out[11] is
+//                          64, both in WALK DEPTH and in neither nesting
+//                          level nor env.depth_peak. Before this change the
+//                          four words were a position and a family and a
+//                          caller could not tell whether the cap was crossed
+//                          at 65 or at 200 -- which was not a terse message,
+//                          it was a quantity with no channel to travel in.
+//                          FOUR SITES, AND THE FOURTH ANSWERED 381/1, NOT
+//                          375/9. Three of the four sites raise this bound's
+//                          own diagnostic. declares_below is a predicate and
+//                          cannot raise a code, so its callers raise 381/1 --
+//                          "the caller declares this name" -- for a cap
+//                          crossing, with out[10]/out[11] left 0. That made a
+//                          cap crossing byte-identical on the wire to a real
+//                          collision, and it made this row's sentence "a
+//                          refusal that is NOT a bound publishes 0 and 0"
+//                          false at one of the four sites bound to this cap.
+//                          It now writes the two words under note_bound, so
+//                          the fourth site is distinguishable from the other
+//                          three ONLY by its code and from a real collision
+//                          by its quantity. See declares_below.
+//   loop_cap 512          380 reason 2.  Measured under the frozen maxima:
+//                          512 items expand, 513 answer 380/2. Before this
+//                          change the measured ceiling was 177 items, and it
+//                          was the host buffer table, not this cap.
+//   template_item_cap 512 380 reason 2, per quoted block/generated function body.
+//                          Both forms are measured at 511/512/513/1026 items.
+//                          The private C bootstrap uses one aggregate template
+//                          table per macro; that narrower compatibility limit
+//                          is distinct from this declared per-body bound.
+//   hard_name_cap 4194304 900 reason 1, in reserve_names. Reachable, and only
+//                          on a body that writes LONG introduced names: a
+//                          512x512 nested meta-for with one character names
+//                          answers 201/3 (arena bytes) and the same shape with
+//                          two hundred character names answers 900/1. That is
+//                          the whole argument against writing a measured
+//                          ceiling down as a constant: it is a property of
+//                          the body, and the same loop counts answer a
+//                          different bound when the names are longer.
+//
+// ENFORCED BUT UNREACHABLE, and the reason is arithmetic, so no body reaches
+// it either:
+//   hard_node_cap 262144  900 reason 1 in reserve_nodes, but charge_arena
+//                          always answers first. node_bytes() is 96 and
+//                          max_arena() is frozen at 16777216, and a comptime
+//                          block may only LOWER a budget, so arena_bytes
+//                          refuses at 174762 nodes -- below the 262144 at
+//                          which reserve_nodes would refuse, for every body
+//                          that exists. Measured: 512x512 nested meta-fors,
+//                          262144 items, answers 201 reason 3. This cap is
+//                          dead code. It is kept because it is a declared
+//                          bound of the reference and removing it is a
+//                          decision this module does not take; it is NOT a
+//                          guarantee, and nothing should rely on it.
+//   argument stack 4096   900 reason 1 in push_arg, but 4096 words is 1024
+//                          chain levels and max_expansion_depth() is 128, so
+//                          the depth budget answers 201 reason 5 at 129
+//                          levels, eight times below. Measured.
+//   binding stack 65536   900 reason 1 in push_binding. bind_stride is 7, so
+//                          9362 entries is 65534 words, the largest count
+//                          that fits, and the 9363rd entry is the one refused.
+//                          A body that pushes 9363 of them holds 9363
+//                          statements, and template_item_cap refuses that at
+//                          512 -- eighteen times earlier. The entry this one
+//                          replaces said "it needs 9362 lets of 7 words. A
+//                          1200 let body still expands", and BOTH halves of
+//                          that were wrong: a 1200 statement body is refused
+//                          380 reason 2, and while the claim stood the 1200
+//                          let body expanded TRUNCATED, in silence, as a
+//                          success.
+//
+// The SIX declared budgets (the six fn above) are enforced by charge_* and
+// answer 201 with the reason, and that is independent of everything here. The
+// gate re-measures every ceiling on four body shapes, in
+// compiler/c/nova/tests_ntasm_macro_expand.c.
+//
+// A compiler bound independent of the six budgets, so a declared budget can
+// never make this module allocate without limit. See the unreachable entry
+// above for what it does and does not bound.
+fn hard_node_cap()->u64 { return 262144; }
+// The name table's own ceiling: a bound on want*8, doubling from 64 words.
+// See the reachable entry above for the shape it needs.
+fn hard_name_cap()->u64 { return 4194304; }
+// A meta-for may not project more than this many template items.
+fn loop_cap()->u64 { return 512; }
+// Nesting bound of the template walk, a compiler bound like the parser's.
+fn walk_depth_cap()->u64 { return 64; }
+// Macro parameter count, the reference value is 8.
+fn parameter_cap()->u64 { return 8; }
+// The reference's template table: how many top level items ONE macro body may
+// hold, whatever its form. It is a DIFFERENT quantity from loop_cap above --
+// that one is how many times a meta-for repeats, this one is how big the body
+// it repeats is -- and the two are declared apart and measured apart on
+// purpose. See template_items for what the reference does when it is passed.
+fn template_item_cap()->u64 { return 512; }
+
+// ------------------------------------------------------------- node kinds
+fn k_const()->u64 { return 10; }
+fn k_comptime()->u64 { return 11; }
+fn k_ct_limit()->u64 { return 12; }
+fn k_macro()->u64 { return 13; }
+fn k_mparam()->u64 { return 14; }
+fn k_fn()->u64 { return 18; }
+fn k_param()->u64 { return 19; }
+fn k_effects()->u64 { return 20; }
+fn k_clobbers()->u64 { return 21; }
+fn k_abi()->u64 { return 28; }
+fn k_requires()->u64 { return 22; }
+fn k_ensures()->u64 { return 23; }
+fn k_data()->u64 { return 24; }
+fn k_block()->u64 { return 25; }
+fn k_let()->u64 { return 27; }
+fn k_call()->u64 { return 28; }
+fn k_return()->u64 { return 29; }
+fn k_if()->u64 { return 30; }
+fn k_expand()->u64 { return 31; }
+fn k_insn()->u64 { return 32; }
+fn k_memory()->u64 { return 34; }
+fn k_expr()->u64 { return 35; }
+fn k_type()->u64 { return 36; }
+fn k_meta_block()->u64 { return 37; }
+fn k_meta_let()->u64 { return 38; }
+fn k_meta_if()->u64 { return 39; }
+fn k_meta_for()->u64 { return 40; }
+fn k_meta_return()->u64 { return 41; }
+fn k_meta_emit()->u64 { return 42; }
+fn k_quote()->u64 { return 43; }
+fn k_name()->u64 { return 90; }
+fn k_qualified()->u64 { return 91; }
+fn k_dashed()->u64 { return 92; }
+fn k_section_name()->u64 { return 93; }
+fn k_literal()->u64 { return 94; }
+
+// The parser gives the same node kind to an abi annotation and to a call
+// statement. An abi node holds one dashed child, a call node always starts
+// with a qualified callee, so the first child tells them apart.
+fn is_abi(env:Env,id:u64)->bool {
+    if nkind(env,id)!=k_abi() { return false; }
+    if child_count(env,id)!=1 { return false; }
+    return nkind(env,nth(env,id,0))==k_dashed();
+}
+
+// ------------------------------------------------------------ diagnostics
+// 201 budget refusal, reason 1 fuel, 2 call depth, 3 arena bytes, 4 produced
+// AST nodes, 5 expansion depth, 6 constant data bytes
+// 203 the caller output buffer cannot hold the produced region
+// 370 unknown macro at the invocation
+// 371 macro arity mismatch
+// 372 macro parameter kind, value or shape mismatch
+// 373 a comptime value is used with no binding in scope
+// 374 capture of a caller symbol
+// 375 a template node kind outside the closed vocabulary
+// 376 a template name shadows a macro parameter or a comptime binding, or is
+//     one of the reserved words of word_id
+// 377 macro form outside this profile
+// 378 the comptime limit block is malformed
+// 379 a meta-if or meta-for condition is not a deterministic constant. Its
+//     reason is the evaluator status, and ABOVE that range four reasons name
+//     WHICH forbidden channel a comptime expression reached for: 20 file read,
+//     21 file write, 22 file handle close, 23 diagnostic output. A fifth family
+//     -- clock, random, environment, subprocess, network -- has no primitive in
+//     the Nova environment at all, so there is no channel to name and those
+//     keep the evaluator's own reason. See channel_id.
+// 380 a template's projected statement count is too large: reason 1 the
+//     meta-for count is negative, reason 2 either it is past loop_cap or the
+//     body it repeats holds more than template_item_cap items
+// 381 a generated symbol collides with an existing caller symbol
+// 386 expansion in a type position is not implemented in this profile
+// 800 structural failure, nothing written
+// 900 allocation failure
+fn budget_fuel()->u64 { return 1; }
+fn budget_call()->u64 { return 2; }
+fn budget_arena()->u64 { return 3; }
+fn budget_nodes()->u64 { return 4; }
+fn budget_depth()->u64 { return 5; }
+fn budget_constant()->u64 { return 6; }
+
+// One produced node costs twelve words, so its arena cost is fixed.
+fn node_bytes()->u64 { return 96; }
+// Binding kinds in the binding stack.
+fn bind_value()->u64 { return 0; }
+fn bind_local()->u64 { return 1; }
+fn bind_decl()->u64 { return 2; }
+// Name positions: a binding position must resolve inside the template, a
+// spelled position is copied verbatim.
+fn pos_bind()->u64 { return 0; }
+fn pos_spelled()->u64 { return 1; }
+// A spliced caller argument is copied verbatim: its names belong to the
+// caller scope, so they are neither resolved against the template bindings
+// nor renamed, and a symbol position inside it is not a capture.
+fn pos_caller()->u64 { return 2; }
+// Macro result kinds.
+fn result_expr()->u64 { return 1; }
+fn result_stmt()->u64 { return 2; }
+fn result_decl()->u64 { return 3; }
+fn result_type()->u64 { return 4; }
+fn result_block()->u64 { return 5; }
+
+// ---------------------------------------------------------------- the state
+// Every mutable field lives in this record, which is passed by reference to
+// every helper, so the whole expansion shares one budget account.
+struct Env {
+    source:buf<u8>,tree:ntasm_ast.Tree,
+    fuel_limit:u64,call_limit:u64,arena_limit:u64,
+    node_limit:u64,depth_limit:u64,constant_limit:u64,
+    fuel:u64,call_depth:u64,call_peak:u64,arena:u64,
+    node_count:u64,depth:u64,depth_peak:u64,constant:u64,
+    serial:u64,expansions:u64,macros:u64,nodes_made:u64,
+    code:u64,reason:u64,line:u64,column:u64,
+    // offending and limit are the QUANTITY a bound refused on and the cap it
+    // refused against. They are not part of fail()'s signature: fail() is
+    // called from 113 places, most of which are not a bound at all (a dead
+    // id, a wrong node kind, a literal outside its range). Widening it would
+    // put a fifth argument on all 113 to fill in at sixteen. Instead a bound
+    // site writes these two and then calls refuse_bound below, and a refusal
+    // that is NOT a bound leaves both at zero, which is how a caller tells
+    // "refused 372 reason 2, on 9 macro parameters against a cap of 8" from
+    // "refused 800 reason 1, on no quantity at all". SIXTEEN sites write them:
+    // the six declared budgets, the six `fn *cap()` bounds, template_item_cap,
+    // and the two literal capacities in push_binding and push_arg.
+    offending:u64,limit:u64,
+    node_words:buf<u64>,node_cap:u64,high:u64,scratch:bool,scratch_used:u64,
+    // Set only around the clone of an expression the expander is about to
+    // fold. resolve_name reads it, so a name spelled in a fold position is
+    // classified as a channel attempt and a name spelled anywhere else keeps
+    // the hygiene refusal. One bool, three writers, one reader.
+    folding:bool,
+    name_words:buf<u64>,name_cap:u64,name_bytes:u64,
+    arg:buf<u64>,arg_cap:u64,arg_top:u64,
+    // bind is one stack for the whole expansion. scope_base is the word
+    // offset a nested expansion starts its own bindings above, so a lookup
+    // never reaches the entries of the expansion that opened it and a push
+    // never overwrites them.
+    bind:buf<u64>,bind_cap:u64,bind_top:u64,scope_base:u64,
+    frames:buf<u64>,dummy:buf<u64>
+}
+
+fn fresh_env(source:buf<u8>,tree:ntasm_ast.Tree)->Env {
+    let none:buf<u64>=alloc(runtime(),0);
+    let nodes:buf<u64>=alloc(runtime(),0);
+    let names:buf<u64>=alloc(runtime(),0);
+    let args:buf<u64>=alloc(runtime(),0);
+    let binds:buf<u64>=alloc(runtime(),0);
+    let frames:buf<u64>=alloc(runtime(),0);
+    return Env{source:source,tree:tree,
+        fuel_limit:max_fuel(),call_limit:max_call_depth(),arena_limit:max_arena(),
+        node_limit:max_ast_nodes(),depth_limit:max_expansion_depth(),
+        constant_limit:max_constant_bytes(),
+        fuel:0,call_depth:0,call_peak:0,arena:0,node_count:0,depth:0,
+        depth_peak:0,constant:0,serial:0,expansions:0,macros:0,nodes_made:0,
+        code:0,reason:0,line:0,column:0,
+        offending:0,limit:0,
+        node_words:nodes,node_cap:0,high:0,scratch:false,scratch_used:0,folding:false,name_words:names,name_cap:0,name_bytes:0,
+        arg:args,arg_cap:0,arg_top:0,bind:binds,bind_cap:0,bind_top:0,scope_base:0,
+        frames:frames,dummy:none};
+}
+
+fn release_env(env:Env)->u64 {
+    let nodes:buf<u64>=env.node_words;
+    let names:buf<u64>=env.name_words;
+    let args:buf<u64>=env.arg;
+    let binds:buf<u64>=env.bind;
+    let none:buf<u64>=env.dummy;
+    let frames:buf<u64>=env.frames;
+    rt_free(runtime(),nodes);rt_free(runtime(),names);
+    rt_free(runtime(),args);rt_free(runtime(),binds);rt_free(runtime(),frames);rt_free(runtime(),none);
+    return 0;
+}
+
+// First failure wins, so the diagnostic is stable.
+fn fail(env:Env,code:u64,reason:u64,line:u64,column:u64)->u64 {
+    if env.code==0 {
+        env.code=code;env.reason=reason;env.line=line;env.column=column;
+    }
+    return 1;
+}
+
+// fail() plus the two words that say WHICH quantity crossed WHICH cap. The
+// guard is fail()'s, byte for byte, and it has to be: if a bound site wrote
+// offending after some earlier failure had already claimed env.code, the
+// refusal a caller reads would carry the quantity of a bound that never
+// answered. First failure wins, and so does its quantity.
+fn refuse_bound(env:Env,code:u64,reason:u64,line:u64,column:u64,
+                offending:u64,limit:u64)->u64 {
+    if env.code==0 { env.offending=offending;env.limit=limit; }
+    return fail(env,code,reason,line,column);
+}
+
+// For the two reserve_* sites, which answer 1 to their CALLER and let the
+// caller raise the code. The two words are written under the same guard and
+// then the caller fails as it always did, so the refusal a caller reads keeps
+// the code it had and gains the quantity. Writing them here is safe precisely
+// because guard and caller are adjacent: nothing runs between the write and
+// the fail.
+fn note_bound(env:Env,offending:u64,limit:u64)->u64 {
+    if env.code==0 { env.offending=offending;env.limit=limit; }
+    return 0;
+}
+
+// ------------------------------------------------------------ tree reading
+//
+// WHY THERE IS NO node_at HERE, and it is the reason this module's declared
+// bounds used to mean nothing. ntasm_ast.node_at returns a record by value
+// across a module boundary, and nova.c lowers a record literal to NV2_ALLOC:
+// every single call is one live host buffer, 96 bytes for a node, that this
+// bootstrap never reclaims. The handle of a record used in an expression has
+// no name, so there is nothing for rt_free to name either. A walk that reads
+// a node per step therefore spends one buffer table slot per step, and the
+// table is BUFFER_MAX = 65536 (runtime_v2.c:9).
+//
+// Measured, in a proven-cold build directory (out/c-bootstrap/nova/
+// w14-buffer-base-a91f3c for the before, the instrument
+// out/c-bootstrap/nova/w14-probe-b77e01 for all three arms). Across the body
+// shapes swept, add_buffer was called 4502073 times and the overwhelming
+// majority were length 96: a 177 item meta-for, under a third of loop_cap,
+// cost 60277 allocations on its own, and a 16x32 nested pair cost more than
+// the whole table. The table filled, the host raised an error, and the
+// expander returned 0 with out[0] still 0: a refusal the expander never
+// made, published as a success. That ceiling, not loop_cap 512 and not
+// hard_node_cap 262144, was the bound five of this module's seven declared
+// bounds were measured against.
+//
+// The three arms, same probe, same directory, so the two allocations this
+// change removed are separable and each removal is shown to matter:
+//   before, both leaks present          4502073 calls, peak live 65536
+//   node reads fixed, literals still    1813735 calls, peak live 65536
+//   both fixed                             8952 calls, peak live    436
+// The second of those is text_is: a `let t:buf<u8>="fuel"` is one buffer per
+// spelling tested, and word_id tests a spelling for every name it meets. It is
+// the same defect, a different allocation, and it only became visible once
+// the first one was gone.
+//
+// So the words are read out of tree.node_words here, which allocates nothing,
+// which is the form ntir.nova:98-104 and stub_table.nova:9-13 already use and
+// the form the note this comment replaces had already asked for. A node id
+// crosses a function boundary as a u64 and a field is read where it is used.
+// ast.nova still exports node_at: that is another module's choice, and this
+// module no longer depends on it.
+fn live(env:Env,id:u64)->bool {
+    return id!=0 && id<=env.tree.node_count;
+}
+
+// Word `field` of the caller tree node `id`. A node that is not live answers
+// zero, which is exactly what the all-zero record this replaced answered, so
+// no caller's arithmetic changes and the out of range case stays the one
+// answer it was.
+fn nword(env:Env,id:u64,field:u64)->u64 {
+    if live(env,id)==false { return 0; }
+    let n:buf<u64>=env.tree.node_words;
+    return n[(id-1)*12+field];
+}
+
+fn nkind(env:Env,id:u64)->u64 { return nword(env,id,0); }
+fn ntoken_begin(env:Env,id:u64)->u64 { return nword(env,id,1); }
+fn ntoken_end(env:Env,id:u64)->u64 { return nword(env,id,2); }
+fn nsource(env:Env,id:u64)->u64 { return nword(env,id,3); }
+fn nline(env:Env,id:u64)->u64 { return nword(env,id,4); }
+fn ncolumn(env:Env,id:u64)->u64 { return nword(env,id,5); }
+fn nstart(env:Env,id:u64)->u64 { return nword(env,id,6); }
+fn nend(env:Env,id:u64)->u64 { return nword(env,id,7); }
+fn nfirst_child(env:Env,id:u64)->u64 { return nword(env,id,8); }
+fn nlast_child(env:Env,id:u64)->u64 { return nword(env,id,9); }
+fn nnext_sibling(env:Env,id:u64)->u64 { return nword(env,id,10); }
+fn naux(env:Env,id:u64)->u64 { return nword(env,id,11); }
+
+fn kid(env:Env,id:u64)->u64 { return nfirst_child(env,id); }
+fn sib(env:Env,id:u64)->u64 { return nnext_sibling(env,id); }
+
+// The nth child of a node, zero based.
+fn nth(env:Env,id:u64,index:u64)->u64 {
+    let mut at_id:u64=kid(env,id);
+    let mut seen:u64=0;
+    while at_id!=0 && seen<index {
+        if live(env,at_id)==false { return 0; }
+        at_id=nnext_sibling(env,at_id);seen=seen+1;
+    }
+    if live(env,at_id)==false { return 0; }
+    return at_id;
+}
+
+// WHY THERE IS NO WALK BOUND HERE, because there was one and it was the worst
+// defect this module has carried.
+//
+// child_count used to walk siblings under `seen<=1024` and RETURN THE COUNT IT
+// REACHED. A quoted block body is walked by index from its quote node, whose
+// first child is its kind word, so a body of 1025 statements was expanded as
+// if it had 1024 and the result was PUBLISHED: code 0, runtime 0, a complete
+// looking node region, and no diagnostic anywhere. A caller could not tell a
+// truncated expansion from a whole one, and because it was a SUCCESS nothing
+// downstream was protected by anything either. Measured on one body shape,
+// one fuel budget and one binary:
+//
+//   1024 lets, 1025 items    5122 published nodes, code 0, last let PRESENT
+//   1025 lets, 1026 items    5122 published nodes, code 0, last let ABSENT
+//   9363 lets, 9364 items    5122 published nodes, code 0, last let ABSENT
+//
+// A silent truncation reported as a success is the shape this project's own
+// rule is about -- an instrument that cannot see the case it exists to detect
+// -- with no red anywhere, because the truncation IS the answer rather than a
+// failed check.
+//
+// So the count is the count. The walk runs to the end of the chain on the two
+// conditions it always used, a zero terminator and a dead node, and the trust
+// model is the one run_block, declares_below and walk have always relied on:
+// the parser owns chain wellformedness, and ntir.nova:869-872 asserts it, a
+// chain holding exactly child_count nodes whose last one ends it.
+//
+// A body too big for this module to expand is no longer a SMALLER body. It is
+// template_items below, which refuses it with a code and a position, at the
+// reference's own 512.
+fn child_count(env:Env,id:u64)->u64 {
+    let mut at_id:u64=kid(env,id);
+    let mut seen:u64=0;
+    while at_id!=0 {
+        if live(env,at_id)==false { break; }
+        seen=seen+1;at_id=nnext_sibling(env,at_id);
+    }
+    return seen;
+}
+
+// THE ITEM COUNT OF A MACRO BODY'S OWN TOP LEVEL LIST, refused past the
+// reference's template table. This is the answer the walk above used to
+// invent, and it is the REFERENCE's answer rather than this module's.
+//
+// WHAT THE REFERENCE DOES, measured rather than read off the source. A macro
+// body that returns a quoted block holds its statements in MacroTemplate
+// templates[512] (frontend.c:57) and frontend.c:3782 refuses the 513th with
+// NTF_E_LIMIT, 201, "quoted block statement limit exceeded", at p->token.span,
+// which is the position of the 513th statement itself. Run against the C
+// reference on this body shape:
+//
+//   511 statements   compiles, verified, 514 statements published
+//   512 statements   refused 201 at the 513th item, nothing published
+//   1025 statements  refused 201 at the 513th item, nothing published
+//   2048 statements  refused 201 at the 513th item, nothing published
+//
+// So the reference ACCEPTS 512 items and REFUSES THE 513TH LOUDLY. Nova
+// accepted 1024 statements and dropped the rest in silence: wider than the
+// reference by a factor of two, and quieter than it in the half that
+// matters. Refusing here is therefore not a bound Nova invents and not a
+// narrowing Nova imposes on a shape the reference expands -- it is the
+// reference's own bound at the reference's own value, and the range Nova
+// gives up is exactly the range the reference never expanded either.
+//
+// WHY 380 AND NOT A NEW CODE. 380 is "the template's projected statement
+// count is too large", and the reference answers NTF_E_LIMIT for BOTH of its
+// 512s -- the meta-for repeat count at frontend.c:2241 and the template table
+// at frontend.c:3782 -- so one code carries both the way one code carries
+// both there. The two quantities are not the same number and are never
+// reported as the same: loop_cap() is the repeat count, template_item_cap()
+// is the size of the body being repeated, and the gate measures them apart.
+//
+// ONE RESIDUAL, named rather than hidden. The reference's 512 is ONE table
+// shared by every template item of the macro, so a body at exactly 512 with
+// other template items beside it is refused there and is one count wider
+// here, because Nova's meta-block items and a quote's statements are two
+// lists and the reference has one. Every shape the gate builds agrees.
+//
+// `skip` is the index of the first item in the child chain: 0 when the
+// children are all items, 1 for a quote whose first child is its kind word.
+// On refusal the position is the first item PAST the cap, the token the
+// reference reports on. The return value is the count and nothing else: on
+// refusal this returns 0 AND sets env.code, so a caller must test env.code
+// and never the value, because an empty body is a legal count of zero.
+fn template_items(env:Env,id:u64,skip:u64)->u64 {
+    let count:u64=child_count(env,id);
+    if count>skip+template_item_cap() {
+        let over:u64=nth(env,id,skip+template_item_cap());
+        let mut at:u64=over;
+        if live(env,over)==false { at=id; }
+        refuse_bound(env,380,2,nline(env,at),ncolumn(env,at),
+                     count-skip,template_item_cap());
+        return 0;
+    }
+    return count;
+}
+
+// ---- the token a materialised literal carries -----------------------------
+// A literal built by emit_constant has no source text of its own: it was
+// folded from a comptime value, not written. The node still has to carry a
+// token, because ntir.type_literal classifies a literal BY its token and
+// refuses anything that is not an integer or a string token. The token array
+// belongs to the caller's lexer -- produced() hands this module no tokens of
+// its own -- so a token cannot be minted here, and asking the IR to accept a
+// token kind the lexer never produces would put this module's convention into
+// the contract of the thing the product is being held to.
+//
+// The token is therefore the caller's own: the first INTEGER token inside the
+// range the constant was folded from, and that range is the folded
+// expression's own token span, so the token is always one that contributed to
+// the value and never one borrowed from an unrelated line. A range holding no
+// integer token -- a comptime value bound from a boolean word -- has none, and
+// the node keeps the template position token it has always carried.
+//
+// The two node words are read through the shared reader, which is the same
+// direct word read this note always asked for -- it just is not two readers
+// of its own any more, because nothing in this module reads a node as a
+// record any more. The reason is written down at the top of the tree reading
+// block and it is not a style preference: it was the ceiling behind five of
+// the seven declared bounds.
+fn fold_token_begin(env:Env,id:u64)->u64 { return ntoken_begin(env,id); }
+fn fold_token_end(env:Env,id:u64)->u64 { return ntoken_end(env,id); }
+// The lexer's integer token kind (lexer.nova:117), written out for the same
+// reason ntir.nova:117-118 writes it: the token kinds are the lexer's numbers
+// and no module exports them.
+fn tok_int()->u64 { return 258; }
+
+// The index of the first integer token in [from,to], BIASED BY ONE, so zero
+// can mean "this range holds no integer token" without colliding with token
+// zero. Token zero is a real index -- it is the first token of every stream --
+// so an unbiased answer would let a module whose first token is an integer
+// read as "no token found", which is the guard depending on the value it is
+// checking.
+fn first_int_token(env:Env,from:u64,to:u64)->u64 {
+    let tokens:buf<u64>=env.tree.token_words;
+    if from>to || to>=env.tree.token_count { return 0; }
+    let mut i:u64=from;
+    while i<=to {
+        if tokens[i*9]==tok_int() { return i+1; }
+        i=i+1;
+    }
+    return 0;
+}
+
+// The token a materialised literal of the value folded from source_id carries,
+// biased by one as first_int_token returns it, and 0 when the folded range
+// named no integer token.
+fn folded_token(env:Env,source_id:u64)->u64 {
+    if live(env,source_id)==false { return 0; }
+    return first_int_token(env,fold_token_begin(env,source_id),
+        fold_token_end(env,source_id));
+}
+
+// Rewrite the two token words of a produced literal. A zero bias leaves the
+// node exactly as emit stamped it, which is the only correct answer when the
+// folded range held no integer token to name.
+fn stamp_literal_token(env:Env,id:u64,bias:u64)->u64 {
+    if bias==0 || prod_live(env,id)==false { return 0; }
+    let token:u64=bias-1;
+    let words:buf<u64>=env.node_words;
+    let w:u64=(id-1)*12;
+    words[w+1]=token;words[w+2]=token;return 0;
+}
+
+// A spelled name is compared against a byte count and up to three packed u64
+// words, never against a buffer. A `let t:buf<u8>="fuel"` is one host buffer
+// allocation, and this module makes one per name it tests, so comparing
+// against a buffer literal is the SECOND form of the same leak -- the one
+// that survived removing the record node reads, and the one that then became
+// the binding ceiling. The packing is stated once, here: byte i of the text
+// is bit (i%8)*8 of word i/8, and the three words are little endian in that
+// order, so a text of up to 24 bytes is three u64 literals.
+fn text_is(env:Env,start:u64,end:u64,n:u64,w0:u64,w1:u64,w2:u64)->bool {
+    let source:buf<u8>=env.source;
+    if n>24 { return false; }
+    if start>end || end>len(source) { return false; }
+    if (end-start)!=n { return false; }
+    let mut i:u64=0;
+    while i<n {
+        let mut word:u64=w0;
+        if i>=8 { word=w1; }
+        if i>=16 { word=w2; }
+        if source[start+i]!=((word>>((i%8)*8))&255) { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Two source spans carry the same identifier when their texts are equal.
+// Positions are not identity: a declaration and its reference are two
+// occurrences, so a hygiene lookup must compare the spelling, never the span.
+fn same_text(env:Env,astart:u64,aend:u64,bstart:u64,bend:u64)->bool {
+    let source:buf<u8>=env.source;
+    if aend-astart!=bend-bstart { return false; }
+    if astart>aend || bstart>bend { return false; }
+    if aend>len(source) || bend>len(source) { return false; }
+    let mut i:u64=0;
+    while i<(aend-astart) {
+        if source[astart+i]!=source[bstart+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+fn named(env:Env,id:u64,n:u64,w0:u64,w1:u64,w2:u64)->bool {
+    if live(env,id)==false { return false; }
+    let node:u64=id;
+    if nkind(env,node)!=k_name() { return false; }
+    return text_is(env,nstart(env,node),nend(env,node),n,w0,w1,w2);
+}
+
+// A Nova buffer parameter must name a variable, so every spelling the
+// expander compares against is bound once here and selected by a small
+// number. The set is closed: 1..6 the six comptime limit names, 7..11 the
+// five ast result and parameter kinds, 12..20 the nine scalar type names,
+// 21 and 22 the two boolean words.
+fn word_id(env:Env,id:u64,which:u64)->bool {
+    if which==1 { return named(env,id,4,0x000000006c657566,0x0000000000000000,0x0000000000000000); }
+    if which==2 { return named(env,id,10,0x7065645f6c6c6163,0x0000000000006874,0x0000000000000000); }
+    if which==3 { return named(env,id,11,0x79625f616e657261,0x0000000000736574,0x0000000000000000); }
+    if which==4 { return named(env,id,9,0x65646f6e5f747361,0x0000000000000073,0x0000000000000000); }
+    if which==5 { return named(env,id,15,0x6f69736e61707865,0x0068747065645f6e,0x0000000000000000); }
+    if which==6 { return named(env,id,14,0x746e6174736e6f63,0x000073657479625f,0x0000000000000000); }
+    if which==7 { return named(env,id,4,0x0000000072707865,0x0000000000000000,0x0000000000000000); }
+    if which==8 { return named(env,id,4,0x0000000065707974,0x0000000000000000,0x0000000000000000); }
+    if which==9 { return named(env,id,4,0x00000000746d7473,0x0000000000000000,0x0000000000000000); }
+    if which==10 { return named(env,id,4,0x000000006c636564,0x0000000000000000,0x0000000000000000); }
+    if which==11 { return named(env,id,5,0x0000006b636f6c62,0x0000000000000000,0x0000000000000000); }
+    if which==12 { return named(env,id,4,0x000000006c6f6f62,0x0000000000000000,0x0000000000000000); }
+    if which==13 { return named(env,id,2,0x0000000000003875,0x0000000000000000,0x0000000000000000); }
+    if which==14 { return named(env,id,3,0x0000000000363175,0x0000000000000000,0x0000000000000000); }
+    if which==15 { return named(env,id,3,0x0000000000323375,0x0000000000000000,0x0000000000000000); }
+    if which==16 { return named(env,id,3,0x0000000000343675,0x0000000000000000,0x0000000000000000); }
+    if which==17 { return named(env,id,2,0x0000000000003869,0x0000000000000000,0x0000000000000000); }
+    if which==18 { return named(env,id,3,0x0000000000363169,0x0000000000000000,0x0000000000000000); }
+    if which==19 { return named(env,id,3,0x0000000000323369,0x0000000000000000,0x0000000000000000); }
+    if which==20 { return named(env,id,3,0x0000000000343669,0x0000000000000000,0x0000000000000000); }
+    if which==21 { return named(env,id,4,0x0000000065757274,0x0000000000000000,0x0000000000000000); }
+    if which==22 { return named(env,id,5,0x00000065736c6166,0x0000000000000000,0x0000000000000000); }
+    return false;
+}
+
+// The closed reserved set. word_id already compares a node against each of
+// the twenty two words the module and the expander read as text, so this is
+// that same set under one predicate: the six comptime limit names, the five
+// ast result and parameter kinds, the nine scalar type names and the two
+// boolean literals. A template that binds one of them makes the word mean
+// two things, and the boolean literals are already load bearing: run_meta_if
+// decides a branch from the word, so a template could otherwise bind true to
+// zero and still take the then branch. Refusing the whole set is the
+// auditable form of the rule, and it is the shape 376 already has for a
+// template name that shadows a binding.
+fn reserved_word(env:Env,id:u64)->bool {
+    let mut which:u64=1;
+    while which<=22 {
+        if word_id(env,id,which) { return true; }
+        which=which+1;
+    }
+    return false;
+}
+
+// ------------------------------------------------------- produced storage
+fn reserve_nodes(env:Env,extra:u64)->u64 {
+    if env.high+extra<=env.node_cap { return 0; }
+    let mut want:u64=env.node_cap;
+    if want==0 { want=64; }
+    while want<(env.high+extra) { want=want*2; }
+    if want>hard_node_cap() { note_bound(env,want,hard_node_cap());return 1; }
+    let words:buf<u64>=alloc(runtime(),want*12);
+    if len(words)!=want*12 { return 1; }
+    let old:buf<u64>=env.node_words;
+    let mut i:u64=0;
+    let keep:u64=env.node_cap*12;
+    while i<keep { words[i]=old[i];i=i+1; }
+    env.node_words=words;env.node_cap=want;
+    rt_free(runtime(),old);
+    return 0;
+}
+
+fn reserve_names(env:Env,extra_bytes:u64)->u64 {
+    if env.name_bytes+extra_bytes<=(env.name_cap*8) { return 0; }
+    let mut want:u64=env.name_cap;
+    if want==0 { want=64; }
+    while want*8<(env.name_bytes+extra_bytes) { want=want*2; }
+    if want*8>hard_name_cap() { note_bound(env,want*8,hard_name_cap());return 1; }
+    let words:buf<u64>=alloc(runtime(),want);
+    if len(words)!=want { return 1; }
+    let old:buf<u64>=env.name_words;
+    let mut i:u64=0;
+    let keep:u64=env.name_cap;
+    while i<keep { words[i]=old[i];i=i+1; }
+    env.name_words=words;env.name_cap=want;
+    rt_free(runtime(),old);
+    return 0;
+}
+
+// The produced region is itself a valid node_words buffer, so the only
+// compile time evaluator can read an expansion result without any new
+// evaluator being written. The high water mark is published, never the
+// scratch high water of a temporary, so a folded condition cannot be read as
+// part of the result.
+//
+// This is the ONE record this module still builds, and it is the whole of
+// what is left: a Tree is twelve words, so a fold costs 96 bytes, and
+// constant_eval.evaluate builds its own Value record beside it. Removing
+// them needs a change to constant_eval.nova, which takes the Tree by value
+// and is not this module's file, so the number is declared here rather than
+// hidden. It is two allocations per folded constant -- see the tree reading
+// block for what the other 2271856 of them used to be.
+fn produced(env:Env)->ntasm_ast.Tree {
+    return ntasm_ast.Tree{ok:true,token_words:env.dummy,token_count:0,
+        node_words:env.node_words,node_count:env.high,
+        code:0,reason:0,source:0,line:0,column:0,start:0,end:0};
+}
+
+fn prod_live(env:Env,id:u64)->bool { return id!=0 && id<=env.high; }
+
+// prod_at used to sit here and was the produced-region twin of at(). It had
+// no call site: every reader of the produced region goes through stamp_
+// literal_token or the word loop in run()'s publish, both of which read
+// env.node_words directly. It is removed rather than kept as an unused
+// second way to spend a buffer, because an unused accessor is exactly the
+// thing that starts being used again.
+
+// ---------------------------------------------------------- budget charges
+// Every charge is refused before it is applied, so reaching a limit is
+// allowed and one step further is a stable error.
+fn charge_fuel(env:Env,line:u64,column:u64)->u64 {
+    if env.fuel>=env.fuel_limit {
+        return refuse_bound(env,201,budget_fuel(),line,column,
+                           env.fuel+1,env.fuel_limit);
+    }
+    env.fuel=env.fuel+1;return 0;
+}
+
+fn charge_arena(env:Env,bytes:u64,line:u64,column:u64)->u64 {
+    if bytes>env.arena_limit-env.arena {
+        return refuse_bound(env,201,budget_arena(),line,column,
+                           env.arena+bytes,env.arena_limit);
+    }
+    env.arena=env.arena+bytes;return 0;
+}
+
+fn charge_constant(env:Env,bytes:u64,line:u64,column:u64)->u64 {
+    if bytes>env.constant_limit-env.constant {
+        return refuse_bound(env,201,budget_constant(),line,column,
+                           env.constant+bytes,env.constant_limit);
+    }
+    env.constant=env.constant+bytes;return 0;
+}
+
+// Every charge is refused before it is applied, so reaching a limit is
+// allowed and one step further is a stable error. nodes_made counts every node
+// the expansion produced, including the temporaries of a folded condition,
+// while node_count counts only the nodes the caller receives.
+fn take_node(env:Env,line:u64,column:u64)->u64 {
+    if env.nodes_made>=env.node_limit {
+        refuse_bound(env,201,budget_nodes(),line,column,
+                     env.nodes_made+1,env.node_limit);return 0;
+    }
+    if charge_arena(env,node_bytes(),line,column)!=0 { return 0; }
+    if charge_fuel(env,line,column)!=0 { return 0; }
+    env.nodes_made=env.nodes_made+1;
+    let mut id:u64=0;
+    if env.scratch==true {
+        env.scratch_used=env.scratch_used+1;
+        id=env.node_count+env.scratch_used;
+    } else {
+        env.node_count=env.node_count+1;id=env.node_count;
+    }
+    if id>env.high {
+        if reserve_nodes(env,id-env.high)!=0 { fail(env,900,1,line,column);return 0; }
+        env.high=id;
+    }
+    return id;
+}
+
+// A temporary region: the ids are reused by the next real node, the budgets
+// are still charged, and nothing temporary is ever published.
+fn scratch_begin(env:Env)->u64 {
+    let saved:u64=env.node_count;
+    env.scratch=true;env.scratch_used=0;return saved;
+}
+
+fn scratch_end(env:Env)->u64 {
+    env.scratch=false;env.scratch_used=0;return 0;
+}
+
+// ------------------------------------------------------------ name storage
+// Every produced name lives in the payload name table, so a consumer never
+// has to look into a source buffer to read a symbol, generated or copied.
+fn put_byte(env:Env,value:u64,line:u64,column:u64)->u64 {
+    if reserve_names(env,1)!=0 { return fail(env,900,1,line,column); }
+    let words:buf<u64>=env.name_words;
+    let w:u64=env.name_bytes/8;
+    let shift:u64=(env.name_bytes%8)*8;
+    if env.name_bytes%8==0 { words[w]=value; }
+    else { words[w]=words[w] | (value<<shift); }
+    env.name_bytes=env.name_bytes+1;return 0;
+}
+
+fn put_text(env:Env,source:buf<u8>,start:u64,end:u64,line:u64,column:u64)->u64 {
+    if start>end || end>len(source) { return fail(env,800,1,line,column); }
+    if charge_constant(env,end-start,line,column)!=0 { return 1; }
+    if reserve_names(env,end-start)!=0 { return fail(env,900,1,line,column); }
+    let mut i:u64=start;
+    while i<end {
+        if put_byte(env,source[i],line,column)!=0 { return 1; }
+        i=i+1;
+    }
+    return 0;
+}
+
+// The same three packed words, written out instead of compared. Charged and
+// stored exactly as put_text stores a source range, so a mark fragment costs
+// the same constant bytes and the same name table as it always did and
+// nothing else.
+fn put_words(env:Env,n:u64,w0:u64,w1:u64,w2:u64,line:u64,column:u64)->u64 {
+    // The 24 is three packed words of eight bytes, and this refuses on the
+    // BYTE COUNT, so it is a cap and not a shape check. It is the only
+    // `fail()` in the module guarded by a numeric limit: the 201/900 capacity
+    // paths publish through refuse_bound or note_bound, and every other
+    // refusal is on a node's kind, existence or identity, where 0/0 is the
+    // honest answer. Before wave 23 this one published nothing at all.
+    if n>24 { return refuse_bound(env,800,2,line,column,n,24); }
+    if charge_constant(env,n,line,column)!=0 { return 1; }
+    if reserve_names(env,n)!=0 { return fail(env,900,1,line,column); }
+    let mut i:u64=0;
+    while i<n {
+        let mut word:u64=w0;
+        if i>=8 { word=w1; }
+        if i>=16 { word=w2; }
+        if put_byte(env,(word>>((i%8)*8))&255,line,column)!=0 { return 1; }
+        i=i+1;
+    }
+    return 0;
+}
+
+fn put_number(env:Env,value:u64,line:u64,column:u64)->u64 {
+    let mut digits:u64=0;
+    let mut scale:u64=1;
+    let mut rest:u64=value;
+    while rest!=0 { digits=digits+1;scale=scale*10;rest=rest/10; }
+    if digits==0 {
+        if put_byte(env,48,line,column)!=0 { return 1; }
+        return 0;
+    }
+    let mut place:u64=scale;
+    while place>1 {
+        place=place/10;
+        let digit:u64=(value/place)%10;
+        if put_byte(env,48+digit,line,column)!=0 { return 1; }
+    }
+    return 0;
+}
+
+// Produce a name node whose text is the byte range start..start+length of the
+// name table. aux is 1 to tell a consumer that start and end address the name
+// table and not a source buffer.
+fn emit_name(env:Env,origin:u64,inv:u64,start:u64,
+             length:u64)->u64 {
+    let id:u64=take_node(env,nline(env,inv),ncolumn(env,inv));
+    if id==0 { return 0; }
+    let words:buf<u64>=env.node_words;
+    let w:u64=(id-1)*12;
+    words[w]=k_name();words[w+1]=ntoken_begin(env,origin);words[w+2]=ntoken_end(env,origin);
+    words[w+3]=nsource(env,origin);words[w+4]=nline(env,inv);words[w+5]=ncolumn(env,inv);
+    words[w+6]=start;words[w+7]=start+length;
+    words[w+8]=0;words[w+9]=0;words[w+10]=0;words[w+11]=1;
+    return id;
+}
+
+// Copy a spelled name into the name table and produce it.
+fn emit_name_copy(env:Env,origin:u64,inv:u64)->u64 {
+    let start:u64=env.name_bytes;
+    if put_text(env,env.source,nstart(env,origin),nend(env,origin),nline(env,inv),ncolumn(env,inv))!=0 {
+        return 0;
+    }
+    return emit_name(env,origin,inv,start,nend(env,origin)-nstart(env,origin));
+}
+
+// Produce a node. source, token_begin and token_end are the origin, that is
+// the exact source and token range the shape was copied from: the macro
+// template for a clone, the caller argument for a splice. line and column are
+// the invocation position and start and end are the invocation byte span,
+// with one exception below.
+//
+// A parameter (kind 19) is the one kind whose own span is load bearing. The
+// parser records it on the direction keyword: node(p,19,ti(p)) takes the
+// keyword token as the node begin, so nodes[at+6] is the first byte of "in",
+// "out" or "inout", and finish leaves that start in place. The keyword is then
+// stepped over and discarded, so it leaves no child and no other AST field
+// carries the direction anywhere. abi.check (stage 17), calls.check (28) and
+// call_types.check (29) all read the direction back from the source bytes at
+// parameter.start, and none of those three readers can be replaced from here,
+// so stamping the invocation span on a produced parameter destroys the only
+// copy of the direction: the produced parameter reads the invocation text, the
+// direction comes back 0, and the whole pipeline refuses the module with 800.
+//
+// The origin span restores exactly the two words the parser would have
+// recorded, and the source buffer validate.nova hands to the later stages is
+// the caller source with the expander name table appended after it, so the
+// original bytes are still at the original offsets. Every other kind keeps
+// the invocation span, which is the choice respan_types in validate.nova
+// re-derives from a node's own children when a kind needs its own text.
+fn emit(env:Env,kind:u64,auxv:u64,origin:u64,inv:u64,
+        start:u64,end:u64)->u64 {
+    let id:u64=take_node(env,nline(env,inv),ncolumn(env,inv));
+    if id==0 { return 0; }
+    let w:u64=(id-1)*12;
+    env.node_words[w]=kind;env.node_words[w+1]=ntoken_begin(env,origin);
+    env.node_words[w+2]=ntoken_end(env,origin);env.node_words[w+3]=nsource(env,origin);
+    env.node_words[w+4]=nline(env,inv);env.node_words[w+5]=ncolumn(env,inv);
+    if kind==k_param() {
+        env.node_words[w+6]=nstart(env,origin);env.node_words[w+7]=nend(env,origin);
+    } else {
+        env.node_words[w+6]=start;env.node_words[w+7]=end;
+    }
+    env.node_words[w+8]=0;env.node_words[w+9]=0;env.node_words[w+10]=0;
+    env.node_words[w+11]=auxv;
+    return id;
+}
+
+fn prod_attach(env:Env,parent:u64,child:u64)->u64 {
+    if child==0 { return 0; }
+    if prod_live(env,parent)==false {
+        return fail(env,900,99,parent,child);
+    }
+    let w:u64=(parent-1)*12;
+    if env.node_words[w+8]==0 { env.node_words[w+8]=child; }
+    else {
+        let last:u64=env.node_words[w+9];
+        if prod_live(env,last)==false { return 0; }
+        env.node_words[(last-1)*12+10]=child;
+    }
+    env.node_words[w+9]=child;return child;
+}
+
+// --------------------------------------------------------- binding stack
+// A binding is seven words: kind, negative, magnitude, fresh offset, fresh
+// length, template name node, and the caller node the value was folded from. A
+// value binding carries a folded constant and no template, a name binding
+// carries the template name it was introduced under and the hygienic text it
+// was rewritten to. The seventh word is the origin a materialised literal
+// takes its token from, and it is 0 for every binding that is not a folded
+// comptime value: only a folded value has to name a token. The newest match
+// wins, so a later introduction shadows an earlier one inside one expansion.
+fn bind_stride()->u64 { return 7; }
+
+// A binding index is a word offset into the binding buffer, so an entry is
+// addressed by its own offset and never by an entry number.
+fn bind_field(env:Env,index:u64,field:u64)->u64 {
+    let words:buf<u64>=env.bind;return words[index+field];
+}
+
+fn push_binding(env:Env,kind:u64,negative:bool,magnitude:u64,start:u64,
+                length:u64,template:u64,origin:u64)->u64 {
+    if env.bind_top+bind_stride()>env.bind_cap {
+        let mut want:u64=env.bind_cap;
+        if want==0 { want=256; }
+        while want<(env.bind_top+bind_stride()) { want=want*2; }
+        if want>65536 { return refuse_bound(env,900,1,0,0,want,65536); }
+        let words:buf<u64>=alloc(runtime(),want);
+        if len(words)!=want { return fail(env,900,1,0,0); }
+        let old:buf<u64>=env.bind;
+        let mut i:u64=0;
+        while i<env.bind_cap { words[i]=old[i];i=i+1; }
+        env.bind=words;env.bind_cap=want;rt_free(runtime(),old);
+    }
+    let w:u64=env.bind_top;
+    let words:buf<u64>=env.bind;
+    words[w]=kind;
+    if negative { words[w+1]=1; } else { words[w+1]=0; }
+    words[w+2]=magnitude;words[w+3]=start;words[w+4]=length;
+    words[w+5]=template;words[w+6]=origin;
+    env.bind_top=env.bind_top+bind_stride();return 0;
+}
+
+fn bind_kind(env:Env,index:u64)->u64 { return bind_field(env,index,0); }
+
+fn bind_negative(env:Env,index:u64)->bool { return bind_field(env,index,1)==1; }
+
+fn bind_magnitude(env:Env,index:u64)->u64 { return bind_field(env,index,2); }
+
+fn bind_start(env:Env,index:u64)->u64 { return bind_field(env,index,3); }
+
+fn bind_length(env:Env,index:u64)->u64 { return bind_field(env,index,4); }
+
+fn bind_template(env:Env,index:u64)->u64 { return bind_field(env,index,5); }
+
+// The caller node a folded value came from, 0 when the binding carries no
+// folded value. It is read only by resolve_name, on the bind_value arm.
+fn bind_origin(env:Env,index:u64)->u64 { return bind_field(env,index,6); }
+
+// The word offset of the newest accepted binding for a template name, biased
+// by one: the first binding of an expansion sits at offset zero, so zero
+// cannot double as the not-found answer. The scan starts at scope_base, so a
+// nested expansion never resolves a name against the expansion that opened
+// it: that expansion is a different template scope and its marks differ, so
+// matching its binding would be a capture and not a resolution.
+fn bind_offset(env:Env,id:u64,accept_value:bool,accept_local:bool,
+               accept_decl:bool)->u64 {
+    if live(env,id)==false { return 0; }
+    let name:u64=id;
+    if nkind(env,name)!=k_name() { return 0; }
+    let mut found:u64=0;
+    let mut index:u64=env.scope_base;
+    while index<env.bind_top {
+        let template:u64=bind_template(env,index);
+        if live(env,template)==true {
+            let tn:u64=template;
+            if same_text(env,nstart(env,tn),nend(env,tn),nstart(env,name),nend(env,name)) {
+                let kind:u64=bind_kind(env,index);
+                let ok:bool=(kind==bind_value()&&accept_value) ||
+                    (kind==bind_local()&&accept_local) ||
+                    (kind==bind_decl()&&accept_decl);
+                if ok { found=index+1; }
+            }
+        }
+        index=index+bind_stride();
+    }
+    return found;
+}
+
+fn binding_exists(env:Env,id:u64)->bool {
+    if live(env,id)==false { return false; }
+    let name:u64=id;
+    let mut index:u64=env.scope_base;
+    while index<env.bind_top {
+        let template:u64=bind_template(env,index);
+        if live(env,template)==true {
+            let tn:u64=template;
+            if same_text(env,nstart(env,tn),nend(env,tn),nstart(env,name),nend(env,name)) { return true; }
+        }
+        index=index+bind_stride();
+    }
+    return false;
+}
+
+// ------------------------------------------------------------ argument stack
+// An argument is four words: tag, then either the caller node id, or the sign
+// and the magnitude of a comptime value, and last the caller node the value
+// was folded from. One shape for both keeps a splice from having to guess what
+// the slot holds. The fourth word is 0 on the node arm, because a spliced
+// caller node carries its own tokens and is never restamped; it is the
+// argument node itself on the value arm, and it is what a materialised
+// literal takes its token from.
+fn arg_stride()->u64 { return 4; }
+fn arg_node()->u64 { return 0; }
+fn arg_value()->u64 { return 1; }
+// A name the ENCLOSING template bound, carried as the fresh text's extent in
+// the name table rather than as a caller node. The splice publishes those
+// bytes verbatim, so the inner expansion refers to the outer's introduced
+// name and not to whatever the caller happens to call it. See expand_node.
+fn arg_mark()->u64 { return 2; }
+
+fn push_node_arg(env:Env,node_id:u64)->u64 {
+    return push_arg(env,arg_node(),node_id,0,0);
+}
+
+// An argument whose name the enclosing template introduced: the fresh text's
+// start and length in the name table, and the source node it came from.
+fn push_mark_arg(env:Env,start:u64,length:u64,origin:u64)->u64 {
+    return push_arg(env,arg_mark(),start,length,origin);
+}
+
+// The name node of an argument that is nothing BUT a symbol reference, and 0
+// for every other argument.
+//
+// AND THE SHAPE IS NOT THE OBVIOUS ONE, which cost two inert revisions of the
+// push that consumes this. The argument of `expand inner(t)` is not a bare
+// name: the parser builds a call's arguments as a QUALIFIED path, so `t` is a
+// k_qualified holding exactly one k_name. The first revision tested the
+// argument for k_name, the second also accepted k_expr, and both were silent
+// and green on every nested expansion, because a branch nothing reaches does
+// not fail -- it is simply never taken. The cut-every-site proof is what
+// caught it, and it is why the helper accepts the three shapes by name here
+// rather than by being widened at the call site until something matched.
+//
+// A path of one segment is the bare-reference form. `a+b` and a path of two or
+// more segments both have more structure, and they are left to the scope that
+// wrote them, which is where they belong.
+fn argument_name(env:Env,argument:u64)->u64 {
+    let n:u64=argument;
+    // The EXPRESSION wrapper comes off first. The parser builds a call's
+    // arguments as typed expressions, so `t` arrives as an expression holding
+    // a one-segment path holding the name -- three layers, and each of the
+    // first two revisions of the push tested only one of them and was
+    // therefore inert on every nested expansion while the gate stayed green.
+    if nkind(env,n)==k_expr() && naux(env,n)==0 && child_count(env,n)==1 {
+        return argument_name(env,kid(env,n));
+    }
+    if nkind(env,n)==k_name() { return n; }
+    if nkind(env,n)!=k_qualified() { return 0; }
+    if child_count(env,n)!=1 { return 0; }
+    let seg:u64=kid(env,n);
+    if live(env,seg)==false { return 0; }
+    if nkind(env,seg)!=k_name() { return 0; }
+    return seg;
+}
+
+fn push_value_arg(env:Env,negative:bool,magnitude:u64,origin:u64)->u64 {
+    let mut sign:u64=0;
+    if negative { sign=1; }
+    return push_arg(env,arg_value(),sign,magnitude,origin);
+}
+
+fn push_arg(env:Env,tag:u64,first:u64,second:u64,origin:u64)->u64 {
+    if env.arg_top+arg_stride()>env.arg_cap {
+        let mut want:u64=env.arg_cap;
+        if want==0 { want=64; }
+        while want<(env.arg_top+arg_stride()) { want=want*2; }
+        if want>4096 { return refuse_bound(env,900,1,0,0,want,4096); }
+        let words:buf<u64>=alloc(runtime(),want);
+        if len(words)!=want { return fail(env,900,1,0,0); }
+        let old:buf<u64>=env.arg;
+        let mut i:u64=0;
+        while i<env.arg_cap { words[i]=old[i];i=i+1; }
+        env.arg=words;env.arg_cap=want;rt_free(runtime(),old);
+    }
+    let w:u64=env.arg_top;
+    let words:buf<u64>=env.arg;
+    words[w]=tag;words[w+1]=first;words[w+2]=second;words[w+3]=origin;
+    env.arg_top=env.arg_top+arg_stride();return 0;
+}
+
+fn arg_tag(env:Env,index:u64)->u64 {
+    let words:buf<u64>=env.arg;return words[index];
+}
+
+fn arg_first(env:Env,index:u64)->u64 {
+    let words:buf<u64>=env.arg;return words[index+1];
+}
+
+fn arg_second(env:Env,index:u64)->u64 {
+    let words:buf<u64>=env.arg;return words[index+2];
+}
+
+// The caller node a folded comptime value came from. 0 on the node arm, and 0
+// never on the value arm, because the value arm is reached only after the
+// argument node has been checked and a live id is in hand.
+fn arg_origin(env:Env,index:u64)->u64 {
+    let words:buf<u64>=env.arg;return words[index+3];
+}
+
+// ------------------------------------------------------------- comptime block
+// The six mandated limits, each verified before it is applied, each capped by
+// the frozen maximum, no duplicate and none missing. A module with no comptime
+// block runs on the frozen maxima, as frontend.c:5863-5868 does.
+fn limit_index(env:Env,id:u64)->u64 {
+    if word_id(env,id,1) { return 0; }
+    if word_id(env,id,2) { return 1; }
+    if word_id(env,id,3) { return 2; }
+    if word_id(env,id,4) { return 3; }
+    if word_id(env,id,5) { return 4; }
+    if word_id(env,id,6) { return 5; }
+    return 99;
+}
+
+fn limit_maximum(index:u64)->u64 {
+    if index==0 { return max_fuel(); }
+    if index==1 { return max_call_depth(); }
+    if index==2 { return max_arena(); }
+    if index==3 { return max_ast_nodes(); }
+    if index==4 { return max_expansion_depth(); }
+    return max_constant_bytes();
+}
+
+fn limit_store(env:Env,index:u64,value:u64)->u64 {
+    if index==0 { env.fuel_limit=value;return 0; }
+    if index==1 { env.call_limit=value;return 0; }
+    if index==2 { env.arena_limit=value;return 0; }
+    if index==3 { env.node_limit=value;return 0; }
+    if index==4 { env.depth_limit=value;return 0; }
+    env.constant_limit=value;return 0;
+}
+
+fn apply_comptime(env:Env,id:u64)->u64 {
+    let mut values:buf<u64>=alloc(runtime(),6);
+    if len(values)!=6 { rt_free(runtime(),values);return fail(env,900,1,0,0); }
+    let mut seen:u64=0;
+    let mut i:u64=0;
+    while i<6 { values[i]=0;i=i+1; }
+    let mut mask:u64=0;
+    let mut ok:bool=true;
+    let mut at_id:u64=kid(env,id);
+    while at_id!=0 && ok {
+        let entry:u64=at_id;
+        if nkind(env,entry)==k_ct_limit() {
+            let name_id:u64=kid(env,at_id);
+            let value_id:u64=nth(env,at_id,1);
+            let index:u64=limit_index(env,name_id);
+            if index>5 { ok=false; }
+            else {
+                let bit:u64=1<<index;
+                if (mask&bit)!=0 { ok=false; }
+                else if live(env,value_id)==false { ok=false; }
+                else {
+                    let value_node:u64=value_id;
+                    if nkind(env,value_node)!=k_literal() { ok=false; }
+                    else if naux(env,value_node)>limit_maximum(index) { ok=false; }
+                    else { mask=mask|bit;values[index]=naux(env,value_node); }
+                }
+            }
+        }
+        at_id=sib(env,at_id);
+    }
+    if ok && mask!=63 { ok=false; }
+    if ok {
+        limit_store(env,0,values[0]);limit_store(env,1,values[1]);
+        limit_store(env,2,values[2]);limit_store(env,3,values[3]);
+        limit_store(env,4,values[4]);limit_store(env,5,values[5]);
+    }
+    rt_free(runtime(),values);
+    if ok==false { return fail(env,378,1,nline(env,id),ncolumn(env,id)); }
+    return 0;
+}
+
+// ------------------------------------------------------------- macro lookup
+// The one based declaration order of every macro in the module is its
+// ordinal, so a hygiene mark depends only on the source text.
+fn macro_ordinal(env:Env,id:u64)->u64 {
+    let mut ordinal:u64=0;
+    let mut scan:u64=1;
+    while scan<=env.tree.node_count {
+        let n:u64=scan;
+        if nkind(env,n)==k_macro() {
+            ordinal=ordinal+1;
+            if scan==id { return ordinal; }
+        }
+        scan=scan+1;
+    }
+    return 0;
+}
+
+fn count_macros(env:Env)->u64 {
+    let mut ordinal:u64=0;
+    let mut scan:u64=1;
+    while scan<=env.tree.node_count {
+        if nkind(env,scan)==k_macro() { ordinal=ordinal+1; }
+        scan=scan+1;
+    }
+    return ordinal;
+}
+
+fn find_macro(env:Env,name_id:u64)->u64 {
+    if live(env,name_id)==false { return 0; }
+    let want:u64=name_id;
+    let mut scan:u64=1;
+    while scan<=env.tree.node_count {
+        let n:u64=scan;
+        if nkind(env,n)==k_macro() {
+            let declared:u64=kid(env,scan);
+            if live(env,declared)==true {
+                let dn:u64=declared;
+                if same_text(env,nstart(env,dn),nend(env,dn),nstart(env,want),nend(env,want)) { return scan; }
+            }
+        }
+        scan=scan+1;
+    }
+    return 0;
+}
+
+// A macro parameter kind: 1 ast.expr, 2 ast.type, 3 a comptime value.
+fn parameter_kind(env:Env,param:u64)->u64 {
+    let type_id:u64=nth(env,param,1);
+    if live(env,type_id)==false { return 0; }
+    let t:u64=type_id;
+    if nkind(env,t)!=k_type() { return 0; }
+    if naux(env,t)==5 {
+        let inner:u64=kid(env,type_id);
+        if word_id(env,inner,7) { return 1; }
+        if word_id(env,inner,8) { return 2; }
+        return 0;
+    }
+    return 3;
+}
+
+fn parameter_name(env:Env,param:u64)->u64 { return kid(env,param); }
+
+fn parameter_type_node(env:Env,param:u64)->u64 { return nth(env,param,1); }
+
+// The declared result kind, or 0 for a form outside this profile.
+fn macro_result(env:Env,id:u64)->u64 {
+    let mut at_id:u64=kid(env,id);
+    while at_id!=0 {
+        let n:u64=at_id;
+        if nkind(env,n)==k_type() { return result_of(env,at_id); }
+        if nkind(env,n)==k_meta_block() { return 0; }
+        at_id=sib(env,at_id);
+    }
+    return 0;
+}
+
+fn result_of(env:Env,type_id:u64)->u64 {
+    let t:u64=type_id;
+    if naux(env,t)==5 {
+        let inner:u64=kid(env,type_id);
+        if word_id(env,inner,7) { return result_expr(); }
+        if word_id(env,inner,9) { return result_stmt(); }
+        if word_id(env,inner,10) { return result_decl(); }
+        if word_id(env,inner,8) { return result_type(); }
+        if word_id(env,inner,11) { return result_block(); }
+        return 0;
+    }
+    return 0;
+}
+
+fn macro_parameters(env:Env,id:u64)->u64 {
+    let mut count:u64=0;
+    let mut at_id:u64=kid(env,id);
+    while at_id!=0 {
+        if nkind(env,at_id)==k_mparam() { count=count+1; }
+        if nkind(env,at_id)==k_meta_block() { break; }
+        at_id=sib(env,at_id);
+    }
+    return count;
+}
+
+fn macro_parameter_at(env:Env,id:u64,index:u64)->u64 {
+    let mut seen:u64=0;
+    let mut at_id:u64=kid(env,id);
+    while at_id!=0 {
+        if nkind(env,at_id)==k_meta_block() { return 0; }
+        if nkind(env,at_id)==k_mparam() {
+            if seen==index { return at_id; }
+            seen=seen+1;
+        }
+        at_id=sib(env,at_id);
+    }
+    return 0;
+}
+
+fn macro_body(env:Env,id:u64)->u64 {
+    let mut at_id:u64=kid(env,id);
+    while at_id!=0 {
+        if nkind(env,at_id)==k_meta_block() { return at_id; }
+        at_id=sib(env,at_id);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------- hygiene marks
+// Every mark is built by textual composition in the name table, so the result
+// is a pure function of the source, the ordinal and the expansion serial.
+// The fixed text fragments of a hygiene mark, selected by number so that no
+// call site has to pass a literal where a buffer is expected.
+fn put_mark(env:Env,which:u64,line:u64,column:u64)->u64 {
+    if which==1 { return put_words(env,6,0x0000246d746e5f5f,0x0000000000000000,0x0000000000000000,line,column); }
+    if which==2 { return put_words(env,6,0x00002464746e5f5f,0x0000000000000000,0x0000000000000000,line,column); }
+    if which==3 { return put_words(env,6,0x00002470746e5f5f,0x0000000000000000,0x0000000000000000,line,column); }
+    if which==4 { return put_words(env,2,0x0000000000006524,0x0000000000000000,0x0000000000000000,line,column); }
+    if which==5 { return put_words(env,2,0x0000000000007224,0x0000000000000000,0x0000000000000000,line,column); }
+    if which==6 { return put_words(env,2,0x0000000000007424,0x0000000000000000,0x0000000000000000,line,column); }
+    if which==7 { return put_words(env,2,0x0000000000007024,0x0000000000000000,0x0000000000000000,line,column); }
+    if which==8 { return put_words(env,1,0x0000000000000024,0x0000000000000000,0x0000000000000000,line,column); }
+    return fail(env,800,2,line,column);
+}
+
+// Every mark is built by textual composition in the name table, so the result
+// is a pure function of the source, the ordinal and the expansion serial.
+fn mark_local(env:Env,ordinal:u64,serial:u64,name:u64,
+              inv:u64)->u64 {
+    let start:u64=env.name_bytes;
+    if put_mark(env,1,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_number(env,ordinal,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_mark(env,4,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_number(env,serial,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_mark(env,8,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_text(env,env.source,nstart(env,name),nend(env,name),nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    return start;
+}
+
+fn mark_decl(env:Env,ordinal:u64,serial:u64,repeat:u64,item:u64,listed:bool,
+             name:u64,inv:u64)->u64 {
+    let start:u64=env.name_bytes;
+    if put_mark(env,2,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_number(env,ordinal,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_mark(env,4,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_number(env,serial,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if listed {
+        if put_mark(env,5,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        if put_number(env,repeat,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        if put_mark(env,6,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        if put_number(env,item,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    }
+    if put_mark(env,8,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_text(env,env.source,nstart(env,name),nend(env,name),nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    return start;
+}
+
+fn mark_param(env:Env,ordinal:u64,serial:u64,index:u64,name:u64,
+              inv:u64)->u64 {
+    let start:u64=env.name_bytes;
+    if put_mark(env,3,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_number(env,ordinal,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_mark(env,4,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_number(env,serial,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_mark(env,7,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_number(env,index,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_mark(env,8,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    if put_text(env,env.source,nstart(env,name),nend(env,name),nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    return start;
+}
+
+// ------------------------------------------------------------ value checks
+// A comptime value parameter accepts a plain integer literal, or the name
+// true or false for a bool, and the value must fit the declared type. The
+// wider evaluator is not used for arguments, so an argument can never carry a
+// name, a call or a comparison into the template.
+fn value_fits(env:Env,type_id:u64,negative:bool,magnitude:u64)->bool {
+    let name_id:u64=kid(env,type_id);
+    if word_id(env,name_id,12) {
+        if negative { return false; }
+        if magnitude>1 { return false; }
+        return true;
+    }
+    let mut bits:u64=0;
+    let mut signed:bool=false;
+    if word_id(env,name_id,13) { bits=8;signed=false; }
+    else if word_id(env,name_id,14) { bits=16;signed=false; }
+    else if word_id(env,name_id,15) { bits=32;signed=false; }
+    else if word_id(env,name_id,16) { bits=64;signed=false; }
+    else if word_id(env,name_id,17) { bits=8;signed=true; }
+    else if word_id(env,name_id,18) { bits=16;signed=true; }
+    else if word_id(env,name_id,19) { bits=32;signed=true; }
+    else if word_id(env,name_id,20) { bits=64;signed=true; }
+    else { return false; }
+    if signed {
+        let half:u64=1<<(bits-1);
+        if negative {
+            if magnitude>half { return false; }
+            return true;
+        }
+        if magnitude>=half { return false; }
+        return true;
+    }
+    if negative { return false; }
+    if bits==64 { return true; }
+    let top:u64=1<<bits;
+    if magnitude>=top { return false; }
+    return true;
+}
+
+// Fold an expression that the module itself produced. The only evaluator is
+// constant_eval, so no second arithmetic exists here.
+fn fold(env:Env,id:u64)->constant_eval.Value {
+    return constant_eval.evaluate(produced(env),id);
+}
+
+// Materialise a folded constant as produced literal nodes. A negative value
+// becomes the unary minus of its magnitude, which is the only shape
+// constant_eval reads back as a negative value.
+//
+// source_id is the CALLER node the constant was folded from: the argument of a
+// value parameter, or the expression a comptime let bound, or the count a
+// repeat runs to. It is what the literal's token is taken from, because a
+// token taken from the template would name the $v of the splice position --
+// a NAME token -- and ntir.type_literal would refuse the whole image in 817
+// on a module the pipeline accepts. See the block above for the whole argument.
+fn emit_constant(env:Env,negative:bool,magnitude:u64,origin:u64,
+                 inv:u64,source_id:u64)->u64 {
+    if charge_constant(env,8,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    let bias:u64=folded_token(env,source_id);
+    if negative {
+        let outer:u64=emit(env,k_expr(),45,origin,inv,nstart(env,inv),nend(env,inv));
+        if outer==0 { return 0; }
+        let inner:u64=emit(env,k_literal(),magnitude,origin,inv,nstart(env,inv),nend(env,inv));
+        if inner==0 { return 0; }
+        // Only the literal is restamped. The unary minus is a kind 35 whose
+        // token no pass reads: ntir.nova:652-689 has no arm for an expression,
+        // so it types nothing and reads no token.
+        stamp_literal_token(env,inner,bias);
+        prod_attach(env,outer,inner);
+        return outer;
+    }
+    let made:u64=emit(env,k_literal(),magnitude,origin,inv,nstart(env,inv),nend(env,inv));
+    if made==0 { return 0; }
+    stamp_literal_token(env,made,bias);
+    return made;
+}
+
+// ------------------------------------------------------------- the context
+// Everything one expansion needs to instantiate a template.
+struct Ctx {
+    macro:u64,arg_base:u64,ordinal:u64,serial:u64,
+    repeat:u64,item:u64,listed:bool,result:u64,frame:u64
+}
+
+fn empty_ctx()->Ctx {
+    return Ctx{macro:0,arg_base:0,ordinal:0,serial:0,repeat:0,item:0,
+        listed:false,result:0,frame:0};
+}
+
+// The expander is mutually recursive: a template can hold a nested expand,
+// whose body can hold another one. Every such step is bounded by the call
+// depth, expansion depth and fuel budgets, never by the language.
+
+// Does the caller declare this name outside any macro body? A template is not
+// a caller declaration: the name it introduces lives inside a macro and is
+// renamed, so scanning it would collide with the template itself. The walk
+// descends from the module root and skips a macro body whole.
+//
+// THE TRUE AT THE CAP IS A REFUSAL, AND IT IS WHY IT IS TRUE, NOT A LIE ABOUT
+// THE SCAN. This predicate is "the caller declares this name", so a cap
+// crossing cannot answer false -- answering false would say the scan looked
+// and found nothing, which is the one answer this site must never give, since
+// the scan did not look. True is the conservative refusal: refuse the
+// expansion as though a collision existed, so no unreached name is ever
+// renamed into an existing one. The three callers all read true as
+// fail(381,1), so the cap produces a red, not a green.
+//
+// WHAT WAS WRONG, AND IT IS NOT THE POLARITY. The refusal was a truthful
+// refusal under a code that says something else: 381/1 means "the caller
+// declares this name", and a cap crossing claims exactly that with no
+// declaration anywhere in sight. Before this change the two cases were
+// byte-identical on the wire -- same code, same reason, and out[10]/out[11]
+// both 0, which the export's own comment reserves for a refusal that is NOT a
+// bound. So a reader could not tell a real collision from a scan cut short at
+// 64, and "the two are told apart" was false at this site: the channel that
+// tells them apart was exactly the one this site left empty.
+//
+// So the two words are written here under note_bound's guard, which is
+// fail()'s guard, and the caller raises 381/1 as it always did. The refusal a
+// caller reads keeps its code and gains the quantity, which is the
+// reserve_nodes/reserve_names precedent and not a new mechanism. Nothing runs
+// between the write and the caller's fail: caller_declares charges its fuel
+// BEFORE this call, and on the way out it only returns.
+fn declares_below(env:Env,id:u64,start:u64,end:u64,depth:u64)->bool {
+    if depth>walk_depth_cap() {
+        note_bound(env,depth,walk_depth_cap());
+        return true;
+    }
+    let mut at_id:u64=id;
+    while at_id!=0 {
+        if live(env,at_id)==false { return true; }
+        let n:u64=at_id;
+        if nkind(env,n)==k_macro() || nkind(env,n)==k_comptime() { at_id=sib(env,at_id);continue; }
+        if nkind(env,n)==k_const() || nkind(env,n)==k_data() || nkind(env,n)==k_fn() ||
+           nkind(env,n)==k_param() {
+            let declared:u64=kid(env,at_id);
+            if live(env,declared)==true {
+                let dn:u64=declared;
+                if same_text(env,nstart(env,dn),nend(env,dn),start,end) { return true; }
+            }
+        }
+        if declares_below(env,kid(env,at_id),start,end,depth+1) { return true; }
+        at_id=sib(env,at_id);
+    }
+    return false;
+}
+
+fn caller_declares(env:Env,start:u64,end:u64)->bool {
+    if charge_fuel(env,0,0)!=0 { return true; }
+    return declares_below(env,kid(env,1),start,end,0);
+}
+
+// The parameter index a template name refers to, or 99 when it is not a macro
+// parameter. Parameters are matched on their template spelling, which is
+// unique because a duplicate parameter name is refused.
+fn parameter_index(env:Env,ctx:Ctx,name_id:u64)->u64 {
+    if live(env,name_id)==false { return 99; }
+    let want:u64=name_id;
+    let count:u64=macro_parameters(env,ctx.macro);
+    let mut index:u64=0;
+    while index<count {
+        let param:u64=macro_parameter_at(env,ctx.macro,index);
+        let declared:u64=parameter_name(env,param);
+        if live(env,declared)==true {
+            let dn:u64=declared;
+            if same_text(env,nstart(env,dn),nend(env,dn),nstart(env,want),nend(env,want)) { return index; }
+        }
+        index=index+1;
+    }
+    return 99;
+}
+
+// ---- WHICH FORBIDDEN CHANNEL A COMPTIME EXPRESSION REACHED FOR ---------
+//
+// WHY THIS EXISTS, and it is a defect that was measured rather than imagined.
+// Before it, EVERY attempt to name an I/O channel inside a comptime
+// expression was refused 374 reason 1, "capture of a caller symbol" -- the
+// hygiene rule, which fires because the name is unbound and not because it is
+// a channel. rt_open_read, rt_write, rt_diag and a name that is not a
+// primitive at all all answered the same code and the same reason, so the
+// refusal carried no information about the channel: a reader could not tell
+// which one fired, and a gate that asserted "the file-read channel is refused
+// at comptime" was in fact asserting that unbound names are refused.
+//
+// WHAT THE CLASS IS, and why it is not the presence of a word. These six
+// spellings are not a vocabulary this module invented: they are the Nova
+// language's own primitive table, the runtime_names[] array the front end
+// recognises as syntax (nova.c, the seven-name runtime table) and the one the
+// host runtime implements with fopen/fread/fwrite (runtime_v2). A spelling is
+// a channel because the ENVIRONMENT publishes it as one, and the gate that
+// ships with this lot re-reads that table out of the environment's own source
+// and fails if the two disagree. rt_free, alloc, rt_copy, slice, runtime and
+// len are in the same table and are NOT listed here: they are the permitted
+// half, and the classifier refusing them would be a blanket refusal wearing a
+// channel's name.
+//
+// The four reasons are DISTINCT NUMBERS, not one answer under four labels, and
+// they are published as the reason of 379 beside the evaluator statuses 1-8.
+fn channel_file_read()->u64 { return 20; }
+fn channel_file_write()->u64 { return 21; }
+fn channel_file_close()->u64 { return 22; }
+fn channel_diagnostic()->u64 { return 23; }
+
+// The class of one name, or 0 when the name is not a channel primitive. The
+// packing is text_is's own, stated once in that function: byte i of the text
+// is bit (i%8)*8 of word i/8.
+fn channel_id(env:Env,id:u64)->u64 {
+    // rt_open_read, rt_read -- open an existing file for reading, read bytes.
+    if named(env,id,12,0x5f6e65706f5f7472,0x0000000064616572,0x0000000000000000)==true { return channel_file_read(); }
+    if named(env,id,7,0x00646165725f7472,0x0000000000000000,0x0000000000000000)==true { return channel_file_read(); }
+    // rt_open_new, rt_write -- create a file, write bytes into it.
+    if named(env,id,11,0x5f6e65706f5f7472,0x000000000077656e,0x0000000000000000)==true { return channel_file_write(); }
+    if named(env,id,8,0x65746972775f7472,0x0000000000000000,0x0000000000000000)==true { return channel_file_write(); }
+    // rt_close -- the lifecycle half of the file channel, refused on its own
+    // number so a reader is never left guessing which of the three fired.
+    if named(env,id,8,0x65736f6c635f7472,0x0000000000000000,0x0000000000000000)==true { return channel_file_close(); }
+    // rt_diag -- diagnostic output on the host's stderr.
+    if named(env,id,7,0x00676169645f7472,0x0000000000000000,0x0000000000000000)==true { return channel_diagnostic(); }
+    return 0;
+}
+
+// THE FIRST CHANNEL PRIMITIVE IN THE CALLER SUBTREE, or 0.
+//
+// This is the second of the two doors the attempt can come through, and it is
+// the one the first does not see. channel_id classifies a name the TEMPLATE
+// spells at a binding position, which resolve_name below reaches while
+// cloning. An attempt can also arrive SPELCED: the caller writes the channel
+// call as an ast.expr macro argument, so the TEMPLATE holds only the $name and
+// the spelling lives in the caller's own node. A splice is followed here
+// exactly as clone_splice follows it -- same parameter_index, same slot, same
+// arg_node tag -- because a walk that stopped at the $name would answer 0 on
+// the one route where the author never spelled the channel in the template at
+// all, and that refusal would fall back to the evaluator's own reason, which
+// names a shape and not a channel.
+//
+// The walk is over the CALLER tree, never the produced one. A produced node
+// carries the invocation's span, not the span of the caller's own expression,
+// so a produced tree cannot name the spelling -- that is a measured fact
+// about emit, not a choice made here.
+fn fold_channel(env:Env,ctx:Ctx,id:u64,depth:u64)->u64 {
+    if live(env,id)==false || depth>walk_depth_cap() { return 0; }
+    let n:u64=id;
+    if nkind(env,n)==k_name() { return channel_id(env,n); }
+    if nkind(env,n)==k_expr() && naux(env,n)==36 {
+        let name_id:u64=kid(env,n);
+        if live(env,name_id)==false { return 0; }
+        let index:u64=parameter_index(env,ctx,name_id);
+        if index>=macro_parameters(env,ctx.macro) { return 0; }
+        let param:u64=macro_parameter_at(env,ctx.macro,index);
+        if parameter_kind(env,param)!=1 { return 0; }
+        let slot:u64=ctx.arg_base+index*arg_stride();
+        if slot+arg_stride()>env.arg_top { return 0; }
+        if arg_tag(env,slot)!=arg_node() { return 0; }
+        return fold_channel(env,ctx,arg_first(env,slot),depth+1);
+    }
+    let count:u64=child_count(env,id);
+    let mut at:u64=0;
+    while at<count {
+        let found:u64=fold_channel(env,ctx,nth(env,id,at),depth+1);
+        if found!=0 { return found; }
+        at=at+1;
+    }
+    return 0;
+}
+
+// Resolve a binding position name. Returns the produced node, or 0 after a
+// refusal. There is no fourth outcome: a name that is not bound inside the
+// template is a capture attempt and is refused.
+//
+// THE ONE PLACE A CAPTURE BECOMES A CHANNEL REFUSAL. env.folding is set only
+// around the clone that produces an expression the expander is about to FOLD,
+// so a name elsewhere in a template keeps 374 exactly as before -- a template
+// that merely spells rt_write is a hygiene capture and this module must not
+// call that an I/O attempt. Inside a fold it is a different act: the expander
+// is about to ACQUIRE a value from the environment, and the name it reached
+// for says which environment capability it reached for.
+fn resolve_name(env:Env,ctx:Ctx,name_id:u64,inv:u64,depth:u64,
+                as_type:bool)->u64 {
+    let name:u64=name_id;
+    if binding_exists(env,name_id)==true {
+        let slot:u64=bind_offset(env,name_id,true,true,true);
+        if slot==0 { return fail(env,373,1,nline(env,name),ncolumn(env,name)); }
+        let value:u64=slot-1;
+        if bind_kind(env,value)==bind_value() {
+            return emit_constant(env,bind_negative(env,value),
+                bind_magnitude(env,value),name,inv,bind_origin(env,value));
+        }
+        return emit_name(env,name,inv,bind_start(env,value),
+            bind_length(env,value));
+    }
+    if env.folding==true {
+        let channel:u64=channel_id(env,name);
+        if channel!=0 { return fail(env,379,channel,nline(env,name),ncolumn(env,name)); }
+    }
+    return fail(env,374,1,nline(env,name),ncolumn(env,name));
+}
+
+// A qualified name: the leading segments are spelling, and only the last one
+// is a binding position when the qualified name is a symbol reference.
+fn clone_qualified(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64,
+                   last_is_bind:u64)->u64 {
+    let n:u64=id;
+    if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    let out:u64=emit(env,k_qualified(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+    if out==0 { return 0; }
+    let count:u64=child_count(env,id);
+    let mut index:u64=0;
+    while index<count {
+        let child:u64=nth(env,id,index);
+        let mut pos:u64=pos_spelled();
+        if last_is_bind!=0 && (index+1)==count { pos=pos_bind(); }
+        let piece:u64=clone(env,ctx,child,pos,inv,depth+1);
+        if piece==0 { return 0; }
+        prod_attach(env,out,piece);
+        index=index+1;
+    }
+    return out;
+}
+
+fn clone_children(env:Env,ctx:Ctx,out:u64,id:u64,pos:u64,inv:u64,
+                  depth:u64)->u64 {
+    let count:u64=child_count(env,id);
+    let mut index:u64=0;
+    while index<count {
+        let child:u64=nth(env,id,index);
+        let piece:u64=clone(env,ctx,child,pos,inv,depth+1);
+        if piece==0 { return 0; }
+        prod_attach(env,out,piece);
+        index=index+1;
+    }
+    return out;
+}
+
+// A let statement introduces a symbol, so it is renamed and the later
+// references to it are rewritten. The mark is __ntm$ as in frontend.c:2384.
+fn clone_let(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    let name_id:u64=kid(env,id);
+    let type_id:u64=nth(env,id,1);
+    let init_id:u64=nth(env,id,2);
+    if live(env,name_id)==false || live(env,type_id)==false ||
+       live(env,init_id)==false {
+        return fail(env,800,1,nline(env,n),ncolumn(env,n));
+    }
+    let name:u64=name_id;
+    if binding_exists(env,name_id)==true {
+        return fail(env,376,1,nline(env,name),ncolumn(env,name));
+    }
+    if parameter_index(env,ctx,name_id)<macro_parameters(env,ctx.macro) {
+        return fail(env,376,2,nline(env,name),ncolumn(env,name));
+    }
+    if reserved_word(env,name_id) { return fail(env,376,3,nline(env,name),ncolumn(env,name)); }
+    if caller_declares(env,nstart(env,name),nend(env,name)) {
+        return fail(env,381,1,nline(env,name),ncolumn(env,name));
+    }
+    let start:u64=mark_local(env,ctx.ordinal,ctx.serial,name,inv);
+    if start==0 && env.code!=0 { return 0; }
+    let length:u64=env.name_bytes-start;
+    let out:u64=emit(env,k_let(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+    if out==0 { return 0; }
+    if push_binding(env,bind_local(),false,0,start,length,name_id,0)!=0 {
+        return 0;
+    }
+    let fresh:u64=emit_name(env,name,inv,start,length);
+    if fresh==0 { return 0; }
+    prod_attach(env,out,fresh);
+    let type_copy:u64=clone(env,ctx,type_id,pos_spelled(),inv,depth+1);
+    if type_copy==0 { return 0; }
+    prod_attach(env,out,type_copy);
+    let init_copy:u64=clone(env,ctx,init_id,pos_bind(),inv,depth+1);
+    if init_copy==0 { return 0; }
+    prod_attach(env,out,init_copy);
+    return out;
+}
+
+// A memory operand holds register and space spellings, displacements and one
+// type. Only the type is a typed position and a displacement is a constant.
+fn clone_memory(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    let out:u64=emit(env,k_memory(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+    if out==0 { return 0; }
+    let count:u64=child_count(env,id);
+    let mut index:u64=0;
+    while index<count {
+        let child:u64=nth(env,id,index);
+        let cn:u64=child;
+        let mut pos:u64=pos_spelled();
+        if nkind(env,cn)==k_expr() { pos=pos_bind(); }
+        let piece:u64=clone(env,ctx,child,pos,inv,depth+1);
+        if piece==0 { return 0; }
+        prod_attach(env,out,piece);
+        index=index+1;
+    }
+    return out;
+}
+
+// A type. A $T splice resolves to the caller argument node, never to a re-parse
+// of its spelling.
+fn clone_type(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    if naux(env,n)==5 { return fail(env,375,1,nline(env,n),ncolumn(env,n)); }
+    if naux(env,n)==3 { return fail(env,386,1,nline(env,n),ncolumn(env,n)); }
+    if naux(env,n)==4 {
+        let name_id:u64=kid(env,id);
+        let index:u64=parameter_index(env,ctx,name_id);
+        if index<macro_parameters(env,ctx.macro) {
+            let slot:u64=ctx.arg_base+index*arg_stride();
+            if slot+arg_stride()<=env.arg_top {
+                if arg_tag(env,slot)==3 { return clone_argument_context(env,ctx,slot,inv,depth); }
+                return clone(env,ctx,arg_first(env,slot),pos_caller(),inv,depth+1);
+            }
+        }
+        return fail(env,372,1,nline(env,name_id),ncolumn(env,name_id));
+    }
+    if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    let out:u64=emit(env,k_type(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+    if out==0 { return 0; }
+    let count:u64=child_count(env,id);
+    let mut index:u64=0;
+    while index<count {
+        let child:u64=nth(env,id,index);
+        let piece:u64=clone(env,ctx,child,pos_spelled(),inv,depth+1);
+        if piece==0 { return 0; }
+        prod_attach(env,out,piece);
+        index=index+1;
+    }
+    return out;
+}
+
+// A $name splice. A macro parameter splices the caller typed AST node for the
+// matching argument, a comptime value materialises its folded constant and a
+// hygienic name rewrites to its fresh text. Anything else is a capture.
+// Frames are bounded by the existing expansion-depth limit. Each active frame
+// records its macro, argument base and lexical binding interval. Argument
+// records remain four words: tag 3 refers to an ancestor frame, not a copied AST.
+fn ensure_frames(env:Env)->u64 {
+    let old:buf<u64>=env.frames;
+    if len(old)!=0 { return 0; }
+    let count:u64=max_expansion_depth()*4;
+    let words:buf<u64>=alloc(runtime(),count);
+    if len(words)!=count { rt_free(runtime(),words);return fail(env,900,1,0,0); }
+    env.frames=words;rt_free(runtime(),old);return 0;
+}
+fn clone_argument_context(env:Env,ctx:Ctx,slot:u64,inv:u64,depth:u64)->u64 {
+    let frame:u64=arg_second(env,slot);
+    if frame==0||frame>=env.depth { fail(env,800,1,nline(env,inv),ncolumn(env,inv));return 0; }
+    let frames:buf<u64>=env.frames;
+    let at:u64=(frame-1)*4;
+    if at+4>len(frames) { fail(env,800,1,nline(env,inv),ncolumn(env,inv));return 0; }
+    let old_macro:u64=ctx.macro;let old_base:u64=ctx.arg_base;let old_frame:u64=ctx.frame;
+    let old_scope:u64=env.scope_base;let old_top:u64=env.bind_top;
+    ctx.macro=frames[at];ctx.arg_base=frames[at+1];ctx.frame=frame;
+    env.scope_base=frames[at+2];env.bind_top=frames[at+3];
+    let made:u64=clone(env,ctx,arg_first(env,slot),pos_bind(),inv,depth+1);
+    ctx.macro=old_macro;ctx.arg_base=old_base;ctx.frame=old_frame;
+    env.scope_base=old_scope;env.bind_top=old_top;
+    return made;
+}
+
+fn clone_splice(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64,
+                as_type:bool)->u64 {
+    let n:u64=id;
+    let name_id:u64=kid(env,id);
+    if live(env,name_id)==false { return fail(env,800,1,nline(env,n),ncolumn(env,n)); }
+    let index:u64=parameter_index(env,ctx,name_id);
+    if index<macro_parameters(env,ctx.macro) {
+        let param:u64=macro_parameter_at(env,ctx.macro,index);
+        let kind:u64=parameter_kind(env,param);
+        let slot:u64=ctx.arg_base+index*arg_stride();
+        if slot+arg_stride()>env.arg_top {
+            return fail(env,372,1,nline(env,name_id),ncolumn(env,name_id));
+        }
+        // A comptime value parameter carries its folded sign and magnitude, so
+        // a splice of it materialises that constant, never a node.
+        if kind==3 {
+            if as_type { return fail(env,372,1,nline(env,name_id),ncolumn(env,name_id)); }
+            if arg_tag(env,slot)!=arg_value() {
+                return fail(env,372,1,nline(env,name_id),ncolumn(env,name_id));
+            }
+            return emit_constant(env,arg_first(env,slot)==1,arg_second(env,slot),
+                name_id,inv,arg_origin(env,slot));
+        }
+        if (as_type&&kind==2) || ((as_type==false)&&kind==1) {
+            // An argument the ENCLOSING template bound carries its mark, and
+            // the mark is what the inner expansion must publish: the same
+            // fresh text the outer published, so the reference crosses the
+            // boundary pointing at the binding the author introduced. The
+            // caller-node arm below is unchanged and still correct -- a
+            // caller owns its names, so those keep their spelling.
+            if arg_tag(env,slot)==3 { return clone_argument_context(env,ctx,slot,inv,depth); }
+            if arg_tag(env,slot)==arg_mark() {
+                return emit_name(env,arg_origin(env,slot),inv,
+                                 arg_first(env,slot),arg_second(env,slot));
+            }
+            return clone(env,ctx,arg_first(env,slot),pos_caller(),inv,depth+1);
+        }
+        return fail(env,372,1,nline(env,name_id),ncolumn(env,name_id));
+    }
+    return resolve_name(env,ctx,name_id,inv,depth,as_type);
+}
+
+// A symbol reference or a call target: the last segment of a qualified name
+// is the binding, the leading segments are spelling.
+fn clone_symbol(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    if live(env,id)==false { return fail(env,800,1,nline(env,inv),ncolumn(env,inv)); }
+    if nkind(env,id)==k_qualified() {
+        return clone_qualified(env,ctx,id,inv,depth,1);
+    }
+    return clone(env,ctx,id,pos_bind(),inv,depth+1);
+}
+
+fn clone(env:Env,ctx:Ctx,id:u64,pos:u64,inv:u64,depth:u64)->u64 {
+    if depth>walk_depth_cap() { return refuse_bound(env,375,9,nline(env,inv),ncolumn(env,inv),depth,walk_depth_cap()); }
+    if live(env,id)==false { return fail(env,800,1,nline(env,inv),ncolumn(env,inv)); }
+    if env.code!=0 { return 0; }
+    let n:u64=id;
+    if nkind(env,n)==k_literal() {
+        if charge_constant(env,nend(env,n)-nstart(env,n),nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        return emit(env,k_literal(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+    }
+    if nkind(env,n)==k_name() {
+        if pos!=pos_bind() { return emit_name_copy(env,n,inv); }
+        return resolve_name(env,ctx,id,inv,depth,false);
+    }
+    if nkind(env,n)==k_qualified() { return clone_qualified(env,ctx,id,inv,depth,0); }
+    // The effects, clobbers and abi of a produced declaration are carried over
+    // verbatim: their entries are target spellings, not bindings, and they are
+    // re-checked by the normal effects, clobbers and abi passes afterwards.
+    if nkind(env,n)==k_effects() || nkind(env,n)==k_clobbers() {
+        if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        let out:u64=emit(env,nkind(env,n),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+        if out==0 { return 0; }
+        return clone_children(env,ctx,out,id,pos_spelled(),inv,depth);
+    }
+    if nkind(env,n)==k_dashed() || nkind(env,n)==k_section_name() || is_abi(env,id)==true {
+        if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        let out:u64=emit(env,nkind(env,n),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+        if out==0 { return 0; }
+        return clone_children(env,ctx,out,id,pos_spelled(),inv,depth);
+    }
+    if nkind(env,n)==k_type() { return clone_type(env,ctx,id,inv,depth); }
+    if nkind(env,n)==k_expr() {
+        if naux(env,n)==36 { return clone_splice(env,ctx,id,inv,depth,false); }
+        if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        let out:u64=emit(env,k_expr(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+        if out==0 { return 0; }
+        let count:u64=child_count(env,id);
+        let mut index:u64=0;
+        while index<count {
+            let child:u64=nth(env,id,index);
+            if (naux(env,n)==0 || naux(env,n)==1) && index==0 && pos!=pos_caller() {
+                let piece:u64=clone_symbol(env,ctx,child,inv,depth+1);
+                if piece==0 { return 0; }
+                prod_attach(env,out,piece);
+                index=index+1;
+                continue;
+            }
+            let piece:u64=clone(env,ctx,child,pos,inv,depth+1);
+            if piece==0 { return 0; }
+            prod_attach(env,out,piece);
+            index=index+1;
+        }
+        return out;
+    }
+    if nkind(env,n)>=k_block() && nkind(env,n)<=k_memory() {
+        return clone_stmt(env,ctx,id,pos,inv,depth);
+    }
+    return fail(env,375,1,nline(env,n),ncolumn(env,n));
+}
+
+fn clone_stmt(env:Env,ctx:Ctx,id:u64,pos:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    if nkind(env,n)==k_block() {
+        if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        let out:u64=emit(env,k_block(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+        if out==0 { return 0; }
+        let save:u64=env.bind_top;
+        let count:u64=child_count(env,id);
+        let mut index:u64=0;
+        while index<count {
+            let child:u64=nth(env,id,index);
+            let piece:u64=clone(env,ctx,child,pos_bind(),inv,depth+1);
+            if piece==0 { env.bind_top=save;return 0; }
+            prod_attach(env,out,piece);
+            index=index+1;
+        }
+        env.bind_top=save;return out;
+    }
+    if nkind(env,n)==k_let() { return clone_let(env,ctx,id,inv,depth); }
+    if nkind(env,n)==k_call() { return clone_call(env,ctx,id,pos,inv,depth); }
+    if nkind(env,n)==k_return() {
+        if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        let out:u64=emit(env,k_return(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+        if out==0 { return 0; }
+        return clone_children(env,ctx,out,id,pos_bind(),inv,depth);
+    }
+    if nkind(env,n)==k_if() {
+        if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        let out:u64=emit(env,k_if(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+        if out==0 { return 0; }
+        return clone_children(env,ctx,out,id,pos_bind(),inv,depth);
+    }
+    if nkind(env,n)==k_expand() { return expand_node(env,ctx.frame,id,depth+1); }
+    if nkind(env,n)==k_insn() {
+        if naux(env,n)==1 { return fail(env,375,2,nline(env,n),ncolumn(env,n)); }
+        if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        let out:u64=emit(env,k_insn(),0,n,inv,nstart(env,inv),nend(env,inv));
+        if out==0 { return 0; }
+        let count:u64=child_count(env,id);
+        let mut index:u64=0;
+        while index<count {
+            let child:u64=nth(env,id,index);
+            let mut child_pos:u64=pos_bind();
+            if index==0 { child_pos=pos_spelled(); }
+            let piece:u64=clone(env,ctx,child,child_pos,inv,depth+1);
+            if piece==0 { return 0; }
+            prod_attach(env,out,piece);
+            index=index+1;
+        }
+        return out;
+    }
+    if nkind(env,n)==k_call() { return clone_call(env,ctx,id,pos,inv,depth); }
+    if nkind(env,n)==k_memory() { return clone_memory(env,ctx,id,inv,depth); }
+    return fail(env,375,1,nline(env,n),ncolumn(env,n));
+}
+
+// A call target is a symbol reference, so it is a binding position and the
+// callee is resolved against the macro bindings. Only a call that was itself
+// spliced in from a caller argument keeps the caller spelling.
+fn clone_call(env:Env,ctx:Ctx,id:u64,pos:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    let out:u64=emit(env,k_call(),naux(env,n),n,inv,nstart(env,inv),nend(env,inv));
+    if out==0 { return 0; }
+    let count:u64=child_count(env,id);
+    let mut index:u64=0;
+    while index<count {
+        let child:u64=nth(env,id,index);
+        if index==0 && pos==pos_caller() {
+            let piece:u64=clone(env,ctx,child,pos,inv,depth+1);
+            if piece==0 { return 0; }
+            prod_attach(env,out,piece);
+            index=index+1;
+            continue;
+        }
+        if index==0 {
+            let symbol:u64=clone_symbol(env,ctx,child,inv,depth+1);
+            if symbol==0 { return 0; }
+            prod_attach(env,out,symbol);
+            index=index+1;
+            continue;
+        }
+        let piece:u64=clone(env,ctx,child,pos,inv,depth+1);
+        if piece==0 { return 0; }
+        prod_attach(env,out,piece);
+        index=index+1;
+    }
+    return out;
+}
+
+// A generated function declaration. Parameters are renamed with __ntp$ and
+// bound, so every body reference is rewritten. A requires or ensures clause is
+// refused: a macro may not fabricate a proof.
+fn produce_function(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    let name_id:u64=kid(env,id);
+    if live(env,name_id)==false { return fail(env,800,1,nline(env,n),ncolumn(env,n)); }
+    let name:u64=name_id;
+    if binding_exists(env,name_id)==true {
+        return fail(env,376,1,nline(env,name),ncolumn(env,name));
+    }
+    if reserved_word(env,name_id) { return fail(env,376,3,nline(env,name),ncolumn(env,name)); }
+    if caller_declares(env,nstart(env,name),nend(env,name)) {
+        return fail(env,381,1,nline(env,name),ncolumn(env,name));
+    }
+    let start:u64=mark_decl(env,ctx.ordinal,ctx.serial,ctx.repeat,ctx.item,
+        ctx.listed,name,inv);
+    if start==0 && env.code!=0 { return 0; }
+    if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    let out:u64=emit(env,k_fn(),0,n,inv,nstart(env,inv),nend(env,inv));
+    if out==0 { return 0; }
+    let length:u64=env.name_bytes-start;
+    if push_binding(env,bind_decl(),false,0,start,length,name_id,0)!=0 {
+        return 0;
+    }
+    let fresh:u64=emit_name(env,name,inv,start,length);
+    if fresh==0 { return 0; }
+    prod_attach(env,out,fresh);
+    let count:u64=child_count(env,id);
+    let mut index:u64=1;
+    let mut param_index:u64=0;
+    while index<count {
+        let child:u64=nth(env,id,index);
+        let cn:u64=child;
+        if nkind(env,cn)==k_param() {
+            let pname_id:u64=kid(env,child);
+            if live(env,pname_id)==false { return fail(env,800,1,nline(env,cn),ncolumn(env,cn)); }
+            let pname:u64=pname_id;
+            if binding_exists(env,pname_id)==true {
+                return fail(env,376,1,nline(env,pname),ncolumn(env,pname));
+            }
+            if reserved_word(env,pname_id) {
+                return fail(env,376,3,nline(env,pname),ncolumn(env,pname));
+            }
+            let pstart:u64=mark_param(env,ctx.ordinal,ctx.serial,param_index,pname,inv);
+            if pstart==0 && env.code!=0 { return 0; }
+            let plength:u64=env.name_bytes-pstart;
+            if push_binding(env,bind_local(),false,0,pstart,plength,pname_id,0)!=0 {
+                return 0;
+            }
+            if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+            let pout:u64=emit(env,k_param(),naux(env,cn),cn,inv,nstart(env,inv),nend(env,inv));
+            if pout==0 { return 0; }
+            let pcopy:u64=emit_name(env,pname,inv,pstart,plength);
+            if pcopy==0 { return 0; }
+            prod_attach(env,pout,pcopy);
+            let pcount:u64=child_count(env,child);
+            let mut p:u64=1;
+            while p<pcount {
+                let pchild:u64=nth(env,child,p);
+                let ppiece:u64=clone(env,ctx,pchild,pos_spelled(),inv,depth+1);
+                if ppiece==0 { return 0; }
+                prod_attach(env,pout,ppiece);
+                p=p+1;
+            }
+            prod_attach(env,out,pout);
+            param_index=param_index+1;
+        } else if nkind(env,cn)==k_requires() || nkind(env,cn)==k_ensures() {
+            return fail(env,375,3,nline(env,cn),ncolumn(env,cn));
+        } else {
+            // A generated function's body is ONE block child, and the
+            // reference bounds what is inside it: frontend.c:3654 refuses the
+            // 513th statement of a generated function body with NTF_E_LIMIT
+            // "generated function statement limit exceeded", at that
+            // statement's own token. The cap is applied HERE, on that block,
+            // and not in clone_stmt, because a k_block nested anywhere else
+            // in a template is a form the reference cannot express and a cap
+            // there would be one this module invented.
+            if nkind(env,cn)==k_block() {
+                template_items(env,cn,0);
+                if env.code!=0 { return 0; }
+            }
+            let piece:u64=clone(env,ctx,child,pos_spelled(),inv,depth+1);
+            if piece==0 { return 0; }
+            prod_attach(env,out,piece);
+        }
+        index=index+1;
+    }
+    return out;
+}
+
+// A generated const or data declaration. The name is renamed with __ntd$ and
+// bound, so a later statement of the same expansion can call it.
+fn produce_declaration(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    if nkind(env,n)==k_fn() { return produce_function(env,ctx,id,inv,depth); }
+    if naux(env,n)==1 { return fail(env,377,2,nline(env,n),ncolumn(env,n)); }
+    let name_id:u64=kid(env,id);
+    let type_id:u64=nth(env,id,1);
+    let init_id:u64=nth(env,id,2);
+    if live(env,name_id)==false || live(env,type_id)==false ||
+       live(env,init_id)==false { return fail(env,800,1,nline(env,n),ncolumn(env,n)); }
+    let name:u64=name_id;
+    if binding_exists(env,name_id)==true {
+        return fail(env,376,1,nline(env,name),ncolumn(env,name));
+    }
+    if caller_declares(env,nstart(env,name),nend(env,name)) {
+        return fail(env,381,1,nline(env,name),ncolumn(env,name));
+    }
+    if reserved_word(env,name_id) { return fail(env,376,3,nline(env,name),ncolumn(env,name)); }
+    let start:u64=mark_decl(env,ctx.ordinal,ctx.serial,ctx.repeat,ctx.item,
+        ctx.listed,name,inv);
+    if start==0 && env.code!=0 { return 0; }
+    if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    let out:u64=emit(env,nkind(env,n),0,n,inv,nstart(env,inv),nend(env,inv));
+    if out==0 { return 0; }
+    let length:u64=env.name_bytes-start;
+    if push_binding(env,bind_decl(),false,0,start,length,name_id,0)!=0 {
+        return 0;
+    }
+    let fresh:u64=emit_name(env,name,inv,start,length);
+    if fresh==0 { return 0; }
+    prod_attach(env,out,fresh);
+    let type_copy:u64=clone_type(env,ctx,type_id,inv,depth+1);
+    if type_copy==0 { return 0; }
+    prod_attach(env,out,type_copy);
+    let init_copy:u64=clone(env,ctx,init_id,pos_bind(),inv,depth+1);
+    if init_copy==0 { return 0; }
+    prod_attach(env,out,init_copy);
+    return out;
+}
+
+// A meta return produces the macro result.
+fn run_return(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    let value_id:u64=kid(env,id);
+    if live(env,value_id)==false { return fail(env,800,1,nline(env,n),ncolumn(env,n)); }
+    let value:u64=value_id;
+    if nkind(env,value)!=k_quote() {
+        if ctx.result!=result_expr() { return fail(env,377,3,nline(env,n),ncolumn(env,n)); }
+        return clone(env,ctx,value_id,pos_bind(),inv,depth+1);
+    }
+    if ctx.result==result_decl() { return fail(env,377,3,nline(env,n),ncolumn(env,n)); }
+    let kind_id:u64=kid(env,value_id);
+    let payload:u64=nth(env,value_id,1);
+    if live(env,payload)==false { return fail(env,800,1,nline(env,value),ncolumn(env,value)); }
+    if ctx.result==result_expr() && naux(env,value)==1 { return clone(env,ctx,payload,pos_bind(),inv,depth+1); }
+    if ctx.result==result_type() && naux(env,value)==4 { return clone_type(env,ctx,payload,inv,depth+1); }
+    if ctx.result==result_stmt() && naux(env,value)==2 {
+        if live(env,kind_id)==false { return fail(env,800,1,nline(env,value),ncolumn(env,value)); }
+        if word_id(env,kind_id,9)==false { return fail(env,372,1,nline(env,value),ncolumn(env,value)); }
+        return clone(env,ctx,payload,pos_bind(),inv,depth+1);
+    }
+    if ctx.result==result_block() && naux(env,value)==5 {
+        if word_id(env,kind_id,11)==false { return fail(env,372,1,nline(env,value),ncolumn(env,value)); }
+        // A quote(block) holds the statements directly, so the block node is
+        // produced here and the statements become its children.
+        if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+        let out:u64=emit(env,k_block(),0,value,inv,nstart(env,inv),nend(env,inv));
+        if out==0 { return 0; }
+        let save:u64=env.bind_top;
+        // The statements of a quoted block are the reference's template items
+        // one for one, so this is where the reference's 512 applies, and the
+        // count is refused rather than shortened.
+        let count:u64=template_items(env,value_id,1);
+        if env.code!=0 { env.bind_top=save;return 0; }
+        let mut index:u64=1;
+        while index<count {
+            let statement:u64=nth(env,value_id,index);
+            let piece:u64=clone(env,ctx,statement,pos_bind(),inv,depth+1);
+            if piece==0 { env.bind_top=save;return 0; }
+            prod_attach(env,out,piece);
+            index=index+1;
+        }
+        env.bind_top=save;
+        return out;
+    }
+    return fail(env,372,1,nline(env,value),ncolumn(env,value));
+}
+
+// A meta emit produces a declaration.
+fn run_emit(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    if ctx.result!=result_decl() { return fail(env,377,4,nline(env,n),ncolumn(env,n)); }
+    let value_id:u64=kid(env,id);
+    if live(env,value_id)==false { return fail(env,800,1,nline(env,n),ncolumn(env,n)); }
+    let value:u64=value_id;
+    if nkind(env,value)!=k_quote() || naux(env,value)!=3 {
+        return fail(env,372,1,nline(env,value),ncolumn(env,value));
+    }
+    let kind_id:u64=kid(env,value_id);
+    if word_id(env,kind_id,10)==false {
+        return fail(env,372,1,nline(env,value),ncolumn(env,value));
+    }
+    let payload:u64=nth(env,value_id,1);
+    if live(env,payload)==false { return fail(env,800,1,nline(env,value),ncolumn(env,value)); }
+    let pn:u64=payload;
+    if nkind(env,pn)!=k_const() && nkind(env,pn)!=k_data() && nkind(env,pn)!=k_fn() {
+        return fail(env,375,1,nline(env,pn),ncolumn(env,pn));
+    }
+    return produce_declaration(env,ctx,payload,inv,depth+1);
+}
+
+// A meta let binds a comptime value, evaluated in order with the arguments
+// already spliced, so the value it holds is the folded constant itself.
+fn run_meta_let(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    let name_id:u64=kid(env,id);
+    let value_id:u64=nth(env,id,1);
+    if live(env,name_id)==false || live(env,value_id)==false {
+        return fail(env,800,1,nline(env,n),ncolumn(env,n));
+    }
+    if binding_exists(env,name_id)==true {
+        return fail(env,376,1,nline(env,name_id),ncolumn(env,name_id));
+    }
+    if parameter_index(env,ctx,name_id)<macro_parameters(env,ctx.macro) {
+        return fail(env,376,1,nline(env,name_id),ncolumn(env,name_id));
+    }
+    if reserved_word(env,name_id) {
+        return fail(env,376,3,nline(env,name_id),ncolumn(env,name_id));
+    }
+    scratch_begin(env);
+    let outer_folding:bool=env.folding;
+    env.folding=true;
+    let copy:u64=clone(env,ctx,value_id,pos_bind(),inv,depth+1);
+    env.folding=outer_folding;
+    if copy==0 { scratch_end(env);return 0; }
+    let value:constant_eval.Value=fold(env,copy);
+    scratch_end(env);
+    if value.status!=0 {
+        if value.status==800 { return fail(env,800,1,nline(env,inv),ncolumn(env,inv)); }
+        let channel:u64=fold_channel(env,ctx,value_id,0);
+        if channel!=0 { return fail(env,379,channel,value.line,value.column); }
+        return fail(env,379,value.status,value.line,value.column);
+    }
+    // value_id is the folded expression in the CALLER tree, and it is the
+    // range a materialised $k takes its token from.
+    if push_binding(env,bind_value(),value.negative,value.magnitude,0,0,
+        name_id,value_id)!=0 { return 0; }
+    return 1;
+}
+
+// A meta if is decided by the folded condition, except for the two boolean
+// literals, which are words and not expressions. The parser does not hand a
+// bare word over as a name: primary wraps a NAME token in a kind 35 node of
+// aux 0 around a qualified node around the name, so a test on kind 90 never
+// matches and the word can only reach the evaluator, which refuses it. This
+// unwraps exactly that shape and nothing else: a call, a parenthesised
+// expression, a splice and a qualified multi segment name all keep folding.
+// Nothing can bind true or false, because reserved_word refuses the name at
+// every introducer, so the word always means the word and cannot be made to
+// lie.
+fn boolean_word(env:Env,id:u64)->u64 {
+    if live(env,id)==false { return 0; }
+    let n:u64=id;
+    if nkind(env,n)!=k_expr() || naux(env,n)!=0 { return 0; }
+    if child_count(env,id)!=1 { return 0; }
+    let qualified:u64=nth(env,id,0);
+    if nkind(env,qualified)!=k_qualified() { return 0; }
+    if child_count(env,qualified)!=1 { return 0; }
+    let inner:u64=nth(env,qualified,0);
+    if word_id(env,inner,21) { return 1; }
+    if word_id(env,inner,22) { return 2; }
+    return 0;
+}
+
+// A meta if is decided by the folded condition.
+fn run_meta_if(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    let cond_id:u64=kid(env,id);
+    let then_id:u64=nth(env,id,1);
+    let else_id:u64=nth(env,id,2);
+    if live(env,cond_id)==false || live(env,then_id)==false {
+        return fail(env,800,1,nline(env,n),ncolumn(env,n));
+    }
+    let cond:u64=cond_id;
+    let mut taken:bool=false;
+    let word:u64=boolean_word(env,cond_id);
+    if word==1 { taken=true; }
+    else if word==2 { taken=false; }
+    else {
+        scratch_begin(env);
+        let outer_folding:bool=env.folding;
+        env.folding=true;
+        let copy:u64=clone(env,ctx,cond_id,pos_bind(),inv,depth+1);
+        env.folding=outer_folding;
+        if copy==0 { scratch_end(env);return 0; }
+        let value:constant_eval.Value=fold(env,copy);
+        scratch_end(env);
+        if value.status!=0 {
+            if value.status==800 { return fail(env,800,1,nline(env,inv),ncolumn(env,inv)); }
+            let channel:u64=fold_channel(env,ctx,cond_id,0);
+            if channel!=0 { return fail(env,379,channel,value.line,value.column); }
+            return fail(env,379,value.status,value.line,value.column);
+        }
+        if value.negative { taken=false; } else { taken=value.magnitude!=0; }
+    }
+    if taken { return run_block(env,ctx,then_id,inv,depth+1); }
+    if live(env,else_id)==true { return run_block(env,ctx,else_id,inv,depth+1); }
+    return 0;
+}
+
+// A meta for repeats the body. The count is folded, must not be negative and
+// is capped, and each repeat binds the loop name to its own index.
+fn run_meta_for(env:Env,ctx:Ctx,id:u64,inv:u64,depth:u64)->u64 {
+    let n:u64=id;
+    let loop_id:u64=kid(env,id);
+    let count_id:u64=nth(env,id,1);
+    let body_id:u64=nth(env,id,2);
+    if live(env,loop_id)==false || live(env,count_id)==false ||
+       live(env,body_id)==false { return fail(env,800,1,nline(env,n),ncolumn(env,n)); }
+    if binding_exists(env,loop_id)==true {
+        return fail(env,376,1,nline(env,loop_id),ncolumn(env,loop_id));
+    }
+    if reserved_word(env,loop_id) {
+        return fail(env,376,3,nline(env,loop_id),ncolumn(env,loop_id));
+    }
+    scratch_begin(env);
+    let outer_folding:bool=env.folding;
+    env.folding=true;
+    let copy:u64=clone(env,ctx,count_id,pos_bind(),inv,depth+1);
+    env.folding=outer_folding;
+    if copy==0 { scratch_end(env);return 0; }
+    let value:constant_eval.Value=fold(env,copy);
+    scratch_end(env);
+    if value.status!=0 {
+        if value.status==800 { return fail(env,800,1,nline(env,inv),ncolumn(env,inv)); }
+        let channel:u64=fold_channel(env,ctx,count_id,0);
+        if channel!=0 { return fail(env,379,channel,value.line,value.column); }
+        return fail(env,379,value.status,value.line,value.column);
+    }
+    if value.negative { return fail(env,380,1,nline(env,n),ncolumn(env,n)); }
+    if value.magnitude>loop_cap() { return refuse_bound(env,380,2,nline(env,n),ncolumn(env,n),value.magnitude,loop_cap()); }
+    if charge_fuel(env,nline(env,inv),ncolumn(env,inv))!=0 { return 0; }
+    let out:u64=emit(env,k_block(),0,n,inv,nstart(env,inv),nend(env,inv));
+    if out==0 { return 0; }
+    let mut repeat:u64=0;
+    while repeat<value.magnitude {
+        // The loop index has no token of its own -- it is 0, 1, 2 -- so the
+        // count the loop runs to is the only integer the caller wrote for it.
+        if push_binding(env,bind_value(),false,repeat,0,0,loop_id,count_id)!=0 {
+            return 0;
+        }
+        let inner:Ctx=ctx;
+        inner.repeat=repeat;inner.listed=true;
+        let piece:u64=run_block(env,inner,body_id,inv,depth+1);
+        if piece==0 { return 0; }
+        prod_attach(env,out,piece);
+        repeat=repeat+1;
+    }
+    return out;
+}
+
+// One meta block. Exactly one item may produce the result; a second one is a
+// macro form outside this profile rather than a silent choice.
+fn run_block(env:Env,ctx:Ctx,block:u64,inv:u64,depth:u64)->u64 {
+    if depth>walk_depth_cap() { return refuse_bound(env,375,9,nline(env,inv),ncolumn(env,inv),depth,walk_depth_cap()); }
+    if live(env,block)==false { return fail(env,800,1,nline(env,inv),ncolumn(env,inv)); }
+    if nkind(env,block)!=k_meta_block() { return fail(env,375,1,nline(env,inv),ncolumn(env,inv)); }
+    let save:u64=env.bind_top;
+    let mut result:u64=0;
+    let mut at_id:u64=kid(env,block);
+    while at_id!=0 {
+        if env.code!=0 { env.bind_top=save;return 0; }
+        let n:u64=at_id;
+        let mut piece:u64=0;
+        if nkind(env,n)==k_meta_let() { piece=run_meta_let(env,ctx,at_id,inv,depth+1); }
+        else if nkind(env,n)==k_meta_if() { piece=run_meta_if(env,ctx,at_id,inv,depth+1); }
+        else if nkind(env,n)==k_meta_for() { piece=run_meta_for(env,ctx,at_id,inv,depth+1); }
+        else if nkind(env,n)==k_meta_return() { piece=run_return(env,ctx,at_id,inv,depth+1); }
+        else if nkind(env,n)==k_meta_emit() { piece=run_emit(env,ctx,at_id,inv,depth+1); }
+        else { env.bind_top=save;return fail(env,375,1,nline(env,n),ncolumn(env,n)); }
+        if env.code!=0 { env.bind_top=save;return 0; }
+        if piece>1 {
+            if result!=0 { env.bind_top=save;return fail(env,377,5,nline(env,n),ncolumn(env,n)); }
+            result=piece;
+        }
+        at_id=sib(env,at_id);
+    }
+    env.bind_top=save;
+    return result;
+}
+
+// Expand one expand invocation into a fresh region. The wrapper is the first
+// produced node of the expansion, so the produced ids stay in lexical order.
+fn expand_node(env:Env,parent:u64,inv_id:u64,depth:u64)->u64 {
+    if live(env,inv_id)==false { return 0; }
+    let inv_node:u64=inv_id;
+    if nkind(env,inv_node)!=k_expand() { return fail(env,375,1,nline(env,inv_node),ncolumn(env,inv_node)); }
+    if env.depth>=env.depth_limit {
+        return refuse_bound(env,201,budget_depth(),nline(env,inv_node),ncolumn(env,inv_node),
+                            env.depth+1,env.depth_limit);
+    }
+    if env.call_depth>=env.call_limit {
+        return refuse_bound(env,201,budget_call(),nline(env,inv_node),ncolumn(env,inv_node),
+                            env.call_depth+1,env.call_limit);
+    }
+    if charge_fuel(env,nline(env,inv_node),ncolumn(env,inv_node))!=0 { return 0; }
+    env.depth=env.depth+1;env.call_depth=env.call_depth+1;
+    if env.depth>env.depth_peak { env.depth_peak=env.depth; }
+    if env.call_depth>env.call_peak { env.call_peak=env.call_depth; }
+    env.expansions=env.expansions+1;
+    // A nested expansion reached from a folded condition publishes its own
+    // wrapper, so the temporary region is closed around it.
+    let outer_scratch:bool=env.scratch;
+    env.scratch=false;env.scratch_used=0;
+    let wrap_id:u64=emit(env,k_expand(),0,inv_node,inv_node,nstart(env,inv_node),nend(env,inv_node));
+    if wrap_id==0 { return 0; }
+    let name_id:u64=kid(env,inv_id);
+    if live(env,name_id)==false { return fail(env,800,1,nline(env,inv_node),ncolumn(env,inv_node)); }
+    let macro_id:u64=find_macro(env,name_id);
+    if macro_id==0 {
+        return fail(env,370,1,nline(env,name_id),ncolumn(env,name_id));
+    }
+    let ordinal:u64=macro_ordinal(env,macro_id);
+    if ordinal==0 { return fail(env,370,2,nline(env,inv_node),ncolumn(env,inv_node)); }
+    // The wrapper names the macro it came from, so a consumer can find the
+    // roots of the produced region without a side table.
+    env.node_words[(wrap_id-1)*12+11]=ordinal;
+    let result_kind:u64=macro_result(env,macro_id);
+    if result_kind==0 {
+        return fail(env,377,1,nline(env,macro_id),ncolumn(env,macro_id));
+    }
+    let count:u64=macro_parameters(env,macro_id);
+    if count>parameter_cap() {
+        return refuse_bound(env,372,2,nline(env,macro_id),ncolumn(env,macro_id),
+                            count,parameter_cap());
+    }
+    let given:u64=child_count(env,inv_id)-1;
+    if given!=count {
+        return fail(env,371,1,nline(env,inv_node),ncolumn(env,inv_node));
+    }
+    let mut ctx:Ctx=empty_ctx();
+    ctx.macro=macro_id;ctx.ordinal=ordinal;ctx.result=result_kind;
+    ctx.serial=env.serial+1;
+    env.serial=ctx.serial;
+    let arg_base:u64=env.arg_top;
+    ctx.arg_base=arg_base;ctx.frame=env.depth;
+    if ensure_frames(env)!=0 { return 0; }
+    let frames:buf<u64>=env.frames;
+    if parent!=0 {
+        if parent>=env.depth { return fail(env,800,1,nline(env,inv_node),ncolumn(env,inv_node)); }
+        frames[(parent-1)*4+3]=env.bind_top;
+    }
+    let frame_at:u64=(env.depth-1)*4;
+    frames[frame_at]=ctx.macro;frames[frame_at+1]=arg_base;
+    frames[frame_at+2]=env.bind_top;frames[frame_at+3]=env.bind_top;
+    let mut index:u64=0;
+    while index<count {
+        let param:u64=macro_parameter_at(env,macro_id,index);
+        let kind:u64=parameter_kind(env,param);
+        if kind==0 {
+            return fail(env,372,3,nline(env,param),ncolumn(env,param));
+        }
+        let argument:u64=nth(env,inv_id,index+1);
+        if live(env,argument)==false {
+            return fail(env,800,1,nline(env,inv_node),ncolumn(env,inv_node));
+        }
+        let an:u64=argument;
+        if kind==1 || kind==3 {
+            if nkind(env,an)==k_quote() {
+                return fail(env,372,4,nline(env,an),ncolumn(env,an));
+            }
+            if kind==3 {
+                let mut negative:bool=false;
+                let mut magnitude:u64=0;
+                if nkind(env,an)==k_literal() { magnitude=naux(env,an); }
+                else if nkind(env,an)==k_expr() && naux(env,an)==45 {
+                    // A comptime value parameter also accepts the unary minus
+                    // of a plain literal, so a negative count or offset is
+                    // expressible without a second evaluator.
+                    let inner:u64=kid(env,argument);
+                    if live(env,inner)==false || nkind(env,inner)!=k_literal() {
+                        return fail(env,372,5,nline(env,an),ncolumn(env,an));
+                    }
+                    if nth(env,argument,1)!=0 {
+                        return fail(env,372,5,nline(env,an),ncolumn(env,an));
+                    }
+                    negative=true;magnitude=naux(env,inner);
+                } else if nkind(env,an)==k_name() {
+                    if word_id(env,argument,21) { magnitude=1; }
+                    else if word_id(env,argument,22) { magnitude=0; }
+                    else { return fail(env,372,5,nline(env,an),ncolumn(env,an)); }
+                } else { return fail(env,372,5,nline(env,an),ncolumn(env,an)); }
+                if value_fits(env,parameter_type_node(env,param),negative,
+                    magnitude)==false {
+                    return fail(env,372,6,nline(env,an),ncolumn(env,an));
+                }
+                if push_value_arg(env,negative,magnitude,argument)!=0 { return 0; }
+            } else if parent!=0 {
+                if push_arg(env,3,argument,parent,argument)!=0 { return 0; }
+            } else if argument_name(env,an)!=0 &&
+                      binding_exists(env,argument_name(env,an))==true {
+                // A NAME THE ENCLOSING TEMPLATE BOUND is not a caller name,
+                // and this is the one place that can still tell the two apart.
+                // The binding stack is at its fullest here: the outer template
+                // has pushed the binding this name resolves to, and
+                // expand_node has not yet raised scope_base above it. One
+                // line later the nested expansion runs with scope_base ABOVE
+                // these entries, so by the time the splice asks the question
+                // the answer is gone.
+                //
+                // WHAT WENT WRONG WITHOUT THIS. The argument was pushed as a
+                // plain node, the splice copied its SPELLING verbatim, and the
+                // inner expansion published a bare `t` while the outer
+                // published `__ntm$2$e1$t`. In a module whose caller also
+                // binds `t` at function scope -- the measured edge of 381,
+                // which declares_below does not read because k_let is not
+                // among its four kinds -- that bare `t` binds to the CALLER's
+                // declaration. spec/ntasm/ntasm.md 13 forbids the capture by
+                // default, so the correct answer is the mark.
+                let aname:u64=argument_name(env,an);
+                let slot2:u64=bind_offset(env,aname,true,true,true);
+                if slot2==0 { return fail(env,373,1,nline(env,aname),ncolumn(env,aname)); }
+                let value2:u64=slot2-1;
+                if push_mark_arg(env,bind_start(env,value2),
+                                 bind_length(env,value2),argument)!=0 { return 0; }
+            } else if push_node_arg(env,argument)!=0 { return 0; }
+        } else {
+            if nkind(env,an)!=k_quote() || naux(env,an)!=4 {
+                return fail(env,372,4,nline(env,an),ncolumn(env,an));
+            }
+            let inner:u64=nth(env,argument,1);
+            if live(env,inner)==false { return fail(env,800,1,nline(env,an),ncolumn(env,an)); }
+            if nkind(env,inner)!=k_type() {
+                return fail(env,372,4,nline(env,an),ncolumn(env,an));
+            }
+            if parent!=0 { if push_arg(env,3,inner,parent,inner)!=0 { return 0; } }
+            else if push_node_arg(env,inner)!=0 { return 0; }
+        }
+        index=index+1;
+    }
+    let body:u64=macro_body(env,macro_id);
+    if body==0 { return fail(env,377,6,nline(env,macro_id),ncolumn(env,macro_id)); }
+    // A nested expansion is a fresh template scope. Its bindings go above the
+    // ones the opening expansion already made, so a push never overwrites
+    // them, and the lookups start above them, so a name written in the nested
+    // template resolves against the nested template alone. run_block pops
+    // what the nested body binds, and the scope base is put back before the
+    // result is attached, so a statement after the nested expansion still
+    // reads the outer bindings. The two marks differ by serial anyway, so
+    // nothing here weakens the hygiene: it is what makes a nested expansion
+    // able to use a name the opening expansion already used.
+    let outer_scope:u64=env.scope_base;
+    let outer_bind:u64=env.bind_top;
+    env.scope_base=outer_bind;
+    let made:u64=run_block(env,ctx,body,inv_node,0);
+    env.bind_top=outer_bind;
+    env.scope_base=outer_scope;
+    // Every supported macro form produces exactly one result, so an empty
+    // expansion is a form outside this profile rather than an empty AST.
+    if made==0 {
+        if env.code==0 { return fail(env,377,7,nline(env,inv_node),ncolumn(env,inv_node)); }
+        return 0;
+    }
+    prod_attach(env,wrap_id,made);
+    env.arg_top=arg_base;
+    env.depth=env.depth-1;env.call_depth=env.call_depth-1;
+    env.scratch=outer_scratch;
+    if outer_scratch==true { env.scratch_used=0; }
+    return wrap_id;
+}
+
+// ------------------------------------------------------------ caller walk
+// Lexical and stable: the module tree is visited in node order, a comptime or
+// macro declaration is not descended into, and an expand is expanded where it
+// stands.
+fn walk(env:Env,id:u64,depth:u64)->u64 {
+    if depth>walk_depth_cap() { return refuse_bound(env,375,9,0,0,depth,walk_depth_cap()); }
+    if live(env,id)==false { return 0; }
+    if env.code!=0 { return 0; }
+    // NO FUEL IS CHARGED HERE, and that is the alignment, not an omission.
+    //
+    // This walk used to charge one unit for every node of the CALLER's module.
+    // The reference charges nothing for the caller's module at all: its
+    // consume_fuel is called from clone_macro_expression, expand_macro_statement,
+    // expand_macro_value and the declaration-expansion path, and from nowhere in
+    // the parser's own descent. frontend.c has no counterpart to this line.
+    //
+    // Measured on the same text through both, in a directory named for it:
+    // a module with a section, a function, a body and a macro declaration and
+    // NO expansion costs the reference 1 unit, all of it the lump its own
+    // comptime body is charged, and costs this expander 23. On the corpus
+    // member it is 5 against 30, and the gate's own SHADOW ladder prints the
+    // constant this line was: 27 units at zero data items.
+    //
+    // So the two schemes were never comparable as totals, and the ratio is not
+    // even constant -- 23:1 with no expansion, 30:5 with one, 2565:1 at 508
+    // data items on a differently shaped ladder. No single rate maps one onto
+    // the other, which is why this is a removal of a charge the oracle does not
+    // make and not a change of rate.
+    //
+    // WHAT THIS DOES NOT SETTLE, and the next thing to measure: with the walk
+    // silent the corpus member costs 8 against the reference's 5. The residual
+    // is two divergences, not one, and they are additive rather than
+    // overlapping. This expansion charges 8 where the reference charges 4, and
+    // it charges NOTHING for the comptime block's own body where the reference
+    // charges the expression count it parsed there and can refuse with
+    // "comptime evaluation exceeds fuel" -- a refusal this expander cannot
+    // produce at all. Neither is settled by this line.
+    let n:u64=id;
+    if nkind(env,n)==k_comptime() || nkind(env,n)==k_macro() { return 0; }
+    if nkind(env,n)==k_type() && naux(env,n)==3 { return fail(env,386,1,nline(env,n),ncolumn(env,n)); }
+    if nkind(env,n)==k_expand() { return expand_node(env,0,id,depth); }
+    let mut at_id:u64=kid(env,id);
+    while at_id!=0 {
+        if env.code!=0 { return 0; }
+        walk(env,at_id,depth+1);
+        at_id=sib(env,at_id);
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------------- core
+// The budget block is applied before anything is expanded, so the limits in
+// force are the ones the module declares. A module with no comptime block runs
+// on the frozen maxima.
+fn run(source:buf<u8>,tree:ntasm_ast.Tree,report:bool,out:buf<u64>)->u64 {
+    let env:Env=fresh_env(source,tree);
+    if tree.ok==false || tree.node_count==0 {
+        release_env(env);return 800;
+    }
+    let mut code:u64=0;
+    if report==true {
+        env.fuel_limit=max_fuel();env.call_limit=max_call_depth();
+        env.arena_limit=max_arena();env.node_limit=max_ast_nodes();
+        env.depth_limit=max_expansion_depth();env.constant_limit=max_constant_bytes();
+    }
+    if len(out)<4 { release_env(env);return 800; }
+    let mut at_id:u64=kid(env,1);
+    while at_id!=0 && code==0 {
+        // A measure run ignores the declared block on purpose: it reports the
+        // cost of the expansion under the frozen maxima, so a caller can then
+        // pin a declared budget at that exact cost.
+        if nkind(env,at_id)==k_comptime() && report==false {
+            code=apply_comptime(env,at_id);
+        }
+        at_id=sib(env,at_id);
+    }
+    if code==0 { env.macros=count_macros(env); }
+    if code==0 { walk(env,1,0); }
+    if env.code!=0 { code=env.code; }
+    if code==0 && report==true {
+        if len(out)<10 { release_env(env);return 800; }
+        out[0]=0;out[1]=env.fuel;out[2]=env.call_peak;out[3]=env.arena;
+        out[4]=env.node_count;out[5]=env.depth_peak;out[6]=env.constant;
+        out[7]=env.name_bytes;out[8]=env.expansions;out[9]=env.macros;
+        release_env(env);return 0;
+    }
+    if code==0 {
+        // Publish only after the whole expansion succeeded, so a refusal can
+        // never leave a partial AST in the caller buffer.
+        let name_words:u64=(env.name_bytes+7)/8;
+        let need:u64=4+name_words+env.node_count*12;
+        if len(out)<need {
+            out[0]=203;out[1]=inv_line(env);out[2]=1;out[3]=need;
+            release_env(env);return 203;
+        }
+        out[0]=0;out[1]=env.node_count;out[2]=env.name_bytes;out[3]=0;
+        let mut i:u64=0;
+        while i<name_words { out[4+i]=env.name_words[i];i=i+1; }
+        let mut id:u64=1;
+        while id<=env.node_count {
+            let s:u64=(id-1)*12;
+            let d:u64=4+name_words+s;
+            let mut k:u64=0;
+            while k<12 { out[d+k]=env.node_words[s+k];k=k+1; }
+            id=id+1;
+        }
+        release_env(env);return 0;
+    }
+    if code==203 { release_env(env);return 203; }
+    out[0]=code;
+    if env.line==0 { out[1]=1; } else { out[1]=env.line; }
+    out[2]=env.column;out[3]=env.reason;
+    // out[10] and out[11], and ONLY when the caller left room for twelve
+    // words. A four-word caller gets byte-identical behaviour to the ABI it
+    // was written against: the two words are the whole of the addition and
+    // the guard is what makes that true. See the export's own comment for
+    // what they name and why they are HERE and not at out[4] and out[5].
+    if len(out)>=12 { out[10]=env.offending;out[11]=env.limit; }
+    release_env(env);return code;
+}
+
+// The invocation line used for a capacity refusal, which is not a budget.
+fn inv_line(env:Env)->u64 {
+    let mut scan:u64=1;
+    while scan<=env.tree.node_count {
+        if nkind(env,scan)==k_expand() { return nline(env,scan); }
+        scan=scan+1;
+    }
+    return 1;
+}
+
+// Expand every macro invocation of a parsed module. On success out[0] is zero,
+// out[1] is the produced node count, out[2] is the name table byte length and
+// the produced region follows at out[4]: the name table first, then twelve
+// words per produced node with one based ids. On a refusal out[0] is the
+// diagnostic code, out[1] the line, out[2] the column, out[3] the reason, and
+// no produced region is written. A refusal therefore never publishes a partial
+// AST, as spec/ntasm/ntasm.md 13 requires.
+//
+// ON A REFUSAL, AND ONLY ON A REFUSAL, out[10] and out[11] mean:
+//
+//   out[10]  offending  the QUANTITY that crossed the cap, in the cap's OWN
+//                        unit -- not in any unit the body happens to be
+//                        written in. A macro body of 31 nested levels that
+//                        walks past walk_depth_cap publishes the walk depth
+//                        that crossed it, which is not 31 and is not
+//                        env.depth_peak (that is EXPANSION nesting, a
+//                        different recursion raised on a different path).
+//   out[11]  limit      the declared cap it crossed, in the same unit.
+//
+// So a bound refusal reads out[11] > 0 with out[10] > out[11] -- 9 against 8,
+// 65 against 64 -- and a refusal that is NOT a bound (a dead id, a wrong node
+// kind, a literal out of range) publishes 0 and 0, which is how the two are
+// told apart.
+//
+// WHY TEN AND ELEVEN AND NOT FOUR AND FIVE.  This is the second attempt at
+// this position and the first one was wrong in a way worth recording.
+// out[4] and out[5] are already spoken for: on a successful MEASURE they are
+// env.node_count and env.depth_peak.  Publishing offending/limit there would
+// have made one position carry two meanings, disambiguated only by whether
+// out[0] is zero -- a caller would have to hold the code to read the data,
+// and a channel that can only be decoded by something the reader already
+// holds is not a channel.  Nothing else writes words 10 and 11 on any path:
+// a success measure writes out[0..9], and the produced region begins at
+// out[4] only when out[0] is zero.  So ten and eleven mean offending/limit
+// and nothing else, and POSITION ALONE decodes them.  Both are written only
+// under `len(out)>=12`.
+//
+// Two refusals never reach the twelve words at all, and both say why.  800 is
+// returned when the caller's out holds fewer than four words, and it writes
+// NOTHING into out -- there is no room to write a code into.  203 writes
+// out[0..3] and then returns, before the quantity words, because it is the
+// caller's buffer being too small for a produced region and not a bound
+// refusing on anything.  Neither is a bound refusal, so neither invents a
+// quantity to look like one.
+//
+// There is NO text, and there is still none after this change.  out is
+// buf<u64> and every word of it is a number, so a "message" here is a number
+// a formatter would render on the caller's side.  Nothing in this module
+// formats, and a scan of the whole out region of a refusal for printable byte
+// runs of four or more finds none.  That is a property of the ABI, not a
+// missing formatter: what this adds is two more NUMBERS, which is what a
+// numeric channel can carry.
+export fn expand(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    return run(source,tree,false,out);
+}
+
+// The same expansion under the frozen maxima, reporting the six consumptions
+// so a caller can pin a budget at its exact cost and at one less.
+export fn measure(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    return run(source,tree,true,out);
+}

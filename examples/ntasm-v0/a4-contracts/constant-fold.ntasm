@@ -1,0 +1,17 @@
+module a4.constant_fold
+target x86_64-nexora-uefi
+features {sse2}
+section .text {
+fn leaf(in p:ptr<user,u64> @rdi)->u64
+effects {}
+clobbers {}
+requires {stack_aligned(8+8),stack_aligned(1<<4)}
+ensures {stack_aligned(16)} {
+return 42
+}
+export fn main()->u64
+effects {}
+clobbers {} {
+return 42
+}
+}

@@ -1,0 +1,254 @@
+module clobbers;
+
+import ntasm_ast;
+import register_widths;
+
+// Node kinds: clobbers set 21, qualified name 91.
+
+// Byte-wise comparison over the real source text with bounds.
+fn same_bytes(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Direct child of parent at the given ordinal, or 0 when the chain or
+// the tree is invalid.
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);
+    let mut id:u64=p.first_child;
+    let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;
+        index=index+1;
+    }
+    if id>tree.node_count { return 0; }
+    return id;
+}
+
+// Clobbers sets. Every clobbers set is a node of kind 21; its direct
+// children are qualified names (kind 91) whose last_child carries the
+// bounded register name. Within one set, the second name that charges a bit
+// already charged in that set is rejected with code 320, writing the line
+// and column of
+// the second occurrence to out[0..1]. The seen-name table is reset
+// between sets; the same name in different sets is accepted. Known x86_64
+// aliases of one physical register are duplicates too, because they charge
+// the same bit, not because their spellings match.
+// Returns 0 on success, writing out[0]=sets,out[1]=entries,
+// out[2]=nonempty sets. Returns 320 on a bit charged twice within one set
+// and 330 on a name that charges no bit, which covers both an unknown
+// register name and a qualified one.
+// When the caller lends a fourth word, out[3] additionally receives the union
+// of every set's mask on success, in the oracle's numbering. Nothing in the
+// tree reads it; it is published so the gate can confront a charged name's bit
+// against the oracle instead of against a number written down here. A caller
+// that lends three words gets the three word contract unchanged, and an error
+// never writes out[3].
+// Returns 800 with no write to out on an invalid tree, an invalid
+// span or child chain or shape, or an output buffer shorter than
+// three words. The scratch buffer is always freed; neither source nor
+// tree is released.
+//
+// BOTH RULES ARE OVER BITS, NOT OVER FAMILY NUMBERS, and that is the whole
+// content of this pass. The oracle writes them the same way: frontend.c:1866
+// refuses a name nt_frontend_register does not know, frontend.c:1874 refuses
+// one whose bit is already set, frontend.c:1880 sets it. Over the sixteen GPRs
+// the two formulations coincide, because the sixteen families are dense from
+// zero, so the difference only shows on the first name that is not a GPR.
+// That name is rflags, the oracle's family 17 and clobber_bit's 1<<17, the bit
+// codegen.c:1277 reads to drop the pushfq/popfq pair. Comparing 17 against the
+// GPR families 1..16 would happen to be right here, and would be wrong for any
+// future family at 16 or below, so neither rule below names a family.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    let n_clobbers:u64=21;
+    let n_qualified:u64=91;
+    let entry_words:u64=2;
+    if tree.ok==false { return 800; }
+    if tree.node_count==0 { return 800; }
+    if len(out)<3 { return 800; }
+
+    let scratch:buf<u64>=alloc(runtime(),tree.node_count*entry_words);
+    let mut used:u64=0;
+    let mut sets:u64=0;
+    let mut entries:u64=0;
+    let mut nonempty:u64=0;
+    // The union of every set's mask in the source, oracle numbering, published
+    // only in out[3] and only on success, and only when the caller lends four
+    // words. The three word contract is untouched: a caller that lends three
+    // still gets sets, entries and nonempty and nothing else.
+    //
+    // This exists because the mask was otherwise unobservable, and a number
+    // nothing can see is a number nothing measures. clobber_bit answers 1<<17
+    // for rflags, and bit 16 is charged by no name at all, so a summarize that
+    // emitted the wrong bit for rflags would collide with nothing, fire no
+    // duplicate, and leave every count in this pass unchanged. Publishing the
+    // union is what lets tests_ntasm_clobbers.c confront each charged name's
+    // bit against UINT64_C(1) << nt_frontend_register(name).family, derived
+    // from the oracle rather than written down here.
+    let mut union:u64=0;
+    let mut code:u64=0;
+    let mut dup_line:u64=0;
+    let mut dup_column:u64=0;
+
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if node.kind==n_clobbers {
+            sets=sets+1;
+            // Mask of this set alone, folded into the union below. Duplicates
+            // are per set, so this is reset with the name table.
+            let mut set_mask:u64=0;
+            // Reset the per-set name table.
+            used=0;
+            // Walk direct children; each must be a qualified name (91)
+            // whose last_child holds the bounded register name.
+            let mut child_id:u64=node.first_child;
+            while child_id!=0 && code==0 {
+                if child_id>tree.node_count { code=800; }
+                else {
+                    let cn:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+                    if cn.kind!=n_qualified || cn.first_child==0
+                       || cn.last_child==0 || cn.first_child>tree.node_count
+                       || cn.last_child>tree.node_count {
+                        code=800;
+                    } else if cn.first_child!=cn.last_child {
+                        let qualified_name:ntasm_ast.Node=
+                            ntasm_ast.node_at(tree,cn.last_child);
+                        code=330;dup_line=qualified_name.line;
+                        dup_column=qualified_name.column;
+                    } else {
+                        let name_id:u64=cn.last_child;
+                        if name_id==0 || name_id>tree.node_count {
+                            code=800;
+                        } else {
+                            let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                            if name.start>name.end || name.end>len(source) {
+                                code=800;
+                            } else {
+                                // Rule one, over bits: a name that charges no
+                                // bit of the caller's mask is unknown. Zero is
+                                // the whole answer for every name outside the
+                                // sixteen GPRs and rflags, including the
+                                // qualified arm above and the oracle families
+                                // this product does not yet honour, gsbase
+                                // and fsbase.
+                                let current_bit:u64=register_widths.clobber_bit(
+                                    source,name.start,name.end);
+                                if current_bit==0 {
+                                    code=330;dup_line=name.line;
+                                    dup_column=name.column;
+                                }
+                                // Rule two, over bits: a duplicate is a bit
+                                // already charged in this set, exactly the
+                                // oracle's f->clobbers & bit at frontend.c:1874.
+                                // The seen table therefore stores spans and
+                                // re-reads the bit, so aliases of one physical
+                                // register and two spellings of rflags are
+                                // duplicates for one reason, not two.
+                                let mut j:u64=0;
+                                while j<used && code==0 {
+                                    let at:u64=j*entry_words;
+                                    let previous_bit:u64=register_widths.clobber_bit(
+                                        source,scratch[at],scratch[at+1]);
+                                    if current_bit==previous_bit {
+                                        code=320;
+                                        dup_line=name.line;
+                                        dup_column=name.column;
+                                    }
+                                    j=j+1;
+                                }
+                                if code==0 {
+                                    let at:u64=used*entry_words;
+                                    scratch[at]=name.start;
+                                    scratch[at+1]=name.end;
+                                    used=used+1;
+                                    entries=entries+1;
+                                    if used==1 { nonempty=nonempty+1; }
+                                    set_mask=set_mask|current_bit;
+                                }
+                            }
+                        }
+                    }
+                    if code==0 { child_id=cn.next_sibling; }
+                }
+            }
+            if code!=0 { id=tree.node_count+1; }
+            union=union|set_mask;
+        }
+        if code==0 { id=id+1; }
+    }
+
+    if code==0 {
+        out[0]=sets;
+        out[1]=entries;
+        out[2]=nonempty;
+        // The optional channel. Written last and only here, so a caller that
+        // lent three words is untouched and an error leaves out[3] alone.
+        if len(out)>=4 { out[3]=union; }
+    } else if (code==320 || code==330) && len(out)>=2 {
+        out[0]=dup_line;
+        out[1]=dup_column;
+        if len(out)>=3 { out[2]=0; }
+    }
+    rt_free(runtime(),scratch);
+    return code;
+}
+
+// Summarize one validated clobber set as the caller's clobber mask and the
+// entry count that built it. The mask is in the oracle's numbering, which is
+// the only numbering the consumers of this word agree on: bits 0 to 15 are
+// the sixteen GPRs, bit 17 is rflags, and bit 16 is the oracle's rip, which no
+// clobbers name may reach.
+//
+// The second sentence above is new and it is the point of the change. This
+// word used to be documented as "Family1 uses bit0 through family16 bit15",
+// which was true and was also a claim that family n is bit n-1. The oracle's
+// families are not dense from zero, so that claim stopped holding at the first
+// name that is not a GPR. A consumer reading this mask now agrees with
+// codegen.c:1277 and with x64_lower_nxo.nova:2016, which both name rflags
+// bit 17, and with frontend.c:5847, which discharges the inference obligation
+// as f->inferred_clobbers & ~(f->clobbers | output_registers). Producing
+// 1<<(17-1) here instead would have been silently accepted by every gate
+// while disagreeing with all four.
+//
+// A name that charges no bit still answers 800, not a mask with that entry
+// dropped: a set this cannot fully summarize is a set whose obligation cannot
+// be discharged, and the project rule is an explicit refusal and never a
+// silent subset. check is the pass that turns such a name into 330, so a set
+// reaching here with one has already been refused.
+export fn summarize(source:buf<u8>,tree:ntasm_ast.Tree,set_id:u64,
+                    out:buf<u64>)->u64 {
+    if tree.ok==false || set_id==0 || set_id>tree.node_count || len(out)<4 {
+        return 800;
+    }
+    let set:ntasm_ast.Node=ntasm_ast.node_at(tree,set_id);
+    if set.kind!=21 { return 800; }
+    let mut mask:u64=0;let mut entries:u64=0;
+    let mut child_id:u64=set.first_child;
+    while child_id!=0 {
+        if child_id>tree.node_count { return 800; }
+        let q:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+        if q.kind!=91 || q.first_child==0 || q.first_child!=q.last_child
+           || q.first_child>tree.node_count { return 800; }
+        let name:ntasm_ast.Node=ntasm_ast.node_at(tree,q.first_child);
+        if name.kind!=90 || name.start>name.end || name.end>len(source) {
+            return 800;
+        }
+        let bit:u64=register_widths.clobber_bit(source,name.start,name.end);
+        if bit==0 { return 800; }
+        mask=mask|bit;entries=entries+1;
+        child_id=q.next_sibling;
+    }
+    out[0]=mask;out[1]=entries;out[2]=0;out[3]=0;return 0;
+}

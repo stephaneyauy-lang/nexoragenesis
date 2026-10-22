@@ -1,0 +1,36 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+scalars,SC-C00,file,legacy/ntasm-s0/scalars/SC-C00.ntasm,106,858a3912d50d253f69f8026679bc9d94fbe4771872d99dc2574a7de041f5238f,NG_S0_T12_OK
+scalars,SC-C01,file,legacy/ntasm-s0/scalars/SC-C01.ntasm,110,cd6e7273b93f3527e44ed2d2cc5b30678618affe4a0ee2f4243ff2d6100d0cce,NG_S0_T12_OK
+scalars,SC-C02,file,legacy/ntasm-s0/scalars/SC-C02.ntasm,121,d85c37ea1119847ce66fa3877341d2e6e1db0c59e01886ccc82bb669eb982b9f,NG_S0_T12_OK
+scalars,SC-C03,file,legacy/ntasm-s0/scalars/SC-C03.ntasm,140,adc511255b1b5edfecd5e1c374e0f40d5fd346a98813975f9c178d8b9011d6c9,NG_S0_T12_OK
+scalars,SC-C04,file,legacy/ntasm-s0/scalars/SC-C04.ntasm,123,4a991891498da273b92226410c9a692802fb0885d5c40ada47a4733ad4c0d99e,NG_S0_T12_OK
+scalars,SC-C05,file,legacy/ntasm-s0/scalars/SC-C05.ntasm,134,7dde652226fe725e2cc949423770f5ca571a40f93b75310e0e1b8d802382ad2a,NG_S0_T12_OK
+scalars,SC-C06,file,legacy/ntasm-s0/scalars/SC-C06.ntasm,110,6fc69015338c21b1afeacdec5550e40fbda985407cf841b9daa2ce7d4c3a8a16,NG_S0_T12_OK
+scalars,SC-C07,file,legacy/ntasm-s0/scalars/SC-C07.ntasm,103,b8d706acf6cfc452eb1f5341b3106bb9065cd7d554c9e1947420be6238e54988,NG_S0_T12_OK
+scalars,SC-R00,file,legacy/ntasm-s0/scalars/SC-R00.ntasm,96,263df54375c726b05fc04c90f334c652e6cbfefc3f4f0b0cfb13a1b43cad7813,NGS0 E401 L0006 C0006 O0000004B
+scalars,SC-R01,file,legacy/ntasm-s0/scalars/SC-R01.ntasm,97,0cf2a607c671ae732b9825eeb25bf27377d6cf6d66adf8f55390c8451de97096,NGS0 E401 L0006 C0006 O0000004B
+scalars,SC-R02,file,legacy/ntasm-s0/scalars/SC-R02.ntasm,98,2439e5c77f8b4605e613ce65fc725a0e34ef7fb8a1ff595d792dbc44d43ae691,NGS0 E401 L0006 C0006 O0000004B
+scalars,SC-R03,file,legacy/ntasm-s0/scalars/SC-R03.ntasm,99,1ab5f16c77c877e6bfdeb65453c729cc42e1d4d6d6f1b12abca9f7ba4affd58f,NGS0 E401 L0006 C0006 O0000004B
+scalars,SC-R04,file,legacy/ntasm-s0/scalars/SC-R04.ntasm,104,07716b3a43395834c3aafb67b37ec77ffd5b27b99ed31ee31787ee274afe1f41,NGS0 E401 L0006 C0007 O0000004C
+scalars,SC-R05,file,legacy/ntasm-s0/scalars/SC-R05.ntasm,105,78a82efa9d2459408bb6063a29af838abf0abb5e40cea4640b1e5e62fe3616db,NGS0 E401 L0006 C0007 O0000004C
+scalars,SC-R06,file,legacy/ntasm-s0/scalars/SC-R06.ntasm,95,fcde264273386f3d9e89d8ea68bb3872f382fc6201f03fa7c15bb27076c278b4,NGS0 E102 L0006 C0007 O0000004C
+scalars,SC-R07,file,legacy/ntasm-s0/scalars/SC-R07.ntasm,95,8b2ede4c22ec7f9117243a111c2a213706a6c6f1ebc335a1e776353baf47a29f,NGS0 E102 L0006 C0008 O0000004D
+scalars,SC-R08,file,legacy/ntasm-s0/scalars/SC-R08.ntasm,96,8897d52cbb0700e41a4b8d01fdab83eca63e7b417476729e707296d751a05ce5,NGS0 E102 L0006 C0007 O0000004C
+scalars,SC-R09,file,legacy/ntasm-s0/scalars/SC-R09.ntasm,96,73ce8ccf12d4df1906bbb39799df57a1d77d30c5677ed5e9e6ce546a42f7ea74,NGS0 E102 L0006 C0008 O0000004D
+scalars,SC-R10,file,legacy/ntasm-s0/scalars/SC-R10.ntasm,95,4f847826d9f60c5b271e84aabc7181f2f9c88864ffbef8c3bd9a2e7cd9dcfcf6,NGS0 E201 L0006 C0006 O0000004B
+scalars,SC-R11,file,legacy/ntasm-s0/scalars/SC-R11.ntasm,96,fdfcdba25f73201a85e48bca9158b4972435018a918732f90487f354dbab4bc6,NGS0 E102 L0006 C0007 O0000004C
+scalars,SC-R12,file,legacy/ntasm-s0/scalars/SC-R12.ntasm,96,eb4a6b9581fd5fc6eb14a8857fe86bbe8c30a11dd1db359593c4c78872a381c0,NGS0 E201 L0006 C0008 O0000004D
+scalars,SC-R13,file,legacy/ntasm-s0/scalars/SC-R13.ntasm,95,f67897f44ee83708984fffb757126a9be024978e4de1e340bfa385253c1ac647,NGS0 E201 L0006 C0008 O0000004D
+scalars,SC-R14,file,legacy/ntasm-s0/scalars/SC-R14.ntasm,97,75379221811a5c69465b447cfc43c6c1bf82d67390be5ab8b50f038e92affa9c,NGS0 E201 L0006 C0008 O0000004D
+scalars,SC-R15,file,legacy/ntasm-s0/scalars/SC-R15.ntasm,92,2a095b3d2eea879ed27f4b2703b7a321bc4359e24e22e4245d341d947a4345eb,NGS0 E201 L0006 C0005 O0000004A
+scalars,SC-R16,file,legacy/ntasm-s0/scalars/SC-R16.ntasm,100,c30e09b774fe6e95c8779870454a821cbf3010311f8d9a60680f0dc3b9154d8e,NGS0 E301 L0006 C0006 O0000004B
+scalars,SC-R17,file,legacy/ntasm-s0/scalars/SC-R17.ntasm,99,42ec109de9529d6e6c8ad8841a209de6538579e48d8b3f725cc7bf3ca9185a76,NGS0 E301 L0007 C0006 O0000004F
+scalars,SC-R18,file,legacy/ntasm-s0/scalars/SC-R18.ntasm,101,3a97cf9406e5e772bb6af71f231ae2975d599d717f81d4ebc681525238ab910d,NGS0 E402 L0007 C0001 O0000004D
+scalars,SC-R19,file,legacy/ntasm-s0/scalars/SC-R19.ntasm,102,520ce422289fe288c00c8812338a373453980ab44b6c082a7495f3d6072f62dc,NGS0 E402 L0007 C0001 O0000004D
+scalars,SC-R20,file,legacy/ntasm-s0/scalars/SC-R20.ntasm,102,b1101c01f49439e928610e924e4bc3dd405ed7f7efa0355043acc1e6981491f1,NGS0 E402 L0007 C0001 O0000004D
+scalars,SC-R21,file,legacy/ntasm-s0/scalars/SC-R21.ntasm,114,f55a2e2e17be37625f851a3d250316f27fe7f1da0d8b1176a24d2056dd6f7d21,NGS0 E102 L0006 C001A O0000005F
+scalars,SC-R22,file,legacy/ntasm-s0/scalars/SC-R22.ntasm,114,7f9fa2fe8ca5dc7bb60a70a20a5cad0c09dd3c61165bdbedcde9d66f021c385a,NGS0 E102 L0006 C001A O0000005F
+scalars,SC-R23,file,legacy/ntasm-s0/scalars/SC-R23.ntasm,96,5180e40ddaf3ace9798511f1e7c6afed0fd9dfd090b3e0e549b892d6561f2c60,NGS0 E201 L0006 C0006 O0000004B
+scalars,SC-C08,file,legacy/ntasm-s0/scalars/SC-C08.ntasm,141,d39c516a3fa07275d971c8aa6e75bcf30211e30ccd804966f1f998bb39d0c7d7,NG_S0_T12_OK
+scalars,SC-R24,file,legacy/ntasm-s0/scalars/SC-R24.ntasm,110,196e64d266dd349091363a039c9c782fd2588080ede5b43229b5214c3ad68885,NGS0 E101 L0006 C0015 O0000005A
+scalars,SC-C09,file,legacy/ntasm-s0/scalars/SC-C09.ntasm,108,1c7fa15eaaf1c0aef8f559a055f2b66e57a094a93039d3c50111101da66a264b,NG_S0_T12_OK

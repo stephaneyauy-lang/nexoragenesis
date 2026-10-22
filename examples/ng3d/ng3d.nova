@@ -1,0 +1,443 @@
+// NG3D - moteur 3D logiciel en Nova.
+//
+// Pipeline entierement entier, fixe Q16.16 : scene -> rotation -> projection
+// perspective -> back-face culling -> rasterisation par fonctions de bord avec
+// z-buffer en 1/z -> eclairage de Lambert -> brouillard -> PNG.
+//
+// Ce programme reproduit exactement la reference out/ng3d/ref/ng3d_ref.py :
+// meme digest FNV-1a et meme PNG octet pour octet.  Voir examples/ng3d/README.md.
+//
+// Note de lexique : `<` suivi d'un identifiant ouvre un type generique, donc
+// toute comparaison est entouree de parentheses.  `while (a < b)` est une
+// comparaison, `while a<b` serait lu comme un type.
+module ng3d;
+
+fn imin(a:i64,b:i64)->i64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn imax(a:i64,b:i64)->i64 {
+    if (a > b) { return a; }
+    return b;
+}
+
+fn clamp255(v:i64)->i64 {
+    if (v < 0) { return 0; }
+    if (v > 255) { return 255; }
+    return v;
+}
+
+fn clamp16(v:i64)->i64 {
+    if (v < 0) { return 0; }
+    if (v > 65536) { return 65536; }
+    return v;
+}
+
+// Rotation Y de 30 degres puis X de 20 degres.  Nova n'a pas de tuple : les
+// trois composantes sont ecrites directement dans le tampon de sommets, donc
+// la rotation est in-linee la ou elle est appelee.
+fn rrot(v:buf<i64>,at:i64,x:i64,y:i64,z:i64)->bool {
+    let c1:i64=56756;
+    let s1:i64=32768;
+    let c2:i64=61566;
+    let s2:i64=22416;
+    let x1:i64=(x*c1+z*s1)>>16;
+    let z1:i64=(z*c1-x*s1)>>16;
+    let y2:i64=(y*c2-z1*s2)>>16;
+    let z2:i64=(y*s2+z1*c2)>>16;
+    v[at]=x1;
+    v[at+1]=y2;
+    v[at+2]=z2;
+    return true;
+}
+
+// Ecrit un triangle (15 mots) et renvoie le nouveau compte.
+fn put(t:buf<i64>,n:u64,ax:i64,ay:i64,az:i64,bx:i64,by:i64,bz:i64,
+       cx:i64,cy:i64,cz:i64,r:i64,g:i64,b:i64,nx:i64,ny:i64,nz:i64)->u64 {
+    let o:i64=i64(n)*15;
+    t[o]=ax; t[o+1]=ay; t[o+2]=az;
+    t[o+3]=bx; t[o+4]=by; t[o+5]=bz;
+    t[o+6]=cx; t[o+7]=cy; t[o+8]=cz;
+    t[o+9]=r; t[o+10]=g; t[o+11]=b;
+    t[o+12]=nx; t[o+13]=ny; t[o+14]=nz;
+    return n+1;
+}
+
+fn build_scene(t:buf<i64>)->u64 {
+    let one:i64=65536;
+    let mut n:u64=0;
+    // ---- sol en damier : 12x12 cases de 1 unite, y = -1.5, x,z dans [-6,6] ----
+    let mut j:u64=0;
+    while (j < 12) {
+        let mut i:u64=0;
+        while (i < 12) {
+            let x0:i64=(i64(i)-6)*one;
+            let z0:i64=(i64(j)-6)*one;
+            let y:i64=-98304;
+            let mut k:i64=210;
+            if ((i+j)%2==1) { k=92; }
+            n=put(t,n,x0,y,z0,x0+one,y,z0,x0+one,y,z0+one,k,k,k+10,0,one,0);
+            n=put(t,n,x0,y,z0,x0+one,y,z0+one,x0,y,z0+one,k,k,k+10,0,one,0);
+            i=i+1;
+        }
+        j=j+1;
+    }
+    // ---- cube pivotant de demi-cote 1, de y = -0.8 a y = 1.2 ----
+    let v:buf<i64>=alloc(runtime(),24);
+    let lo:i64=-52428;
+    let hi:i64=78643;
+    rrot(v,0,-one,lo,-one);
+    rrot(v,3,one,lo,-one);
+    rrot(v,6,one,hi,-one);
+    rrot(v,9,-one,hi,-one);
+    rrot(v,12,-one,lo,one);
+    rrot(v,15,one,lo,one);
+    rrot(v,18,one,hi,one);
+    rrot(v,21,-one,hi,one);
+    // Les normales sont des vecteurs unite exacts : aucune racine carree et
+    // aucune normalisation ne tournent jamais.
+    let f:buf<i64>=alloc(runtime(),36);
+    let q:buf<i64>=alloc(runtime(),18);
+    rrot(q,0,0,0,-one); f[0]=q[0]; f[1]=q[1]; f[2]=q[2];
+    f[3]=208; f[4]=82; f[5]=74;
+    rrot(q,3,0,0,one); f[6]=q[3]; f[7]=q[4]; f[8]=q[5];
+    f[9]=208; f[10]=82; f[11]=74;
+    rrot(q,6,-one,0,0); f[12]=q[6]; f[13]=q[7]; f[14]=q[8];
+    f[15]=84; f[16]=170; f[17]=96;
+    rrot(q,9,one,0,0); f[18]=q[9]; f[19]=q[10]; f[20]=q[11];
+    f[21]=84; f[22]=170; f[23]=96;
+    rrot(q,12,0,one,0); f[24]=q[12]; f[25]=q[13]; f[26]=q[14];
+    f[27]=98; f[28]=142; f[29]=216;
+    rrot(q,15,0,0-one,0); f[30]=q[15]; f[31]=q[16]; f[32]=q[17];
+    f[33]=152; f[34]=124; f[35]=204;
+    let idx:buf<u8>=[0,1,2,0,2,3,5,4,7,5,7,6,4,0,3,4,3,7,1,5,6,1,6,2,3,2,6,3,6,7,4,5,1,4,1,0];
+    let mut k:u64=0;
+    while (k < 12) {
+        let fo:i64=i64(k/2)*6;
+        let a:i64=i64(idx[k*3])*3;
+        let b:i64=i64(idx[k*3+1])*3;
+        let c:i64=i64(idx[k*3+2])*3;
+        n=put(t,n,v[a],v[a+1],v[a+2],v[b],v[b+1],v[b+2],
+                 v[c],v[c+1],v[c+2],
+                 f[fo+3],f[fo+4],f[fo+5],f[fo],f[fo+1],f[fo+2]);
+        k=k+1;
+    }
+    rt_free(runtime(),v);
+    rt_free(runtime(),f);
+    rt_free(runtime(),q);
+    rt_free(runtime(),idx);
+    return n;
+}
+
+// Projecte un sommet monde : ecrit x,y en Q16.16 pixels et 1/z en Q24.24.
+// Renvoie faux si le sommet est derriere la camera.
+fn project(t:buf<i64>,o:i64,out:buf<i64>)->bool {
+    let w:i64=524288-t[o+2];
+    if (w <= 0) { return false; }
+    out[0]=(160<<16)+t[o]*22937600/w;
+    out[1]=(100<<16)-t[o+1]*22937600/w;
+    out[2]=1099511627776/w;
+    return true;
+}
+
+fn render(t:buf<i64>,n:u64,fb:buf<i64>,zb:buf<i64>)->bool {
+    let pa:buf<i64>=alloc(runtime(),3);
+    let pb:buf<i64>=alloc(runtime(),3);
+    let pc:buf<i64>=alloc(runtime(),3);
+    let mut tri:u64=0;
+    while (tri < n) {
+        let o:i64=i64(tri)*15;
+        let ok:bool=project(t,o,pa);
+        let ok2:bool=project(t,o+3,pb);
+        let ok3:bool=project(t,o+6,pc);
+        if (ok && ok2 && ok3) {
+            let x0:i64=pa[0];
+            let y0:i64=pa[1];
+            let z0:i64=pa[2];
+            let x1:i64=pb[0];
+            let y1:i64=pb[1];
+            let z1:i64=pb[2];
+            let x2:i64=pc[0];
+            let y2:i64=pc[1];
+            let z2:i64=pc[2];
+            let area:i64=(x1-x0)*(y2-y0)-(x2-x0)*(y1-y0);
+            if (area > 0) {
+                let xmin:i64=imax(0,imin(x0,imin(x1,x2))>>16);
+                let xmax:i64=imin(319,imax(x0,imax(x1,x2))>>16);
+                let ymin:i64=imax(0,imin(y0,imin(y1,y2))>>16);
+                let ymax:i64=imin(199,imax(y0,imax(y1,y2))>>16);
+                if (xmin <= xmax && ymin <= ymax) {
+                    let mut dl:i64=(t[o+12]*37837+t[o+13]*45000+t[o+14]*37837)>>16;
+                    if (dl < 0) { dl=0; }
+                    let shade:i64=16384+((dl*49152)>>16);
+                    let cr:i64=t[o+9]*shade>>16;
+                    let cg:i64=t[o+10]*shade>>16;
+                    let cb:i64=t[o+11]*shade>>16;
+                    let s01x:i64=-((y1-y0)<<16);
+                    let s01y:i64=(x1-x0)<<16;
+                    let s12x:i64=-((y2-y1)<<16);
+                    let s12y:i64=(x2-x1)<<16;
+                    let s20x:i64=-((y0-y2)<<16);
+                    let s20y:i64=(x0-x2)<<16;
+                    let bx:i64=xmin<<16;
+                    let by:i64=ymin<<16;
+                    let mut r01:i64=(x1-x0)*(by-y0)-(y1-y0)*(bx-x0);
+                    let mut r12:i64=(x2-x1)*(by-y1)-(y2-y1)*(bx-x1);
+                    let mut r20:i64=(x0-x2)*(by-y2)-(y0-y2)*(bx-x2);
+                    let mut py:i64=ymin;
+                    while (py <= ymax) {
+                        let mut e01:i64=r01;
+                        let mut e12:i64=r12;
+                        let mut e20:i64=r20;
+                        let mut px:i64=xmin;
+                        while (px <= xmax) {
+                            if (e01 >= 0 && e12 >= 0 && e20 >= 0) {
+                                let b0:i64=(e01<<16)/area;
+                                let b1:i64=(e12<<16)/area;
+                                let b2:i64=(e20<<16)/area;
+                                let recip:i64=(b0*z0+b1*z1+b2*z2)>>16;
+                                let at:i64=py*320+px;
+                                if (recip > zb[at]) {
+                                    zb[at]=recip;
+                                    let fog:i64=clamp16((((1099511627776/recip)-655360)<<16)/786432);
+                                    let o2:i64=at*3;
+                                    fb[o2]=clamp255(cr+((18-cr)*fog>>16));
+                                    fb[o2+1]=clamp255(cg+((22-cg)*fog>>16));
+                                    fb[o2+2]=clamp255(cb+((34-cb)*fog>>16));
+                                }
+                            }
+                            e01=e01+s01x;
+                            e12=e12+s12x;
+                            e20=e20+s20x;
+                            px=px+1;
+                        }
+                        r01=r01+s01y;
+                        r12=r12+s12y;
+                        r20=r20+s20y;
+                        py=py+1;
+                    }
+                }
+            }
+        }
+        tri=tri+1;
+    }
+    rt_free(runtime(),pa);
+    rt_free(runtime(),pb);
+    rt_free(runtime(),pc);
+    return true;
+}
+
+// Profil "cube seul" : c'est exactement le rendu que fait le moteur NTASM.
+// Le cube est convexe et ses faces visibles ne se recouvrent pas, et il est
+// a w dans [6.5, 9.5] ou le brouillard reste nul : ni le z-buffer ni la
+// profondeur ne changent un pixel.  Les deux langages doivent donc produire
+// le meme digest, et c'est ce que la preuve compare.
+fn render_cube(t:buf<i64>,first:u64,last:u64,fb:buf<i64>)->bool {
+    let pa:buf<i64>=alloc(runtime(),3);
+    let pb:buf<i64>=alloc(runtime(),3);
+    let pc:buf<i64>=alloc(runtime(),3);
+    let mut tri:u64=first;
+    while (tri < last) {
+        let o:i64=i64(tri)*15;
+        let ok:bool=project(t,o,pa);
+        let ok2:bool=project(t,o+3,pb);
+        let ok3:bool=project(t,o+6,pc);
+        if (ok && ok2 && ok3) {
+            let x0:i64=pa[0];
+            let y0:i64=pa[1];
+            let x1:i64=pb[0];
+            let y1:i64=pb[1];
+            let x2:i64=pc[0];
+            let y2:i64=pc[1];
+            let area:i64=(x1-x0)*(y2-y0)-(x2-x0)*(y1-y0);
+            if (area > 0) {
+                let xmin:i64=imax(0,imin(x0,imin(x1,x2))>>16);
+                let xmax:i64=imin(319,imax(x0,imax(x1,x2))>>16);
+                let ymin:i64=imax(0,imin(y0,imin(y1,y2))>>16);
+                let ymax:i64=imin(199,imax(y0,imax(y1,y2))>>16);
+                if (xmin <= xmax && ymin <= ymax) {
+                    let mut dl:i64=(t[o+12]*37837+t[o+13]*45000+t[o+14]*37837)>>16;
+                    if (dl < 0) { dl=0; }
+                    let shade:i64=16384+((dl*49152)>>16);
+                    let cr:i64=t[o+9]*shade>>16;
+                    let cg:i64=t[o+10]*shade>>16;
+                    let cb2:i64=t[o+11]*shade>>16;
+                    let s01x:i64=-((y1-y0)<<16);
+                    let s12x:i64=-((y2-y1)<<16);
+                    let s20x:i64=-((y0-y2)<<16);
+                    let bx:i64=xmin<<16;
+                    let by:i64=ymin<<16;
+                    let mut r01:i64=(x1-x0)*(by-y0)-(y1-y0)*(bx-x0);
+                    let mut r12:i64=(x2-x1)*(by-y1)-(y2-y1)*(bx-x1);
+                    let mut r20:i64=(x0-x2)*(by-y2)-(y0-y2)*(bx-x2);
+                    let mut py:i64=ymin;
+                    while (py <= ymax) {
+                        let mut e01:i64=r01;
+                        let mut e12:i64=r12;
+                        let mut e20:i64=r20;
+                        let mut px:i64=xmin;
+                        while (px <= xmax) {
+                            if (e01 >= 0 && e12 >= 0 && e20 >= 0) {
+                                let o2:i64=(py*320+px)*3;
+                                fb[o2]=cr;
+                                fb[o2+1]=cg;
+                                fb[o2+2]=cb2;
+                            }
+                            e01=e01+s01x;
+                            e12=e12+s12x;
+                            e20=e20+s20x;
+                            px=px+1;
+                        }
+                        r01=r01+((x1-x0)<<16);
+                        r12=r12+((x2-x1)<<16);
+                        r20=r20+((x0-x2)<<16);
+                        py=py+1;
+                    }
+                }
+            }
+        }
+        tri=tri+1;
+    }
+    rt_free(runtime(),pa);
+    rt_free(runtime(),pb);
+    rt_free(runtime(),pc);
+    return true;
+}
+
+fn digest(fb:buf<i64>)->u64 {
+    let mut h:u64=14695981039346656037;
+    let mut i:u64=0;
+    while (i < 192000) {
+        h=(h^u64(fb[i]))*1099511628211;
+        i=i+1;
+    }
+    return h;
+}
+
+fn crc32(buf:buf<u8>,from:u64,len:u64)->u32 {
+    let mut c:u32=4294967295;
+    let mut i:u64=0;
+    while (i < len) {
+        c=c^(u32(buf[from+i])&u32(255));
+        let mut k:u64=0;
+        while (k < 8) {
+            if ((c&u32(1))==u32(1)) { c=(c>>1)^u32(3988292384); } else { c=c>>1; }
+            k=k+1;
+        }
+        i=i+1;
+    }
+    return c^u32(4294967295);
+}
+
+fn put_be32(out:buf<u8>,at:u64,v:u32)->bool {
+    out[at]=u8(v>>24);
+    out[at+1]=u8(v>>16);
+    out[at+2]=u8(v>>8);
+    out[at+3]=u8(v);
+    return true;
+}
+
+fn put_le16(out:buf<u8>,at:u64,v:u32)->bool {
+    out[at]=u8(v);
+    out[at+1]=u8(v>>8);
+    return true;
+}
+
+// Ecrit le PNG complet dans le fichier NG3D.PNG du volume de la machine
+// virtuelle et renvoie sa taille : 192278 octets.
+//
+// Les blocs deflate sont "stored", donc le flux n'est pas compresse.  C'est
+// volontaire : le moteur n'a pas de compresseur, et un flux stored est un PNG
+// que n'importe quel lecteur decode.  La taille est une constante du format
+// (8 + 25 + 12 + 192221 + 12) et elle est verifiee a l'extraction.
+fn write_png(fb:buf<i64>)->u64 {
+    let size:u64=192278;
+    let out:buf<u8>=alloc(runtime(),size);
+    // Signature PNG : 89 50 4E 47 0D 0A 1A 0A
+    out[0]=u8(137); out[1]=u8(80); out[2]=u8(78); out[3]=u8(71);
+    out[4]=u8(13); out[5]=u8(10); out[6]=u8(26); out[7]=u8(10);
+    let mut p:u64=8;
+    // IHDR : 320x200, 8 bits par canal, couleur vraie
+    put_be32(out,p,13);
+    out[p+4]=73; out[p+5]=72; out[p+6]=68; out[p+7]=82;
+    put_be32(out,p+8,320);
+    put_be32(out,p+12,200);
+    out[p+16]=8; out[p+17]=2; out[p+18]=0; out[p+19]=0; out[p+20]=0;
+    put_be32(out,p+21,crc32(out,p+4,17));
+    p=p+25;
+    // IDAT : flux zlib stored + adler32
+    put_be32(out,p,192221);
+    out[p+4]=73; out[p+5]=68; out[p+6]=65; out[p+7]=84;
+    let mut q:u64=p+8;
+    out[q]=120; out[q+1]=1;
+    q=q+2;
+    let mut ad_a:u32=1;
+    let mut ad_b:u32=0;
+    let mut raw:u64=0;
+    let mut left:u64=192200;
+    while (left > 0) {
+        let mut take:u64=65535;
+        if (left < 65535) { take=left; }
+        let mut fin:u8=0;
+        if (take == left) { fin=1; }
+        out[q]=fin;
+        put_le16(out,q+1,u32(take));
+        put_le16(out,q+3,u32(take)^u32(65535));
+        q=q+5;
+        let mut k:u64=0;
+        while (k < take) {
+            // Flux brut : 200 lignes de 1 octet de filtre + 960 octets RVB.
+            let row:u64=raw/961;
+            let col:u64=raw-row*961;
+            let mut byte:u64=0;
+            if (col != 0) {
+                let px:u64=(row*320+(col-1)/3)*3+(col-1)%3;
+                byte=u64(fb[px]);
+            }
+            out[q+k]=u8(byte);
+            ad_a=(ad_a+u32(byte))%u32(65521);
+            ad_b=(ad_b+ad_a)%u32(65521);
+            raw=raw+1;
+            k=k+1;
+        }
+        q=q+take;
+        left=left-take;
+    }
+    put_be32(out,q,(ad_b<<16)|ad_a);
+    q=q+4;
+    put_be32(out,q,crc32(out,p+4,q-(p+4)));
+    q=q+4;
+    // IEND
+    put_be32(out,q,0);
+    out[q+4]=73; out[q+5]=69; out[q+6]=78; out[q+7]=68;
+    put_be32(out,q+8,crc32(out,q+4,4));
+    q=q+12;
+    let path:buf<u8>="NG3D.PNG";
+    let h:u64=rt_open_new(runtime(),path);
+    if (h != 0) {
+        rt_write(runtime(),h,out);
+        rt_close(runtime(),h);
+    }
+    rt_free(runtime(),path);
+    rt_free(runtime(),out);
+    return q;
+}
+
+fn main()->u64 {
+    let t:buf<i64>=alloc(runtime(),4800);
+    let fb:buf<i64>=alloc(runtime(),192000);
+    let zb:buf<i64>=alloc(runtime(),64000);
+    let n:u64=build_scene(t);
+    render(t,n,fb,zb);
+    // Le digest rendu est celui du profil cube, celui que le moteur NTASM
+    // produit lui aussi : c'est la preuve d'egalite entre les deux langages.
+    let cube:buf<i64>=alloc(runtime(),192000);
+    render_cube(t,n-12,n,cube);
+    let d:u64=digest(cube);
+    // L'ecriture vient APRÈS le digest et elle est gardee : le runtime
+    // n'expose que rt_open_new, qui refuse un fichier deja present, donc une
+    // seconde execution doit pouvoir rendre le meme digest sans le fichier.
+    write_png(fb);
+    return d;
+}

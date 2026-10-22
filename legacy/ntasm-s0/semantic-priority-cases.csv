@@ -1,0 +1,6 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+semantic-priority,ORDER-ref-before-op,file,legacy/ntasm-s0/diagnostic-priority/ORDER-ref-before-op.ntasm,134,627ca975c6502ecce3a4df4bb8bc6501524f12642f64ab19564b9f6c6b396f3d,NGS0 E301 L0006 C0005 O00000040
+semantic-priority,ORDER-forward-after-op,file,legacy/ntasm-s0/diagnostic-priority/ORDER-forward-after-op.ntasm,144,cebd19d5f2a5b9f91dfb40cbeba263bf3270d1f6f13617a1f431a3b2116c3cfc,NGS0 E400 L0007 C0001 O00000046
+semantic-priority,ORDER-op-before-data,file,legacy/ntasm-s0/diagnostic-priority/ORDER-op-before-data.ntasm,134,cddd02c6811da35cfc556353107e8ed29734b314bed8422afbcbd84d75ed6280,NGS0 E400 L0007 C0001 O00000040
+semantic-priority,ORDER-addr-before-range,file,legacy/ntasm-s0/diagnostic-priority/ORDER-addr-before-range.ntasm,133,aaf1c5f4145fd8e101d95a71f12aee1ecf405666d2ced02694301b7ffbe0e6d8,NGS0 E301 L0008 C000C O0000005C
+semantic-priority,ORDER-const-before-entry,file,legacy/ntasm-s0/diagnostic-priority/ORDER-const-before-entry.ntasm,137,9f2e2d16273264d86c48f47cdf8ac0301f255a8bf0a3fb5b0a7dc5753c49cfe2,NGS0 E102 L0003 C000C O00000023

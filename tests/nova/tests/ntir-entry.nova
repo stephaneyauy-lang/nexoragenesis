@@ -1,0 +1,248 @@
+module ntir_entry;
+import ntasm_ast;
+import ntasm_parser;
+import ntir;
+import ir_image;
+import register_widths;
+import pointer_spaces;
+
+// One entry, eight modes, so a gate can reach every claim this pair of files
+// makes without a second image and without a second parser.
+//
+// Two of them carry the image ACROSS A BYTE BOUNDARY, and they are the reason
+// this entry imports ir_image at all:
+//
+//   mode 6  build, verify, then ir_image.write. The NTIR file lands in `text`
+//           and its byte length in text_length[0]. This is the only producer of
+//           an NTIR byte string anywhere in the tree.
+//   mode 7  ir_image.read over the file already in `text`, sized by
+//           text_length[0], into `words`, then ntir.verify on what came back.
+//           No parse and no build, exactly like mode 3, and for the same
+//           reason: the absence of a parse is the proof that the reader reads
+//           the FILE rather than the source it could have regenerated.
+//
+// Mode 7 verifies after reading rather than only reading, because a container
+// that round-trips bytes is not yet an IR: the words it hands back are only an
+// NTIR if ntir.verify says so. Reading alone would let a file full of
+// structurally perfect nonsense pass, and the gate would then be measuring the
+// envelope while claiming the image.
+//
+// `words` is the caller's IR image: build writes it, the caller reads it, the
+// caller may DAMAGE it, and verify reads whatever is there. Mode 2 exists for
+// exactly that last step — an adversarial image invented in C would be testing
+// a C fiction, while an image this lowering produced and the caller then broke
+// is a real break. Nothing is copied anywhere, so the bytes verify sees are
+// the bytes build wrote.
+//
+//   mode 0  build, then verify. On success report[0]=node_count and
+//           report[1]=typed_count, report[2]=report[3]=0. A refusal returns its
+//           code and writes report[0]=line, report[1]=column, report[2]=code,
+//           report[3]=node id.
+//   mode 1  mode 0, then serialize: the text lands in `text` and its byte
+//           length in text_length[0].
+//   mode 2  build ONLY. The image stays in `words` undamaged and unverified,
+//           which is what a caller needs before it damages something.
+//   mode 3  verify the image already in `words`, with NO parse and NO build.
+//           This is the mode that sees a corrupted header or a corrupted child
+//           link, and the absence of a parse is the proof that the verifier
+//           reads the image and not the tree it came from.
+//   mode 4  the kind table. report[0]=KIND_COUNT, report[1]=KIND_BASE, then
+//           three words per entry: kind, AST kind, aux predicate.
+//   mode 5  the ORACLE probe, which is what makes the typed words comparable
+//           rather than asserted. For node `index` it hands back BOTH the
+//           register_widths and pointer_spaces answers AND the whole AST
+//           record, so a gate can confront all sixteen words of the IR node
+//           against the tree without writing a parser of its own:
+//             report[0]  = register_widths.width of the node span
+//             report[1]  = register_widths.family of the node span
+//             report[2]  = the pointer_spaces.check refusal code
+//             report[3]  = its pointer count
+//             report[4]  = its nested pointer count
+//             report[5]  = its space mask
+//             report[6]  = the AST kind
+//             report[7]  = the AST aux
+//             report[8]  = the AST source index
+//             report[9]  = the AST line
+//             report[10] = the AST column
+//             report[11] = the AST byte span start
+//             report[12] = the AST byte span end
+//             report[13] = the AST first child
+//             report[14] = the AST last child
+//             report[15] = the AST next sibling
+//             report[16] = the length of the AST child chain
+//
+//   mode 8  the parse verdict and nothing else: no lowering, no typing, no
+//           verifier behind it. A fixture that fails to parse answers every
+//           other mode with the same 800, and a gate that cannot tell a parse
+//           refusal from a lowering refusal measures nothing. report[0] is the
+//           node count and report[1..4] the parser's code, reason, line and
+//           column. It is how the harness attributes a refusal to a stage.
+//
+// Mode 5 is why the last two imports exist. Nothing in ntir.nova computes a
+// register width or a pointer space on its own; both come from the module that
+// owns them, and mode 5 hands the caller that module's OWN answer for the same
+// source, so a drift in either is a measured difference and not a comment.
+export fn main(source:buf<u8>,mode:u64,index:u64,words:buf<u64>,word_count:u64,
+        text:buf<u8>,text_length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<24 || len(text_length)<1 { return 800; }
+    if mode==3 {
+        // No parse, no build: the image in `words` is the whole input, so a
+        // header the caller broke is seen exactly as broken.
+        if len(words)<8 { return 800; }
+        return ntir.verify(words,words[3],report);
+    }
+    if mode==7 { return unpack(text,text_length,words,word_count,report); }
+    if mode==4 {
+        let count:u64=ntir.KIND_COUNT();
+        if len(report)<2+count*3 { return 800; }
+        report[0]=count;
+        report[1]=ntir.KIND_BASE();
+        let mut i:u64=1;
+        while i<=count {
+            let at:u64=2+(i-1)*3;
+            report[at]=ntir.kind_at(i);
+            report[at+1]=ntir.kind_ast_at(i);
+            report[at+2]=ntir.kind_aux_at(i);
+            i=i+1;
+        }
+        return 0;
+    }
+    // Mode 8 is the parse verdict and NOTHING else: no lowering, no typing, no
+    // verifier behind it. It exists because a fixture that fails to parse
+    // answers every later mode with the same 800, and a gate that cannot tell
+    // a parse refusal from a lowering refusal measures nothing. report[0] is
+    // the node count, report[1..4] the parser's code, reason, line and column.
+    // It is the mode the harness uses to attribute a refusal to a stage.
+    if mode==8 {
+        // The parse verdict on its own, so a fixture that does not parse says
+        // WHY instead of answering the same 800 as a lowering refusal.
+        let probe:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+        report[0]=probe.node_count;report[1]=probe.code;report[2]=probe.reason;
+        report[3]=probe.line;report[4]=probe.column;
+        report[5]=probe.start;report[6]=probe.end;report[7]=probe.token_count;
+        ntasm_ast.release(probe);
+        return 0;
+    }
+    if len(words)<8 { return 800; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree); return 800; }
+    if mode==5 {
+        let mut width:u64=0;let mut family:u64=0;
+        let mut kind:u64=0;let mut aux:u64=0;let mut index_source:u64=0;
+        let mut line:u64=0;let mut column:u64=0;let mut start:u64=0;let mut end:u64=0;
+        let mut first:u64=0;let mut last:u64=0;let mut next:u64=0;let mut children:u64=0;
+        if index>=1 && index<=tree.node_count {
+            let nodes:buf<u64>=tree.node_words;
+            let at:u64=(index-1)*12;
+            width=register_widths.width(source,nodes[at+6],nodes[at+7]);
+            family=register_widths.family(source,nodes[at+6],nodes[at+7]);
+            kind=nodes[at];aux=nodes[at+11];index_source=nodes[at+3];
+            line=nodes[at+4];column=nodes[at+5];
+            start=nodes[at+6];end=nodes[at+7];
+            first=nodes[at+8];last=nodes[at+9];next=nodes[at+10];
+            children=ast_chain(tree,first);
+        }
+        let spaces:buf<u64>=alloc(runtime(),4);
+        let refusal:u64=pointer_spaces.check(source,tree,spaces);
+        report[0]=width;report[1]=family;report[2]=refusal;
+        report[3]=spaces[0];report[4]=spaces[1];report[5]=spaces[2];
+        report[6]=kind;report[7]=aux;report[8]=index_source;
+        report[9]=line;report[10]=column;report[11]=start;report[12]=end;
+        report[13]=first;report[14]=last;report[15]=next;report[16]=children;
+        rt_free(runtime(),spaces);
+        ntasm_ast.release(tree);
+        return 0;
+    }
+    if word_count<ntir.HEADER_WORDS() { ntasm_ast.release(tree); return 800; }
+    let code:u64=ntir.build(source,tree,words,word_count);
+    if code!=0 { ntasm_ast.release(tree); return code; }
+    let count:u64=words[3];
+    if mode==2 { report[0]=count;report[1]=words[7];ntasm_ast.release(tree); return 0; }
+    let verdict:u64=ntir.verify(words,count,report);
+    if verdict!=0 { ntasm_ast.release(tree); return verdict; }
+    report[0]=count;report[1]=words[7];report[2]=0;report[3]=0;
+    if mode==0 { ntasm_ast.release(tree); return 0; }
+    if mode==6 {
+        // The image is verified BEFORE it is serialised, not after. A container
+        // that writes a file nobody has read yet is a file whose correctness is
+        // unknown, and handing that to a gate as "the bytes" would make the
+        // round-trip case measure only the round trip.
+        //
+        // THE COUNT HERE IS THE TOTAL NUMBER OF u64 WORDS IN THE IMAGE, which
+        // is the header plus the records, and NOT `count`, which is the number
+        // of NODES. The two are different numbers and the first version of
+        // this line passed the second one, which wrote a file holding the
+        // header and a fraction of the records. Nothing said so: the file was
+        // self-consistent, it read back, and ntir.verify then answered 819 on
+        // an image that had verified clean one line earlier. A container that
+        // took a count it could not check is how that happened.
+        let total:u64=ntir.HEADER_WORDS()+count*ntir.NODE_WORDS();
+        let packed:u64=ir_image.write(ir_image.DOMAIN_NTIR(),words,total,text,text_length);
+        if packed!=0 { ntasm_ast.release(tree); return packed; }
+        ntasm_ast.release(tree);
+        return 0;
+    }
+    let written:u64=ntir.serialize(words,count,text,text_length);
+    if written!=0 { ntasm_ast.release(tree); return written; }
+    ntasm_ast.release(tree);
+    return 0;
+}
+
+// READ A FILE BACK. `text_length[0]` is the file's length, not `len(text)`:
+// `text` is the caller's scratch buffer and its capacity is whatever the
+// harness allocated, while the container refuses any file whose stated size is
+// not the size it was handed. Slicing to the stated length is therefore not
+// tidiness, it is the only way the call can happen at all.
+//
+// The words are copied into the caller's `words` and ir_image's buffer is freed
+// on every path, including the refusals. A refusal hands back an EMPTY buffer,
+// not a null one, and an empty buffer still owns its allocation.
+//
+// `got` is bound to a local rather than freed as `r.words`. rt_free's second
+// argument must NAME a buffer and a struct field is not a name, so writing
+// rt_free(runtime(),r.words) is E400. nxo.nova:158-162 does the same thing for
+// the same reason and that is where the form came from.
+fn unpack(bytes:buf<u8>,text_length:buf<u64>,words:buf<u64>,word_count:u64,report:buf<u64>)->u64 {
+    if len(text_length)<1 || len(words)<1 { return 800; }
+    let size:u64=text_length[0];
+    if size==0 || size>len(bytes) { return 800; }
+    let view:buf<u8>=slice(bytes,0,size);
+    let r:ir_image.ReadResult=ir_image.read(ir_image.DOMAIN_NTIR(),view,word_count);
+    rt_free(runtime(),view);
+    let got:buf<u64>=r.words;
+    let count:u64=r.word_count;
+    let code:u64=r.code;
+    if code!=0 { rt_free(runtime(),got); return code; }
+    if count>len(words) { rt_free(runtime(),got); return 800; }
+    let mut i:u64=0;
+    while i<count { words[i]=got[i]; i=i+1; }
+    rt_free(runtime(),got);
+    // The file was read; now ask whether what it holds is an NTIR. Two
+    // questions, and the gate needs both answered by the same call.
+    //
+    // `count` is the file's TOTAL word count and ntir.verify wants the NODE
+    // count, which is the image's own word 3. Handing verify the total is the
+    // mirror of the write-side bug above: a plausible number, not refused, and
+    // wrong. The two bugs had opposite causes and the same signature -- a
+    // round trip that was self-consistent and was not the same image.
+    let verdict:u64=ntir.verify(words,words[3],report);
+    if verdict!=0 { return verdict; }
+    report[0]=count;
+    return 0;
+}
+// The length of the child chain starting at first, or 0 when the chain leaves
+// the tree. A chain longer than the tree returns 0, so a malformed tree gives
+// the caller an answer it can refuse rather than a count it would believe.
+fn ast_chain(tree:ntasm_ast.Tree,first:u64)->u64 {
+    if first==0 { return 0; }
+    let nodes:buf<u64>=tree.node_words;
+    let mut id:u64=first;
+    let mut count:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        count=count+1;
+        if count>tree.node_count { return 0; }
+        id=nodes[(id-1)*12+10];
+    }
+    return count;
+}

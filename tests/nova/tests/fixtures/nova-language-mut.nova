@@ -1,0 +1,15 @@
+// Lot 122 counter-example, 2 of 4: `mut`.
+//
+// `let mut` is how Nova asks for a writable binding (nova.c:1929) and `=` on
+// a local is refused outright without it: "assignment requires let mut",
+// nova.c:2015. `mut` appears nowhere in the NTASM keyword table, so the two
+// keywords are not merely spelled differently -- the NTASM parser has no
+// mutability rule at all and cannot reject the right thing even if it met the
+// word. Everything below the header is Nova and only Nova.
+module nova_language_mut;
+
+export fn bump() -> u64 {
+    let mut total:u64=0;
+    total=total+1;
+    return total;
+}

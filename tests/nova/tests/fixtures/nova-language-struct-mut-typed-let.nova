@@ -1,0 +1,23 @@
+// Lot 122 counter-example, 4 of 4: `struct` + `mut` + `let` + a type
+// annotation, bound together.
+//
+// This is the one that cannot be waved through by adding a single word to a
+// table. It needs the record declaration, a mutable local, the `let` binding
+// form, AND `type_parse` resolving a record name as the annotation
+// (nova.c:986-994), plus a record initializer and a field write. The record
+// initializer is `Name{field:value,...}` and the field write is `s.f=v;`
+// (nova.c:1479-1518 and 2025-2037). Nothing here is NTASM.
+module nova_language_struct_mut_typed_let;
+
+struct Slot {
+    count:u64,
+    limit:u64
+}
+
+export fn fill() -> u64 {
+    let mut slot:Slot=Slot{count:0,limit:8};
+    while slot.count < slot.limit {
+        slot.count=slot.count+1;
+    }
+    return slot.count;
+}

@@ -1,0 +1,63 @@
+module validate_macro_decl_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import semantics;
+import callable_names;
+import parameters;
+import register_bindings;
+import register_widths;
+import clobbers;
+import abi;
+import validate;
+
+// Entry point for the macro-emitted-declaration chain of the audit W4-8
+// sections C1 and B1. It exists to make the defect measurable on its own,
+// separately from the ninety nine cases that already lived in
+// tests_ntasm_validate.c and from the fixture that pinned the 800 there.
+//
+// The defect: the direction of a parameter is nowhere in the AST, it is read
+// back from the source bytes at the parameter node's own span, and the
+// expander stamps the invocation span on every node it produces, so a
+// parameter produced by a macro is resynchronised on the invocation text and
+// abi.check, stage 17 of 34, reads no direction and answers 800.
+//
+// The seventh word of out selects the mode, and no pass of the pipeline
+// writes it, so a caller of four words cannot reach the selector and the
+// pipeline path is byte for byte the one validate.validate already owns.
+//   mode 0: parse, then run the whole thirty four stage pipeline.
+//   mode 1: publish the packed stage table of spec/ntasm/ntasm.md 17.7.
+//   mode 2: parse, then run abi.check alone on the caller's OWN tree, that is
+//           before any expansion. This is the control: the same declaration
+//           spelled in the clear is accepted by the very pass that refuses
+//           the expanded tree, so the refusal belongs to the expansion and
+//           not to abi.check. The pre passes abi.check expects are the ones
+//           its own gate entry runs, in its own order.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    if len(out)>=7 && out[6]==1 {
+        let bytes:u64=validate.stage_table(source);
+        if bytes==0 { return 800; }
+        out[0]=bytes;
+        return 0;
+    }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree);return 800; }
+    if len(out)>=7 && out[6]==2 {
+        let scratch:buf<u64>=alloc(runtime(),4);
+        let mut code:u64=semantics.index(source,tree,scratch);
+        if code==0 { code=callable_names.check(source,tree,scratch); }
+        if code==0 { code=parameters.check(source,tree,scratch); }
+        if code==0 { code=register_bindings.check(source,tree,scratch); }
+        if code==0 { code=register_widths.check(source,tree,scratch); }
+        if code==0 { code=clobbers.check(source,tree,scratch); }
+        if code==0 { code=abi.check(source,tree,out); }
+        else { out[0]=code;out[1]=0;out[2]=0;out[3]=0; }
+        rt_free(runtime(),scratch);
+        ntasm_ast.release(tree);
+        return code;
+    }
+    let code:u64=validate.validate(source,tree,out);
+    ntasm_ast.release(tree);
+    return code;
+}

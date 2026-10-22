@@ -1,0 +1,91 @@
+module mir_indirect_call_entry;
+import machine_ir;
+import machine_pipeline;
+import ntasm_ast;
+import ntasm_parser;
+import ntir;
+fn put(b:machine_ir.Builder,r:u64,f:u64,v:u64)->u64 { return machine_ir.native_put(b,r,f,v); }
+fn constant(b:machine_ir.Builder,words:buf<u64>,origin:u64,value:u64)->u64 {
+    let r:u64=machine_ir.native_record(b,words,origin,2058);let v:u64=machine_ir.native_value(b);
+    put(b,r,4,v);put(b,r,5,value);put(b,r,8,1);put(b,r,9,64);put(b,r,12,machine_ir.CLASS_CONSTANT());put(b,r,13,machine_ir.FLAG_PURE());put(b,r,15,64);return v;
+}
+fn ret(b:machine_ir.Builder,words:buf<u64>,origin:u64,value:u64)->u64 {
+    let r:u64=machine_ir.native_record(b,words,origin,2077);
+    put(b,r,5,value);put(b,r,8,1);put(b,r,9,64);put(b,r,12,machine_ir.CLASS_VALUE());put(b,r,13,machine_ir.FLAG_TERMINATOR());put(b,r,14,machine_ir.OP_RET());return machine_ir.native_term(b,r);
+}
+export fn main(source:buf<u8>,mode:u64,index:u64,words:buf<u64>,capacity:u64,
+               out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<14 || len(length)<1 || len(words)<machine_ir.HEADER_WORDS() { return 800; }
+    length[0]=0;
+    if mode==5 { return machine_pipeline.build_pe(source,out,length,report); }
+    if mode==2 { return machine_ir.verify(words,words[3],report); }
+    if mode==3 {
+        let verdict:u64=machine_ir.verify(words,words[3],report);if verdict!=0 { return verdict; }
+        return machine_pipeline.build_pe_from_image(words,words[3],source,out,length,report);
+    }
+    let context:u64=words[0];
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    let size:u64=ntir.HEADER_WORDS()+tree.node_count*ntir.NODE_WORDS();let image:buf<u64>=alloc(runtime(),size);
+    let mut code:u64=800;let mut b:machine_ir.Builder=null;
+    if tree.ok { code=ntir.build(source,tree,image,size); }
+    if code==0 {
+        b=machine_ir.native_writer(words,capacity,tree.node_count);
+        machine_ir.native_declarations(b,source,image,tree.node_count);
+        let mut i:u64=1;let mut signature:u64=0;let mut ordinal:u64=0;
+        while i<=tree.node_count && b.code==0 {
+            if image[ntir.HEADER_WORDS()+(i-1)*ntir.NODE_WORDS()]-ntir.KIND_BASE()+1==18 {
+                let f:u64=machine_ir.native_callable(b,source,image,tree.node_count,i);
+                if ordinal==0 { signature=f;ret(b,image,i,constant(b,image,i,0)); }
+                else {
+                    let ctx:u64=constant(b,image,i,context);let mut target:u64=constant(b,image,i,index);
+                    if mode==4 {
+                        let address:u64=machine_ir.native_record(b,image,i,2066);let av:u64=machine_ir.native_value(b);
+                        put(b,address,4,av);put(b,address,5,ctx);put(b,address,8,0);put(b,address,9,64);put(b,address,11,1);
+                        put(b,address,12,machine_ir.CLASS_ADDRESS());put(b,address,13,machine_ir.FLAG_PURE());put(b,address,14,1);put(b,address,15,24);
+                        let load:u64=machine_ir.native_record(b,image,i,2067);target=machine_ir.native_value(b);
+                        put(b,load,4,target);put(b,load,5,av);put(b,load,8,1);put(b,load,9,64);put(b,load,11,1);
+                        put(b,load,12,machine_ir.CLASS_VALUE());put(b,load,13,machine_ir.FLAG_MAY_FAULT());put(b,load,14,machine_ir.OP_LOAD());
+                    }
+                    let argc:u64=machine_ir.native_get(b,signature,14);
+                    let args:buf<u64>=alloc(runtime(),64);let mut a:u64=0;
+                    if argc>64 { b.code=machine_ir.E_ARITY(); }
+                    while a<argc && a<64 {
+                        if a==0 { args[a]=ctx; }
+                        else {
+                            let mut amount:u64=a*2+3;
+                            if a==1 { amount=3; }if a==2 { amount=7; }if a==3 { amount=1; }
+                            args[a]=constant(b,image,i,amount);
+                        }
+                        a=a+1;
+                    }
+                    // MIR call_indirect: target value, inline arguments,
+                    // total arity in aux, real declaration signature in aux2.
+                    let call:u64=machine_ir.native_record(b,image,i,2087);let result:u64=machine_ir.native_value(b);
+                    put(b,call,4,result);put(b,call,5,target);
+                    if argc>0 { put(b,call,6,args[0]); }if argc>1 { put(b,call,7,args[1]); }
+                    let mut taken:u64=argc+1;if taken>3 { taken=3; }put(b,call,8,taken);
+                    put(b,call,9,64);put(b,call,12,machine_ir.CLASS_VALUE());put(b,call,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());
+                    put(b,call,14,argc);put(b,call,15,signature);
+                    let mut scan:u64=signature+1;let mut mask:u64=0;
+                    while scan<f { if machine_ir.native_get(b,scan,0)==2064 && machine_ir.native_get(b,scan,16)==signature { mask=mask|machine_ir.native_get(b,scan,5); }scan=scan+1; }
+                    put(b,call,23,mask|1);
+                    a=2;
+                    while a<argc {
+                        let extra:u64=machine_ir.native_record(b,image,i,2083);put(b,extra,5,args[a]);put(b,extra,6,call);put(b,extra,8,2);put(b,extra,14,a);a=a+1;
+                    }
+                    rt_free(runtime(),args);                    ret(b,image,i,result);
+                }
+                ordinal=ordinal+1;
+            }
+            i=i+1;
+        }
+        code=b.code;
+        if code==0 && ordinal!=2 { code=800; }
+        if code==0 { code=machine_ir.native_finish(b,image,tree.node_count); }
+        if code==0 { code=machine_pipeline.finalize_native(source,tree,words,report); }
+        if code==0 { code=machine_pipeline.build_pe_from_image(words,words[3],source,out,length,report); }
+    }
+    if b!=null { machine_ir.native_release(b); }
+    rt_free(runtime(),image);ntasm_ast.release(tree);rt_free(runtime(),tree);
+    return code;
+}

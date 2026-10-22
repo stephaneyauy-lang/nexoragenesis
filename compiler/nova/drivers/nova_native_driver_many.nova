@@ -1,0 +1,446 @@
+module nova_native_driver_many;
+import nova_language_parse;
+import nova_machine_batches;
+import machine_ir;
+import ntasm_nxo_link_pe;
+import ntasm_nxo_pe;
+import ntasm_pe;
+
+// THE MANY PILOT, ABI2 `main()->u64`. It reads the private bundle NOVA.IN, lets
+// the frontend resolve its sources into ONE tree (`parse_many`), cuts that
+// tree into LOTS of functions (`nova_machine_batches.build_objects`), and
+// links the lots into the ABI2 PE (`ntasm_nxo_link_pe.link_pe_list`). No byte
+// of NOVA.IN is translated here: the blob is handed to the compiler that
+// already exists.
+//
+// THE LOTS ARE WHY THE AST AND THE MIR ARE FREED BEFORE THE LINK. The
+// orchestrator returns an arena and two counts, and the arena is the ONLY
+// thing the linker reads: the frontend's tree, its five tables and the Machine
+// IR image are released before the link, so the peak is the arena and not the
+// tree plus the image plus the merged object. The frontend runs ONCE: the
+// sources are not parsed again per lot, and the MIR words are reused by every
+// lot the orchestrator lowers.
+//
+// THE CLOSED APPLICATION MODE IS WHAT THE LOTS ARE CUT FROM. What this driver
+// lowers is an application, and an application's whole life is its main: the
+// functions the application's main cannot reach are not part of it, so they
+// are not emitted. The self-reconstruction is the same program with more
+// sources, and it is the same answer.
+//
+// NVSRC001, the whole private envelope, little endian throughout:
+//   8  bytes  "NVSRC001"
+//   3  u64    count, root_index, blob_size
+//   count x (u64 offset, u64 length)  offsets RELATIVE TO THE BLOB
+//   blob_size bytes                   the sources concatenated in span order
+// The file is EXACTLY 32+16*count+blob_size bytes. After the declared body the
+// driver reads ONE sentinel byte: a byte there is a suffix and is refused, EOF
+// is the expected answer, and a short body is refused as truncation. count is
+// 1..64, root<count, blob<=4MiB. THIS envelope and its span bounds are the
+// driver's to refuse; modules, imports and types are the frontend's, and the
+// driver does not pre-empt a single one of those answers.
+//
+// The ownership rules this file is written under: every buffer below is
+// allocated here and freed here (a borrowed public-API buffer is never freed);
+// the AST, the five tables, the span table and the blob go as soon as `lower`
+// returns, BEFORE the PE is emitted, because the Machine IR and the declaration
+// text are all the emitter reads; nothing is written to OUTPUT.EFI before the
+// whole translation has succeeded, and rt_open_new creates exclusively, so a
+// pre-existing output survives a refusal byte for byte; no destructor is
+// invented for a buffer this module did not allocate.
+//
+// The 110x codes below are the pilot's own family of named refusals, not
+// additions to the NTASM diagnostic registry: a bundle refusal is not a Nova
+// source refusal, and the frontend's own codes pass through unchanged.
+export fn E_HEADER()->u64 { return 1101; }    // fewer than 32 bytes
+export fn E_MAGIC()->u64 { return 1102; }     // not NVSRC001
+export fn E_ENVELOPE()->u64 { return 1103; }  // truncated, suffixed, or not 32+16*count+blob
+export fn E_COUNT()->u64 { return 1104; }     // count outside 1..64
+export fn E_ROOT()->u64 { return 1105; }      // root>=count
+export fn E_LIMIT()->u64 { return 1106; }     // blob>4MiB, or a span outside the blob
+export fn E_INTERFACE()->u64 { return 1107; } // allocated capacity is not the declared one
+export fn E_IO()->u64 { return 1108; }        // open/write/close refused
+export fn E_OUTPUT()->u64 { return 1109; }    // emitted PE length 0 or over capacity
+
+// Starting capacities, stated once and checked after allocation. A bundle that
+// needs more is refused; nothing here is raised to make a bigger input fit.
+fn INPUT_BYTES_LIMIT()->u64 { return 4195361; } // 32+16*64+4MiB, plus the sentinel byte
+fn BLOB_BYTES_LIMIT()->u64 { return 4194304; }
+fn SPAN_WORDS()->u64 { return 128; }
+fn AST_WORDS_LIMIT()->u64 { return 4194304; }
+fn SCOPE_WORDS_LIMIT()->u64 { return 65536; }
+fn BIND_WORDS_LIMIT()->u64 { return 262144; }
+fn FIELD_WORDS_LIMIT()->u64 { return 65536; }
+fn MODULE_WORDS_LIMIT()->u64 { return 32768; }
+fn MIR_WORDS_LIMIT()->u64 { return 8388608; }
+fn TEXT_BYTES_LIMIT()->u64 { return 1048576; }
+fn PE_BYTES_LIMIT()->u64 { return 16777216; }
+fn REPORT_WORDS()->u64 { return 32; }
+// THE NXO ARENA THE LOTS ARE GATHERED IN, and the size of a lot. The arena is
+// THIRTY TWO megabytes and not sixty four: it holds every lot's object, and a
+// bound twice what the program needs is not a bound. The lot is thirty two
+// functions, which is above the size of the programs this pilot is given and
+// below the size of the self-reconstruction.
+fn NXO_ARENA_BYTES_LIMIT()->u64 { return 33554432; }
+fn BATCH_LIMIT()->u64 { return 32; }
+fn ARENA_LENGTH_WORDS()->u64 { return 2; }
+// THE DRIVER'S OWN STAGES, and they are the driver's: one is the envelope,
+// two are the frontend, three are the lots and four are the link. A stage
+// that is not the driver's is never printed, so a refusal never carries a
+// number that means something else.
+fn STAGE_ENVELOPE()->u64 { return 1; }
+fn STAGE_FRONTEND()->u64 { return 2; }
+fn STAGE_BATCHES()->u64 { return 3; }
+fn STAGE_LINK()->u64 { return 4; }
+
+// The magic is a literal, not a parsed string: each of the eight bytes is the
+// one "NVSRC001" carries, so a rename of the version is a visible edit here
+// and not a table that could drift from the bytes on disk.
+fn magic_byte(i:u64)->u64 {
+    if i==0 { return 78; }
+    if i==1 { return 86; }
+    if i==2 { return 83; }
+    if i==3 { return 82; }
+    if i==4 { return 67; }
+    if i==5 { return 48; }
+    if i==6 { return 48; }
+    return 49;
+}
+
+fn le64(bytes:buf<u8>,at:u64)->u64 {
+    let mut value:u64=0;let mut scale:u64=1;let mut i:u64=0;
+    while i<8 { value=value+u64(bytes[at+i])*scale;scale=scale*256;i=i+1; }
+    return value;
+}
+
+// 0 = exactly want bytes; 1 = EOF (or a refused count) before that.
+fn read_upto(reader:u64,storage:buf<u8>,at:u64,want:u64)->u64 {
+    let mut used:u64=0;
+    while used<want {
+        let room:u64=want-used;
+        let tail:buf<u8>=slice(storage,at+used,room);
+        let got:u64=rt_read(runtime(),reader,tail);
+        rt_free(runtime(),tail);
+        if got==0 || got>room { return 1; }
+        used=used+got;
+    }
+    return 0;
+}
+
+// The envelope, in the order the protocol states it: header, magic, count,
+// root, blob size, exact length, then the span bounds. The sentinel read is
+// what makes "no suffix" observable: after the declared body, one single byte
+// must NOT be readable, and read_upto answers 1 for EOF and 0 for that byte.
+fn read_packet(reader:u64,storage:buf<u8>,spans:buf<u64>)->u64 {
+    if len(storage)!=INPUT_BYTES_LIMIT() || len(spans)!=SPAN_WORDS() { return E_INTERFACE(); }
+    if read_upto(reader,storage,0,32)!=0 { return E_HEADER(); }
+    let mut i:u64=0;
+    while i<8 {
+        if u64(storage[i])!=magic_byte(i) { return E_MAGIC(); }
+        i=i+1;
+    }
+    let count:u64=le64(storage,8);
+    if count<1 || count>64 { return E_COUNT(); }
+    let root:u64=le64(storage,16);
+    if root>=count { return E_ROOT(); }
+    let blob_size:u64=le64(storage,24);
+    if blob_size>BLOB_BYTES_LIMIT() { return E_LIMIT(); }
+    if read_upto(reader,storage,32,16*count+blob_size)!=0 { return E_ENVELOPE(); }
+    let end:u64=32+16*count+blob_size;
+    if read_upto(reader,storage,end,1)!=1 { return E_ENVELOPE(); }
+    i=0;
+    while i<count {
+        let off:u64=le64(storage,32+i*16);
+        let size:u64=le64(storage,40+i*16);
+        if off>blob_size || size>blob_size-off { return E_LIMIT(); }
+        spans[i*2]=off;spans[i*2+1]=size;
+        i=i+1;
+    }
+    return 0;
+}
+
+fn diag_number(value:u64)->u64 {
+    let digits:buf<u8>=alloc(runtime(),20);
+    let mut cursor:u64=20;let mut current:u64=value;let mut done:bool=false;
+    while done==false {
+        cursor=cursor-1;digits[cursor]=u8(48+current%10);current=current/10;
+        if current==0 { done=true; }
+    }
+    let exact:buf<u8>=slice(digits,cursor,20-cursor);
+    rt_diag(runtime(),exact);
+    let newline:buf<u8>="\r\n";rt_diag(runtime(),newline);
+    rt_free(runtime(),newline);rt_free(runtime(),exact);rt_free(runtime(),digits);
+    return 0;
+}
+
+// THE DIAGNOSTIC OF A REFUSED BATCH.
+//
+// It is printed on stderr, once, only when the orchestrator refused, and it
+// is printed BEFORE the tree and the image are released: the record it names
+// lives in them.
+//
+// IT IS A POINTER, NOT A DUMP, and every bound in it is a real one: the
+// records are the records of the image (words[3] of them), the words printed
+// are one record's own stride, the owner walk stops at the image's own count,
+// and the name printed is a span inside the text and at most a few hundred
+// bytes of it. The text can be the PREVIOUS lot's when a lot refused before
+// writing its own; the name printed is then that lot's, and the words of the
+// record are the ones the refusal is about.
+fn diag_indexed(index:u64,value:u64)->u64 {
+    let open:buf<u8>="report[";rt_diag(runtime(),open);rt_free(runtime(),open);
+    diag_number(index);
+    let close:buf<u8>="]=";rt_diag(runtime(),close);rt_free(runtime(),close);
+    diag_number(value);
+    return 0;
+}
+// THE WORDS OF ONE RECORD: its index, its kind, and the record's own stride
+// of words, read at the offset the owner's own formula gives.
+fn diag_record(index:u64,words:buf<u64>)->u64 {
+    let base:u64=machine_ir.HEADER_WORDS()+(index-1)*machine_ir.NODE_WORDS();
+    let l1:buf<u8>="record\r\n";rt_diag(runtime(),l1);rt_free(runtime(),l1);
+    diag_number(index);
+    let l2:buf<u8>="kind\r\n";rt_diag(runtime(),l2);rt_free(runtime(),l2);
+    diag_number(words[base]);
+    let l3:buf<u8>="word\r\n";rt_diag(runtime(),l3);rt_free(runtime(),l3);
+    let mut k:u64=0;
+    while k<machine_ir.NODE_WORDS() {
+        diag_number(k);
+        diag_number(words[base+k]);
+        k=k+1;
+    }
+    return 0;
+}
+fn diag_batch(text:buf<u8>,words:buf<u64>,report:buf<u64>)->u64 {
+    // THE BOUNDS ARE CHECKED BEFORE ANY READ AND BEFORE ANY MULTIPLICATION.
+    // A report too short and an image too short are not read at all, and the
+    // record count is bounded by a DIVISION: the multiplication that would
+    // check the storage overflows on a corrupted counter, and the division
+    // cannot. Once the count is bounded, every offset below is inside the
+    // buffer.
+    if len(report)<14 { return 0; }
+    if len(words)<machine_ir.HEADER_WORDS() { return 0; }
+    // THE MARKER, THEN THE REPORT AS IT IS. The report is not rewritten
+    // here: the stage, the code, the record and the lot are read by the
+    // reader, and the words printed are the ones the producer wrote.
+    let marker:buf<u8>="NG_NOVA_NATIVE_DRIVER_MANY_BATCH_REFUSED\r\n";
+    rt_diag(runtime(),marker);rt_free(runtime(),marker);
+    let mut i:u64=0;
+    while i<14 { diag_indexed(i,report[i]); i=i+1; }
+    // THE IMAGE, and whether it holds the record the report names.
+    let count:u64=words[3];
+    if count>(len(words)-machine_ir.HEADER_WORDS())/machine_ir.NODE_WORDS() { return 0; }
+    let r:u64=report[3];
+    if r<1 || r>count { return 0; }
+    let mut printed:u64=0;
+    diag_record(r,words);printed=printed+1;
+    // ITS NEIGHBOURS, two before and two after, and no more.
+    let mut d:u64=2;
+    while d>0 && printed<16 {
+        if r>d { diag_record(r-d,words);printed=printed+1; }
+        if r+d<=count && printed<16 { diag_record(r+d,words);printed=printed+1; }
+        d=d-1;
+    }
+    // THE DEFINITIONS OF THE THREE OPERANDS: the records whose word 4 is the
+    // operand's own value id. A value of zero names no definition, and at
+    // most three definitions are printed for one operand.
+    let base:u64=machine_ir.HEADER_WORDS()+(r-1)*machine_ir.NODE_WORDS();
+    let mut op:u64=5;
+    while op<=7 && printed<16 {
+        let value:u64=words[base+op];
+        if value!=0 {
+            let mut found:u64=0;
+            let mut q:u64=1;
+            while q<=count && found<3 && printed<16 {
+                if words[machine_ir.HEADER_WORDS()+(q-1)*machine_ir.NODE_WORDS()+4]==value {
+                    diag_record(q,words);printed=printed+1;found=found+1;
+                }
+                q=q+1;
+            }
+        }
+        op=op+1;
+    }
+    // THE FUNCTION THAT OWNS THE RECORD: the owner chain, walked upwards, and
+    // the walk is bounded by the image's own record count.
+    let mut owner:u64=r;
+    let mut steps:u64=0;
+    while steps<64 && owner>=1 && owner<=count {
+        let wbase:u64=machine_ir.HEADER_WORDS()+(owner-1)*machine_ir.NODE_WORDS();
+        if words[wbase]==2051 { break; }
+        let next:u64=words[wbase+16];
+        if next==owner || next<1 || next>count { break; }
+        owner=next;steps=steps+1;
+    }
+    if owner<1 || owner>count { return 0; }
+    if printed>=16 { return 0; }
+    let obase:u64=machine_ir.HEADER_WORDS()+(owner-1)*machine_ir.NODE_WORDS();
+    diag_record(owner,words);printed=printed+1;
+    // THE NAME, when the owner is a function with a name span and the span is
+    // inside the text. An IMPORT is a function whose word 5 is zero: it has a
+    // symbol child and no name span of its own, and then the words above are
+    // the whole of it.
+    if words[obase]==2051 && words[obase+5]!=0 {
+        let start:u64=words[obase+6];
+        let end:u64=words[obase+7];
+        if start<=end && end<=len(text) {
+            let mut n:u64=end-start;
+            if n>256 { n=256; }
+            if n>0 {
+                let label:buf<u8>="name\r\n";rt_diag(runtime(),label);rt_free(runtime(),label);
+                let name:buf<u8>=slice(text,start,n);
+                rt_diag(runtime(),name);
+                rt_free(runtime(),name);
+            }
+        }
+    }
+    return 0;
+}
+
+export fn main()->u64 {
+    let input_path:buf<u8>="NOVA.IN";
+    let output_path:buf<u8>="OUTPUT.EFI";
+    let storage:buf<u8>=alloc(runtime(),INPUT_BYTES_LIMIT());
+    let spans:buf<u64>=alloc(runtime(),SPAN_WORDS());
+    let nodes:buf<u64>=alloc(runtime(),AST_WORDS_LIMIT());
+    let scopes:buf<u64>=alloc(runtime(),SCOPE_WORDS_LIMIT());
+    let binds:buf<u64>=alloc(runtime(),BIND_WORDS_LIMIT());
+    let fields:buf<u64>=alloc(runtime(),FIELD_WORDS_LIMIT());
+    let modules:buf<u64>=alloc(runtime(),MODULE_WORDS_LIMIT());
+    let words:buf<u64>=alloc(runtime(),MIR_WORDS_LIMIT());
+    let text:buf<u8>=alloc(runtime(),TEXT_BYTES_LIMIT());
+    let text_length:buf<u64>=alloc(runtime(),1);
+    let output:buf<u8>=alloc(runtime(),PE_BYTES_LIMIT());
+    let output_length:buf<u64>=alloc(runtime(),1);
+    let arena:buf<u8>=alloc(runtime(),NXO_ARENA_BYTES_LIMIT());
+    let arena_length:buf<u64>=alloc(runtime(),ARENA_LENGTH_WORDS());
+    let report:buf<u64>=alloc(runtime(),REPORT_WORDS());
+    let mut code:u64=E_INTERFACE();
+    // THE STAGE, and it moves with the work: the envelope first, then the
+    // frontend, then the lots, then the link. A refusal is reported with the
+    // stage it belongs to.
+    let mut stage:u64=STAGE_ENVELOPE();
+    output_length[0]=0;text_length[0]=0;
+    let mut capacity_ok:bool=len(storage)==INPUT_BYTES_LIMIT();
+    if len(spans)!=SPAN_WORDS() { capacity_ok=false; }
+    if len(nodes)!=AST_WORDS_LIMIT() { capacity_ok=false; }
+    if len(scopes)!=SCOPE_WORDS_LIMIT() { capacity_ok=false; }
+    if len(binds)!=BIND_WORDS_LIMIT() { capacity_ok=false; }
+    if len(fields)!=FIELD_WORDS_LIMIT() { capacity_ok=false; }
+    if len(modules)!=MODULE_WORDS_LIMIT() { capacity_ok=false; }
+    if len(words)!=MIR_WORDS_LIMIT() { capacity_ok=false; }
+    if len(text)!=TEXT_BYTES_LIMIT() { capacity_ok=false; }
+    if len(output)!=PE_BYTES_LIMIT() { capacity_ok=false; }
+    if len(report)!=REPORT_WORDS() { capacity_ok=false; }
+    if len(text_length)!=1 { capacity_ok=false; }
+    if len(output_length)!=1 { capacity_ok=false; }
+    if len(arena)!=NXO_ARENA_BYTES_LIMIT() { capacity_ok=false; }
+    if len(arena_length)!=ARENA_LENGTH_WORDS() { capacity_ok=false; }
+    if capacity_ok==false { code=E_INTERFACE(); }
+    if capacity_ok {
+        let reader:u64=rt_open_read(runtime(),input_path);
+        code=read_packet(reader,storage,spans);
+        rt_close(runtime(),reader);
+    }
+    if code==0 {
+        let count:u64=le64(storage,8);
+        let root:u64=le64(storage,16);
+        let blob_size:u64=le64(storage,24);
+        // ONE typed local, no empty allocation re-pointed later: the blob is a
+        // slice of `storage`, which main owns for the whole call, and it is
+        // released in THIS block after the orchestrator returned -- before the
+        // link -- so there is no escape and no double free.
+        let blob:buf<u8>=slice(storage,32+16*count,blob_size);
+        // The frontend's own resolution, on the blob it was given, with the
+        // span table decoded from the envelope. report[5] is the node count and
+        // report[6] the program node -- the two numbers the common backend
+        // needs, read from the result of the call that produced them.
+        stage=STAGE_FRONTEND();
+        code=nova_language_parse.parse_many(blob,spans,count,root,nodes,scopes,binds,
+                                            fields,modules,report);
+        if code==0 {
+            // THE LOTS. The orchestrator lowers the reachable functions in
+            // slices of BATCH_LIMIT, builds one NXO object per slice and
+            // gathers them in the arena. It returns the arena's used bytes and
+            // its object count, and it needs the tree and the MIR only while
+            // it runs: the linker reads the arena and nothing else.
+            stage=STAGE_BATCHES();
+            let node_count:u64=report[5];
+            let program:u64=report[6];
+            code=nova_machine_batches.build_objects_progress(blob,spans,count,root,
+                 nodes,node_count,program,scopes,binds,fields,modules,
+                 words,MIR_WORDS_LIMIT(),text,text_length,
+                 arena,len(arena),arena_length,report,BATCH_LIMIT(),true);
+            // THE DIAGNOSTIC, and it is printed while the tree and the image
+            // are still here: the record it names lives in them. The report
+            // and the code the caller receives are the producer's own.
+            if code!=0 { diag_batch(text,words,report); }
+        }
+        rt_free(runtime(),blob);
+    }
+    // THE PARSING SIDE AND THE MIR IMAGE ARE GONE BEFORE THE LINK. This is
+    // the peak-reduction move the ownership comment above describes: the
+    // orchestrator returns without retaining any of these buffers, and the
+    // linker reads only the arena. The frontend is not run again: the sources
+    // are parsed once and the MIR words are reused by every lot.
+    rt_free(runtime(),modules);rt_free(runtime(),fields);
+    rt_free(runtime(),binds);rt_free(runtime(),scopes);rt_free(runtime(),nodes);
+    rt_free(runtime(),spans);
+    rt_free(runtime(),words);
+    // THE ARENA IS EMPTY OR FULL: a lot count of zero is a refusal, not a PE.
+    if code==0 && arena_length[1]==0 { code=E_OUTPUT(); }
+    if code==0 {
+        // THE LINK, over the list of the lots' objects. The result is a
+        // record and a buffer, and both are freed on every path.
+        stage=STAGE_LINK();
+        let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_link_pe.link_pe_list(arena,arena_length[1]);
+        let link_code:u64=converted.code;
+        let image:buf<u8>=converted.bytes;
+        if link_code!=0 { code=link_code; }
+        else {
+            let size:u64=len(image);
+            // THE PE IS COPIED ONLY IF IT FITS, and the copy is the PE's own
+            // bytes, byte for byte.
+            if size==0 || size>len(output) { code=E_OUTPUT(); }
+            else { ntasm_pe.copy(output,0,image);output_length[0]=size; }
+        }
+        rt_free(runtime(),image);
+        rt_free(runtime(),converted);
+    }
+    if code==0 && (output_length[0]==0 || output_length[0]>len(output)) { code=E_OUTPUT(); }
+    if code==0 {
+        let exact:buf<u8>=slice(output,0,output_length[0]);
+        let writer:u64=rt_open_new(runtime(),output_path);
+        let wrote:u64=rt_write(runtime(),writer,exact);
+        let closed:u64=rt_close(runtime(),writer);
+        rt_free(runtime(),exact);
+        if wrote!=output_length[0] || closed!=0 { code=E_IO(); }
+    }
+    let pe_bytes:u64=output_length[0];
+    if code==0 {
+        let ok:buf<u8>="NG_NOVA_NATIVE_DRIVER_MANY_OK\r\n";
+        rt_diag(runtime(),ok);rt_free(runtime(),ok);
+        let pe:buf<u8>="NG_NOVA_NATIVE_DRIVER_MANY_PE_BYTES\r\n";
+        rt_diag(runtime(),pe);rt_free(runtime(),pe);
+        diag_number(pe_bytes);
+    } else {
+        let refused:buf<u8>="NG_NOVA_NATIVE_DRIVER_MANY_REFUSED\r\n";
+        rt_diag(runtime(),refused);rt_free(runtime(),refused);
+        diag_number(code);
+        // THE STAGE THAT REFUSED, and it is the driver's own stage, so it
+        // never means something else.
+        let stage_line:buf<u8>="NG_NOVA_NATIVE_DRIVER_MANY_STAGE\r\n";
+        rt_diag(runtime(),stage_line);rt_free(runtime(),stage_line);
+        diag_number(stage);
+        // AND THE PRODUCER'S OWN STAGE, when the lots are the ones that
+        // refused: that is the stage inside the orchestrator, and it is the
+        // only one that knows which of its own stages said no.
+        if stage==STAGE_BATCHES() {
+            let producer:buf<u8>="NG_NOVA_NATIVE_DRIVER_MANY_PRODUCER_STAGE\r\n";
+            rt_diag(runtime(),producer);rt_free(runtime(),producer);
+            diag_number(report[8]);
+        }
+    }
+    rt_free(runtime(),report);rt_free(runtime(),output_length);rt_free(runtime(),output);
+    rt_free(runtime(),arena_length);rt_free(runtime(),arena);
+    rt_free(runtime(),text_length);rt_free(runtime(),text);
+    rt_free(runtime(),storage);rt_free(runtime(),output_path);rt_free(runtime(),input_path);
+    return code;
+}

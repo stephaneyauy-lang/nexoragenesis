@@ -1,0 +1,10 @@
+module pe_inspect_entry;
+import ntasm_pe_inspect;
+
+// Returns 0 on a validated image and 0x8000000000000000+code otherwise, so a
+// host never confuses a summary failure with an ordinary u64 result.
+fn main(image:buf<u8>,out:buf<u64>)->u64 {
+    let code:u64=ntasm_pe_inspect.inspect(image,out);
+    if code!=0 { return 9223372036854775808+code; }
+    return 0;
+}

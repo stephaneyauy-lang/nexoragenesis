@@ -1,0 +1,48 @@
+module nova_source_emit_entry;
+
+import nova_language_parse;
+import nova_source_emit;
+
+export fn main(source: buf<u8>, nodes: buf<u64>, scopes: buf<u64>,
+               binds: buf<u64>, fields: buf<u64>, out: buf<u8>,
+               length: buf<u64>, report: buf<u64>) -> u64 {
+    if len(length) < 1 || len(report) < 10 {
+        if len(report) >= 10 { report[9] = 1; }
+        if len(length) >= 1 { length[0] = 0; }
+        return 2;
+    }
+    length[0] = 0;
+
+    let p_code: u64 = nova_language_parse.parse(
+        source,
+        nodes,
+        scopes,
+        binds,
+        fields,
+        report
+    );
+
+    if p_code != 0 {
+        report[9] = 1;
+        length[0] = 0;
+        return p_code;
+    }
+
+    let node_count: u64 = report[5];
+    let e_code: u64 = nova_source_emit.emit(
+        source,
+        nodes,
+        node_count,
+        out,
+        length,
+        report
+    );
+
+    report[9] = 2;
+    if e_code != 0 {
+        length[0] = 0;
+        return e_code;
+    }
+
+    return 0;
+}

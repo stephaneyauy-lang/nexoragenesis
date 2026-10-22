@@ -1,0 +1,24 @@
+module corpus_e2e.register_width_binding
+target x86_64-nexora-uefi
+section .text {
+    fn take_r8(in a:u64 @r8) -> u64
+    effects {}
+    clobbers {} {
+        return a
+    }
+    fn take_rdi(in b:u64 @rdi) -> u64
+    effects {}
+    clobbers {} {
+        return b
+    }
+    fn take_rcx(in c:u64 @rcx,in d:u64 @rdx) -> u64
+    effects {}
+    clobbers {} {
+        return c + d
+    }
+    export fn main() -> u64
+    effects {}
+    clobbers {rax} {
+        return take_r8(20) + take_rdi(2) + take_rcx(15,5)
+    }
+}

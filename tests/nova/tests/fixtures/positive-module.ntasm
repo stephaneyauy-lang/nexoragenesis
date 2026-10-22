@@ -1,0 +1,23 @@
+module lexer.fixture
+target x86_64-nexora-none
+// names, numeric separators, all compound operators and raw escapes
+const LIMIT:u64=18_446_744_073_709_551_615
+const HEX:u64=0xFFFF_FFFF_FFFF_FFFF
+section .rdata {
+// The type closer is a bare `>`. `array<u8,4>=` lexes the `>=` as ONE GE token,
+// so the type is never closed; the space is load-bearing, not cosmetic. Both the
+// frozen C lexer and lexer.nova fold `>=` identically, and both refuse the
+// unspaced spelling at the same column (see tests_ntasm_parser.c type_closer_*).
+data text:array<u8,4> ="A\n\x42\0"
+}
+section .text {
+fn main()->u64
+effects {}
+clobbers {} {
+let keep:bool=(LIMIT>>1)<=HEX && LIMIT!=0 && HEX>=LIMIT
+if keep==true {
+return (LIMIT>>1)<=HEX
+}
+return 0
+}
+}

@@ -1,0 +1,314 @@
+module calls;
+
+import ntasm_ast;
+
+// Node kinds: import 9, function declaration 18, parameter 19,
+// call statement 28, call expression 35 (aux 1), qualified name 91.
+
+// Byte-wise name comparison over the real source text with bounds.
+fn same_name(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Direct child of parent at the given ordinal, or 0 when absent or out of range.
+// "Out of range" covers the PARENT as well as the ordinal, and that half was
+// FALSE until the guard below was added on 2026-10-02: with parent==0 or
+// parent>tree.node_count this body reached ntasm_ast.node_at, which REFUSES the
+// run -- "ntasm_ast.node_at: id is not a node (id=0, node_count=27)" --
+// instead of answering 0.
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);
+    let mut id:u64=p.first_child;
+    let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;
+        index=index+1;
+    }
+    if id>tree.node_count { return 0; }
+    return id;
+}
+
+// Whitespace that delimits the first word of a parameter span.
+fn blank(c:u8)->bool {
+    if c==32 { return true; }
+    if c==9 { return true; }
+    if c==10 { return true; }
+    if c==13 { return true; }
+    return false;
+}
+
+// Whole-word comparison of source[start..end] against text, both bounded.
+fn span_word(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    if start>end || end>len(source) { return false; }
+    if (end-start)!=len(text) { return false; }
+    let mut i:u64=0;
+    while i<len(text) {
+        if source[start+i]!=text[i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Exact ABI direction of a parameter: 1 in, 2 out, 3 inout, 0 when the span
+// carries no known direction. parser.nova creates the parameter node before
+// it steps over the direction keyword, so the span opens on the keyword and
+// the direction is its first whitespace-delimited word. The word is compared
+// whole, so a name such as outbound, input, outer or inoutbox is never read
+// as a direction, and a direction is never read from a longer word that
+// starts with it.
+//
+// Rule owner: abi.nova:78 (fn direction). This is a copy of that function, as
+// is call_types.nova:21 and x64_lower_nxo.nova:2056; the four must be changed
+// together, and the function name is the durable anchor. The only textual
+// differences from the owner are the helper names: blank:38 is the inline
+// blank test of the owner and span_word:47 is its same_bytes.
+// tests/c/nova/tests_ntasm_abi.c drives all four readers over
+// one forged parameter span table and fails if they disagree, which is the
+// proof that this copy has not drifted.
+fn direction(source:buf<u8>,parameter:ntasm_ast.Node)->u64 {
+    if parameter.start>=parameter.end || parameter.end>len(source) { return 0; }
+    let mut at:u64=parameter.start;
+    while at<parameter.end {
+        if blank(source[at]) { at=at+1; }
+        else { break; }
+    }
+    let mut stop:u64=at;
+    while stop<parameter.end {
+        if blank(source[stop]) { break; }
+        stop=stop+1;
+    }
+    let inout_:buf<u8>="inout";
+    if span_word(source,at,stop,inout_) { return 3; }
+    let out_:buf<u8>="out";
+    if span_word(source,at,stop,out_) { return 2; }
+    let in_:buf<u8>="in";
+    if span_word(source,at,stop,in_) { return 1; }
+    return 0;
+}
+
+// A parameter takes an argument unless its direction word is exactly out. A
+// span carrying no known direction keeps its argument, so a parameter can
+// never suppress its own check.
+fn consumes(source:buf<u8>,parameter:ntasm_ast.Node)->bool {
+    return direction(source,parameter)!=2;
+}
+
+// Number of call-supplied parameters. Direct out parameters do not consume an
+// argument; in and inout do. Parameters are attached to the declaration.
+fn decl_arity(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64)->u64 {
+    let d:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    let mut id:u64=d.first_child;
+    let mut count:u64=0;
+    while id!=0 && id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==19 && consumes(source,n)==true { count=count+1; }
+        id=n.next_sibling;
+    }
+    return count;
+}
+
+// Name node id of a callable declaration: first child for a function
+// declaration, second child (the alias, after the qualified path) for an
+// import. Returns 0 when the tree does not carry a usable name.
+fn decl_name_id(tree:ntasm_ast.Tree,decl_id:u64)->u64 {
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    if n.kind==18 { return child(tree,decl_id,0); }
+    if n.kind==9 { return child(tree,decl_id,1); }
+    return 0;
+}
+
+// Call name: first child of the call must be a qualified node; the name is
+// its last child. The received arity is the number of direct children after
+// that qualified node. Returns 0 when the shape is not a usable call.
+fn call_name_id(tree:ntasm_ast.Tree,call_id:u64)->u64 {
+    let qid:u64=child(tree,call_id,0);
+    if qid==0 { return 0; }
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,qid);
+    if q.kind!=91 { return 0; }
+    if q.last_child==0 || q.last_child>tree.node_count { return 0; }
+    return q.last_child;
+}
+
+fn call_arity(tree:ntasm_ast.Tree,call_id:u64)->u64 {
+    let c:ntasm_ast.Node=ntasm_ast.node_at(tree,call_id);
+    let mut id:u64=c.first_child;
+    let mut first:bool=true;
+    let mut count:u64=0;
+    while id!=0 && id<=tree.node_count {
+        if first==false { count=count+1; }
+        first=false;
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;
+    }
+    return count;
+}
+
+// A call statement and the explicit `abi` clause are both node kind 28, but
+// they differ in their first child: a call names its callee with a qualified
+// name (kind 91) while an abi clause names its profile with a dashed name
+// (kind 92). Only the qualified shape is a call.
+fn is_call(tree:ntasm_ast.Tree,id:u64)->bool {
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if n.kind==28 {
+        let qid:u64=child(tree,id,0);
+        if qid==0 || qid>tree.node_count { return false; }
+        let q:ntasm_ast.Node=ntasm_ast.node_at(tree,qid);
+        return q.kind==91;
+    }
+    if n.kind==35 && n.aux==1 { return true; }
+    return false;
+}
+
+// Validate call arities against local function declarations and import
+// aliases. Success writes declaration count, call count, validated call
+// count and 0 to out[0..3]. Error 310 writes the line and column of the
+// first call whose name is absent to out[0..1]. Error 311 writes line,
+// column, expected arity and received arity to out[0..3], then the reason
+// to out[4] and its index to out[5] when the caller supplied those two
+// words. Error 800 on an invalid tree, an invalid span or an output
+// buffer shorter than four words, with no write to out. Neither source
+// nor tree is released.
+//
+// Option A, kept deliberately, and additive on purpose. 311 stays the arity
+// code and out[0..3] keeps its meaning, because two gates outside this
+// module read those four words: validate returns 311 for a too-few call
+// before call_types.check ever runs, and the call_types shim pins the same
+// four words. The too-many/too-few verdict therefore travels in a new pair
+// of optional slots instead of overwriting the counts: out[4] is the reason
+// and out[5] the zero-based index, with the reason numbers of call_types
+// (4 too many arguments, 5 too few). out[5] is the index of the first
+// surplus argument for reason 4, which is the number of consumed
+// parameters, and the index of the first unsatisfied parameter for reason
+// 5, which is the number of arguments supplied. Both words are written only
+// when the caller passed them, so a four-word caller such as the validate
+// pipeline is byte-for-byte unaffected. The cost is that the shipped
+// pipeline, which hands over four words, still cannot read the verdict:
+// 354 reasons 4 and 5 stay unreachable from it as well.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+
+    let scratch:buf<u64>=alloc(runtime(),tree.node_count*2);
+    let mut used:u64=0;
+    let mut calls:u64=0;
+    let mut validated:u64=0;
+    let mut code:u64=0;
+    let mut err_line:u64=0;
+    let mut err_column:u64=0;
+    let mut err_expected:u64=0;
+    let mut err_received:u64=0;
+    let mut err_reason:u64=0;
+    let mut err_index:u64=0;
+
+    // Index declarations: id and arity per callable.
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==18 || n.kind==9 {
+            let name_id:u64=decl_name_id(tree,id);
+            if name_id==0 { code=800; }
+            else {
+                let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                if name.start>name.end || name.end>len(source) { code=800; }
+                else {
+                    let at:u64=used*2;
+                    scratch[at]=id;
+                    scratch[at+1]=decl_arity(source,tree,id);
+                    used=used+1;
+                }
+            }
+        }
+        if code!=0 { id=tree.node_count+1; } else { id=id+1; }
+    }
+
+    // Check every call against the indexed arities.
+    id=1;
+    while id<=tree.node_count && code==0 {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if is_call(tree,id) {
+            let name_id:u64=call_name_id(tree,id);
+            if name_id==0 {
+                code=310;
+                err_line=n.line;
+                err_column=n.column;
+            } else {
+                calls=calls+1;
+                let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                if name.start>name.end || name.end>len(source) {
+                    code=800;
+                } else {
+                    let arity:u64=call_arity(tree,id);
+                    let mut found:bool=false;
+                    let mut j:u64=0;
+                    while j<used {
+                        let at:u64=j*2;
+                        let decl:ntasm_ast.Node=ntasm_ast.node_at(tree,scratch[at]);
+                        let decl_name_id:u64=decl_name_id(tree,scratch[at]);
+                        if decl_name_id!=0 {
+                            let decl_name:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_name_id);
+                            if same_name(source,decl_name.start,decl_name.end,
+                                         name.start,name.end) {
+                                found=true;
+                                if arity!=scratch[at+1] {
+                                    code=311;
+                                    err_line=name.line;
+                                    err_column=name.column;
+                                    err_expected=scratch[at+1];
+                                    err_received=arity;
+                                    if arity>scratch[at+1] {
+                                        err_reason=4;
+                                        err_index=scratch[at+1];
+                                    }
+                                    if arity<scratch[at+1] {
+                                        err_reason=5;
+                                        err_index=arity;
+                                    }
+                                }
+                                j=used;
+                            }
+                        }
+                        if code==0 || found==false { j=j+1; }
+                    }
+                    if found==true {
+                        validated=validated+1;
+                    } else if code==0 {
+                        code=310;
+                        err_line=name.line;
+                        err_column=name.column;
+                    }
+                }
+            }
+        }
+        id=id+1;
+    }
+
+    if code==0 {
+        out[0]=used;
+        out[1]=calls;
+        out[2]=validated;
+        out[3]=0;
+    } else if code==310 {
+        out[0]=err_line;
+        out[1]=err_column;
+    } else if code==311 {
+        out[0]=err_line;
+        out[1]=err_column;
+        out[2]=err_expected;
+        out[3]=err_received;
+        if len(out)>4 { out[4]=err_reason; }
+        if len(out)>5 { out[5]=err_index; }
+    }
+    rt_free(runtime(),scratch);
+    return code;
+}

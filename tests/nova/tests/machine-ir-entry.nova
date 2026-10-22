@@ -1,0 +1,299 @@
+module machine_ir_entry;
+import ntasm_ast;
+import ntasm_parser;
+import ntasm_lexer;
+import ntir;
+import machine_ir;
+import ir_image;
+import register_widths;
+import pointer_spaces;
+import versions;
+
+// One entry, nine modes, so a gate can attribute a refusal to a stage. The
+// stage separation is the point: `ntir_out` holds the NTIR image, `out` holds
+// the Machine IR image, and no mode ever copies one into the other, so a
+// refusal at a lowering stage and a refusal at a verifier stage are two
+// different facts and a gate that cannot tell them apart measures nothing.
+//
+//   mode 0  the whole pipeline: parse, ntir.build, machine_ir.lower,
+//           machine_ir.verify. report[0]=records, [1]=values, [2]=blocks,
+//           [3]=0. A refusal returns its code and writes report[0]=line,
+//           [1]=column, [2]=code, [3]=node.
+//   mode 1  mode 0, then machine_ir.serialize.
+//   mode 2  parse and ntir.build ONLY, so a caller can damage the NTIR image.
+//   mode 3  machine_ir.lower on the NTIR image ALREADY in `ntir_out`, with no
+//           parse and no build, then verify. The absence of a parse is the
+//           proof that the lowering reads the IR and not the source.
+//   mode 4  mode 3 without the verify, so the caller may damage the Machine IR
+//           image and then verify it with mode 5.
+//   mode 5  machine_ir.verify on the image already in `out`.
+//   mode 6  the ORACLE probe for NTIR node `index`.
+//   mode 7  the tables, the kind names and the OPCODE VOCABULARY, all read
+//           back. A harness that typed an opcode number of its own would be
+//           checking a number it made up; this makes the number a property of
+//           the module and the harness a reader of it.
+//   mode 8  the parse verdict and nothing else.
+//   mode 11 mode 0 through machine_ir.lower_with_calls (A6), with the
+//           tree's call marks plus node `index` when it is not 0.
+//
+// A signature written on one line stops parsing when the line gets long and
+// the error lands far from the cause, so this one is split in two.
+export fn main(source:buf<u8>,mode:u64,index:u64,ntir_out:buf<u64>,
+        ntir_count:u64,out:buf<u64>,out_count:u64,text:buf<u8>,
+        text_length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<32 || len(text_length)<1 { return 800; }
+    if mode==10 { return unpack_mir(text,text_length,out,out_count,report); }
+    if mode==7 { return tables(out,report); }
+    if mode==5 {
+        if len(out)<8 { return 800; }
+        return machine_ir.verify(out,out[3],report);
+    }
+    if mode==4 || mode==3 {
+        if len(ntir_out)<8 { return 800; }
+        let mut count:u64=ntir_out[3];
+        let mut lowered:u64=machine_ir.lower(source,ntir_out,count,out,out_count,report);
+        if lowered!=0 { return lowered; }
+        if mode==4 { report[0]=out[3];report[1]=out[6];report[2]=out[7];return 0; }
+        return machine_ir.verify(out,out[3],report);
+    }
+    if mode==6 { return probe(source,ntir_out,ntir_count,index,report); }
+    if len(ntir_out)<ntir.HEADER_WORDS() { return 800; }
+    if mode==8 { return verdict(source,report); }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree); return 800; }
+    if ntir_count<ntir.HEADER_WORDS() { ntasm_ast.release(tree); return 800; }
+    let mut built:u64=ntir.build(source,tree,ntir_out,ntir_count);
+    if built!=0 { ntasm_ast.release(tree); return built; }
+    if mode==2 {
+        report[0]=ntir_out[3];report[1]=ntir_out[7];report[2]=0;report[3]=0;
+        ntasm_ast.release(tree);
+        return 0;
+    }
+    if out_count<machine_ir.HEADER_WORDS() { ntasm_ast.release(tree); return 800; }
+    let mut count:u64=ntir_out[3];
+    // mode 11 (A6, 13 October 2026): machine_ir.lower_with_calls with the
+    // tree's own call marks, plus node `index` when it is not 0 -- a gate
+    // imposes a node to prove the table is checked. report as mode 0.
+    if mode==11 {
+        let marks:buf<u64>=machine_ir.ast_call_marks(tree);
+        let mut extra:u64=0;
+        if index!=0 { extra=1; }
+        let table:buf<u64>=alloc(runtime(),len(marks)+extra);
+        let mut k:u64=0;
+        while k<len(marks) { table[k]=marks[k]; k=k+1; }
+        if index!=0 { table[k]=index; }
+        let with:u64=machine_ir.lower_with_calls(source,tree,ntir_out,count,out,out_count,report,table);
+        rt_free(runtime(),table);
+        rt_free(runtime(),marks);
+        if with!=0 { ntasm_ast.release(tree); return with; }
+        let checked:u64=machine_ir.verify(out,out[3],report);
+        ntasm_ast.release(tree);
+        return checked;
+    }
+    let mut lowered:u64=machine_ir.lower(source,ntir_out,count,out,out_count,report);
+    if lowered!=0 { ntasm_ast.release(tree); return lowered; }
+    let mut verdict_code:u64=machine_ir.verify(out,out[3],report);
+    if verdict_code!=0 { ntasm_ast.release(tree); return verdict_code; }
+    if mode==0 { ntasm_ast.release(tree); return 0; }
+    if mode==9 {
+        // Verified BEFORE serialised, for the same reason ntir-entry mode 6
+        // does it: a file nobody has read is a file whose correctness is
+        // unknown, and handing that to a gate as "the bytes" would make a
+        // round-trip case measure only the round trip.
+        // out[3] is the RECORD count, and the container wants the TOTAL number
+        // of u64 words in the image: the header plus the records. Passing
+        // out[3] writes a file holding the header and 32 of the image's 650
+        // words, which is self-consistent, reads back, and then fails
+        // machine_ir.verify with 935 E_CYCLE on an image that verified clean
+        // one line earlier. The gate named it: "32 records of stride 20, so it
+        // occupies 650 words and the file holds 32". ntir-entry carries the
+        // same fix; the same mistake in two entries is one mistake twice.
+        let mut total:u64=machine_ir.HEADER_WORDS()+out[3]*machine_ir.NODE_WORDS();
+        let packed:u64=ir_image.write(ir_image.DOMAIN_MACHINE_IR(),out,total,text,text_length);
+        if packed!=0 { ntasm_ast.release(tree); return packed; }
+        ntasm_ast.release(tree);
+        return 0;
+    }
+    let mut written:u64=machine_ir.serialize(out,out[3],text,text_length);
+    if written!=0 { ntasm_ast.release(tree); return written; }
+    ntasm_ast.release(tree);
+    return 0;
+}
+
+// READ A MACHINE IR FILE BACK, then ask whether what came out is a Machine IR.
+// `text_length[0]` is the file's length and not len(text): the container
+// refuses any file whose stated size is not the size it was handed, and `text`
+// is a scratch buffer whose capacity is not that.
+//
+// `got` is bound to a local because rt_free's second argument must NAME a
+// buffer and a struct field is not a name -- the same E400 ntir-entry's unpack
+// hit, and the same fix nxo.nova:158-162 uses.
+fn unpack_mir(bytes:buf<u8>,text_length:buf<u64>,out:buf<u64>,out_count:u64,report:buf<u64>)->u64 {
+    if len(text_length)<1 || len(out)<8 { return 800; }
+    let size:u64=text_length[0];
+    if size==0 || size>len(bytes) { return 800; }
+    let view:buf<u8>=slice(bytes,0,size);
+    let r:ir_image.ReadResult=ir_image.read(ir_image.DOMAIN_MACHINE_IR(),view,out_count);
+    rt_free(runtime(),view);
+    let got:buf<u64>=r.words;
+    let count:u64=r.word_count;
+    let code:u64=r.code;
+    if code!=0 { rt_free(runtime(),got); return code; }
+    if count>len(out) { rt_free(runtime(),got); return 800; }
+    let mut i:u64=0;
+    while i<count { out[i]=got[i]; i=i+1; }
+    rt_free(runtime(),got);
+    // `count` is the file's TOTAL word count; machine_ir.verify wants the
+    // RECORD count, which is the image's own word 3. Same mirror of the same
+    // write-side bug, on the read side, and the two together are why a round
+    // trip can be self-consistent and still not be the same image.
+    let verdict:u64=machine_ir.verify(out,out[3],report);
+    if verdict!=0 { return verdict; }
+    report[0]=count;
+    return 0;
+}
+fn verdict(source:buf<u8>,report:buf<u64>)->u64 {
+    let mut lexed:ntasm_lexer.Result=ntasm_lexer.lex(source,1);
+    let mut lex_ok:bool=lexed.ok;
+    if (lex_ok==false) {
+        report[1]=lexed.diagnostic.code;report[2]=lexed.diagnostic.reason;
+        report[3]=lexed.diagnostic.span.line;report[4]=lexed.diagnostic.span.column;
+        ntasm_lexer.release(lexed);
+        report[0]=0;report[5]=0;report[6]=0;report[7]=0;
+        return 0;
+    }
+    ntasm_lexer.release(lexed);
+    let mut probe:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    report[0]=probe.node_count;report[1]=probe.code;report[2]=probe.reason;
+    report[3]=probe.line;report[4]=probe.column;
+    report[5]=probe.start;report[6]=probe.end;report[7]=probe.token_count;
+    ntasm_ast.release(probe);
+    return 0;
+}
+fn probe(source:buf<u8>,ntir_out:buf<u64>,ntir_count:u64,index:u64,report:buf<u64>)->u64 {
+    let mut tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree); return 800; }
+    let mut ntir_code:u64=ntir.build(source,tree,ntir_out,ntir_count);
+    if ntir_code!=0 { ntasm_ast.release(tree); return ntir_code; }
+    let mut nodes:u64=ntir_out[3];
+    let mut width:u64=0;let mut family:u64=0;
+    let mut kind:u64=0;let mut aux:u64=0;let mut source_index:u64=0;
+    let mut line:u64=0;let mut column:u64=0;let mut start:u64=0;
+    let mut end:u64=0;let mut first:u64=0;let mut last:u64=0;
+    let mut next:u64=0;let mut children:u64=0;
+    if index>=1 && index<=nodes {
+        let raw:buf<u64>=tree.node_words;
+        let at_n:u64=(index-1)*12;
+        width=register_widths.width(source,raw[at_n+6],raw[at_n+7]);
+        family=register_widths.family(source,raw[at_n+6],raw[at_n+7]);
+        kind=raw[at_n];aux=raw[at_n+11];source_index=raw[at_n+3];
+        line=raw[at_n+4];column=raw[at_n+5];
+        start=raw[at_n+6];end=raw[at_n+7];
+        first=raw[at_n+8];last=raw[at_n+9];next=raw[at_n+10];
+        children=ast_chain(tree,first);
+    }
+    let mut spaces:buf<u64>=alloc(runtime(),4);
+    let mut refusal:u64=pointer_spaces.check(source,tree,spaces);
+    report[0]=width;report[1]=family;report[2]=refusal;
+    report[3]=spaces[0];report[4]=spaces[1];report[5]=spaces[2];
+    report[6]=kind;report[7]=aux;report[8]=source_index;
+    report[9]=line;report[10]=column;report[11]=start;report[12]=end;
+    report[13]=first;report[14]=last;report[15]=next;report[16]=children;
+    if index>=1 && index<=nodes {
+        if machine_ir.admits(ntir_out,index) { report[17]=1; } else { report[17]=0; }
+        let at_i:u64=ntir.HEADER_WORDS()+(index-1)*ntir.NODE_WORDS();
+        report[18]=ntir_out[at_i];
+        report[19]=ntir_out[at_i+12];
+        report[20]=ntir_out[at_i+13];
+        report[21]=ntir_out[at_i+14];
+        report[22]=ntir_out[at_i+15];
+    } else {
+        report[17]=0;report[18]=0;report[19]=0;report[20]=0;report[21]=0;report[22]=0;
+    }
+    let mut versioned:buf<u64>=alloc(runtime(),4);
+    let mut version_verdict:u64=versions.check(source,tree,versioned);
+    report[23]=version_verdict;report[24]=versioned[0];report[25]=versioned[1];
+    report[26]=versioned[2];
+    rt_free(runtime(),versioned);
+    rt_free(runtime(),spaces);
+    ntasm_ast.release(tree);
+    return 0;
+}
+// The tables, the kind names and the opcode vocabulary, all read back. The kind
+// NAMES come back in the caller's buffer one byte per word and the return value
+// is their byte length, because a buf<u8> return does not survive the
+// cross-module export boundary of this bootstrap compiler (the same reason
+// parser.nova:81-82 has keyword_read_back).
+fn tables(out:buf<u64>,report:buf<u64>)->u64 {
+    let mut count:u64=machine_ir.KIND_COUNT();
+    let mut span:u64=10+count+machine_ir.OP_LIMIT();
+    // Two slots past the opcode table, for the NTIR record layout. The gate
+    // indexes the NTIR image the same way machine_ir does, and writing 8 and 16
+    // down in the harness is a second copy of a layout that would then
+    // disagree silently, on every field, at every record.
+    if len(report)<=span+4 { return 800; }
+    report[0]=count;
+    report[1]=machine_ir.KIND_BASE();
+    report[2]=machine_ir.FORMAT_MAJOR();
+    report[3]=machine_ir.FORMAT_MINOR();
+    report[4]=machine_ir.DOMAIN_BIT();
+    report[5]=machine_ir.HEADER_WORDS();
+    report[6]=machine_ir.NODE_WORDS();
+    report[7]=machine_ir.version_pin();
+    let mut i:u64=1;
+    while i<=count {
+        report[8+i]=machine_ir.kind_at(i);
+        i=i+1;
+    }
+    // The opcode vocabulary. op_arity(op) is min*16+max, so a non-zero answer
+    // is the module saying "that number is an opcode I know", and a gate that
+    // holds an opcode constant can tie it to the module instead of to a number
+    // it chose.
+    report[9+count]=machine_ir.OP_LIMIT();
+    let mut op:u64=0;
+    while op<=machine_ir.OP_LIMIT() {
+        report[10+count+op]=machine_ir.op_arity(op);
+        op=op+1;
+    }
+    report[span+1]=ntir.HEADER_WORDS();
+    report[span+2]=ntir.NODE_WORDS();
+    // THE NTIR KIND BASE AND COUNT, and the reason they are here. A harness
+    // that wants to say WHICH KIND an NTIR node is -- and the attribution
+    // census does, because it has to name the kinds it finds unclaimed -- has
+    // to turn the image's raw kind word into a table index, and that turn is
+    // `raw - KIND_BASE + 1`. Writing 1024 down in the harness would be a
+    // second copy of a constant ntir.nova owns, and a gate that classified
+    // nodes by a stale offset would report a kind no node has while every
+    // number it printed stayed plausible. Both words are ADDED: nothing above
+    // span+2 moves, and nothing below span is touched.
+    report[span+3]=ntir.KIND_BASE();
+    report[span+4]=ntir.KIND_COUNT();
+    let mut total:u64=0;
+    i=1;
+    while i<=count {
+        let mut name:buf<u8>=machine_ir.kind_text(i);
+        let mut size:u64=len(name);
+        let mut j:u64=0;
+        while j<size { out[total+j]=name[j]; j=j+1; }
+        out[total+size]=0;
+        total=total+size+1;
+        i=i+1;
+    }
+    return total;
+}
+// The length of the child chain starting at first, or 0 when the chain leaves
+// the tree. A chain longer than the tree returns 0, so a malformed tree gives
+// the caller an answer it can refuse rather than a count it would believe.
+fn ast_chain(tree:ntasm_ast.Tree,first:u64)->u64 {
+    if first==0 { return 0; }
+    let mut nodes:buf<u64>=tree.node_words;
+    let mut id:u64=first;
+    let mut count:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        count=count+1;
+        if count>tree.node_count { return 0; }
+        id=nodes[(id-1)*12+10];
+    }
+    return count;
+}

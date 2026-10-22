@@ -1,0 +1,10 @@
+module constant_types_entry;import ntasm_ast;import ntasm_parser;import types;import constant_types;import constant_eval;
+// Observation channel for the harness only: out[4+i] receives the value that
+// constant_eval produced for the i-th const declaration, written only after a
+// successful check and only when the caller supplied those extra words. The
+// evaluator reports a sign and a magnitude; the channel keeps the historical
+// two's complement u64 pattern so the harness still pins one number, and a
+// failure or a zero still writes zero.
+fn pattern(result:constant_eval.Value)->u64{if result.status!=0{return 0;}if result.negative{return 0-result.magnitude;}return result.magnitude;}
+fn values(tree:ntasm_ast.Tree,out:buf<u64>)->u64{let mut id:u64=1;let mut slot:u64=4;while id<=tree.node_count&&slot<len(out){let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if declaration.kind==10{let mut at:u64=declaration.first_child;let mut seen:u64=0;while at!=0&&seen<2{if at>tree.node_count{return 800;}let node:ntasm_ast.Node=ntasm_ast.node_at(tree,at);at=node.next_sibling;seen=seen+1;}if at!=0&&at<=tree.node_count{let result:constant_eval.Value=constant_eval.evaluate(tree,at);out[slot]=pattern(result);slot=slot+1;}}id=id+1;}return 0;}
+export fn main(source:buf<u8>,out:buf<u64>)->u64{if len(out)<4{return 800;}let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);if tree.ok==false{ntasm_ast.release(tree);return 800;}let scratch:buf<u64>=alloc(runtime(),4);let mut code:u64=types.check(source,tree,scratch);if code==0{code=constant_types.check(source,tree,out);}else if code!=800{out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3];}if code==0{code=values(tree,out);}rt_free(runtime(),scratch);ntasm_ast.release(tree);return code;}

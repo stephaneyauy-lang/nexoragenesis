@@ -1,0 +1,1533 @@
+; Candidate native Nova ABI2 runtime. No C, libc, imports or final-product claim.
+; Private entry returns NVRH0001 host descriptor. LoadImage + direct call only.
+format pe64
+abi efi_x64
+entry nv_start
+section .text rx
+nv_start:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+; Private native entry: RCX=EFI_BS*,RDX=root EFI_FILE*,R8=ConOut*.
+; Direct invocation after LoadImage, NEVER StartImage with this ABI.
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+lea rbx, [rip + nv_state]
+load64 rax, [rbx + 120]
+cmp rax, 0
+jne nv_start_bad
+cmp r12, 0
+je nv_start_bad
+mov rax, 0
+mov rdi, rbx
+mov rsi, 128
+nv_start_zero:
+store8 [rdi], rax
+add rdi, 1
+sub rsi, 1
+jne nv_start_zero
+store64 [rbx], r12
+store64 [rbx + 8], r13
+store64 [rbx + 16], r14
+lea r12, [rip + nv_ctx]
+mov rax, 2
+store64 [r12], rax
+mov rax, 48
+store64 [r12 + 8], rax
+mov rax, 0
+store64 [r12 + 16], rax
+store64 [r12 + 24], rax
+store64 [r12 + 32], rax
+lea rax, [rip + nv_table]
+store64 [r12 + 40], rax
+mov rcx, r12
+mov rdx, 4194304
+call nv_pool
+cmp rax, 0
+je nv_start_bad
+store64 [rbx + 64], rax
+mov rcx, r12
+mov rdx, 4096
+call nv_pool
+cmp rax, 0
+je nv_start_unwind
+store64 [rbx + 72], rax
+mov rax, 1
+store64 [rbx + 120], rax
+lea rax, [rip + nv_host]
+jmp nv_start_ret
+nv_start_unwind:
+mov rcx, r12
+load64 rdx, [rbx + 64]
+call nv_unpool
+mov rax, 0
+store64 [rbx + 64], rax
+nv_start_bad:
+mov rax, 0
+jmp nv_start_ret
+nv_start_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_err:
+load64 rax, [rcx + 16]
+cmp rax, 0
+jne nv_err_done
+store64 [rcx + 16], rdx
+nv_err_done:
+mov rax, 0
+ret
+nv_clear:
+mov rax, 0
+store64 [rcx + 16], rax
+store64 [rcx + 24], rax
+store64 [rcx + 32], rax
+ret
+
+nv_pool:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+; Internal zeroed payload,16-byte header, same128MiB platform bound.
+mov r12, rcx
+mov r13, rdx
+cmp r13, 134217713
+jae nv_pool_bound
+load64 rbx, [rcx + 40]
+load64 rbx, [rbx + 112]
+load64 r14, [rbx]
+mov rax, 0
+store64 [rsp + 32], rax
+mov rcx, 2
+lea rdx, [r13 + 16]
+lea r8, [rsp + 32]
+load64 rax, [r14 + 64]
+call rax
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jae nv_pool_bad
+load64 rax, [rsp + 32]
+cmp rax, 0
+je nv_pool_bad
+mov rdx, 0x4e564d454d303032
+store64 [rax], rdx
+store64 [rax + 8], r13
+add rax, 16
+mov rdi, rax
+mov rsi, r13
+mov rdx, 0
+cmp rsi, 0
+je nv_pool_count
+; Payload zero: store64 words while >=8 bytes left, then 0..7 byte tail.
+nv_pool_zero:
+cmp rsi, 8
+jae nv_pool_zero_word
+cmp rsi, 0
+je nv_pool_count
+nv_pool_zero_tail:
+store8 [rdi], rdx
+add rdi, 1
+sub rsi, 1
+jne nv_pool_zero_tail
+jmp nv_pool_count
+nv_pool_zero_word:
+store64 [rdi], rdx
+add rdi, 8
+sub rsi, 8
+jmp nv_pool_zero
+nv_pool_count:
+load64 rdx, [rbx + 48]
+add rdx, 1
+store64 [rbx + 48], rdx
+jmp nv_pool_ret
+nv_pool_bound:
+mov rcx, r12
+mov rdx, 4
+call nv_err
+jmp nv_pool_ret
+nv_pool_bad:
+mov rcx, r12
+mov rdx, 6
+call nv_err
+jmp nv_pool_ret
+nv_pool_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_unpool:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+; Cleanup intentionally ignores ctx.error.
+mov r12, rcx
+mov r13, rdx
+cmp r13, 0
+je nv_unpool_ok
+sub r13, 16
+load64 rax, [r13]
+mov rdx, 0x4e564d454d303032
+cmp rax, rdx
+jne nv_unpool_bad
+load64 rbx, [r12 + 40]
+load64 rbx, [rbx + 112]
+mov rax, 0
+store64 [r13], rax
+mov rcx, r13
+load64 rax, [rbx]
+load64 rax, [rax + 72]
+call rax
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jae nv_unpool_bad
+load64 rax, [rbx + 48]
+sub rax, 1
+store64 [rbx + 48], rax
+nv_unpool_ok:
+mov rax, 0
+jmp nv_unpool_ret
+nv_unpool_bad:
+lea rbx, [rip + nv_state]
+mov rax, 1
+store64 [rbx + 80], rax
+jmp nv_unpool_ret
+nv_unpool_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_buf:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+; RCX=ctx,RDX=handle -> pointer descriptor or0.
+mov r12, rcx
+mov r13, rdx
+load64 rbx, [r12 + 40]
+load64 rbx, [rbx + 112]
+mov rax, 0xffffffff
+and rdx, rax
+cmp rdx, 0
+je nv_buf_bad
+cmp rdx, 65537
+jae nv_buf_bad
+sub rdx, 1
+shl rdx, 6
+load64 rax, [rbx + 64]
+cmp rax, 0
+je nv_buf_bad
+add rax, rdx
+load64 rdx, [rax + 40]
+and rdx, 1
+je nv_buf_bad
+mov rdx, r13
+shr rdx, 32
+load64 r8, [rax + 24]
+cmp rdx, r8
+jne nv_buf_bad
+jmp nv_buf_ret
+nv_buf_bad:
+mov rcx, r12
+mov rdx, 7
+call nv_err
+jmp nv_buf_ret
+nv_buf_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_add:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+; RCX=ctx,RDX=pointer to descriptor template (64 bytes).
+mov r12, rcx
+mov r13, rdx
+load64 rbx, [rcx + 40]
+load64 rbx, [rbx + 112]
+load64 r14, [rbx + 24]
+mov rax, 0xffffffff
+cmp r14, rax
+jae nv_add_full
+load64 r15, [rbx + 40]
+mov rsi, 65536
+nv_add_next:
+mov rax, r15
+shl rax, 6
+load64 rdi, [rbx + 64]
+add rdi, rax
+load64 rax, [rdi + 40]
+and rax, 1
+je nv_add_found
+add r15, 1
+and r15, 65535
+sub rsi, 1
+jne nv_add_next
+jmp nv_add_full
+nv_add_found:
+mov rsi, 0
+nv_add_copy:
+load64 rax, [r13 + rsi * 8]
+store64 [rdi + rsi * 8], rax
+add rsi, 1
+cmp rsi, 8
+jb nv_add_copy
+add r14, 1
+store64 [rbx + 24], r14
+store64 [rdi + 24], r14
+load64 rax, [rdi + 40]
+or rax, 1
+store64 [rdi + 40], rax
+mov rax, r15
+add rax, 1
+and rax, 65535
+store64 [rbx + 40], rax
+mov rax, r14
+shl rax, 32
+add r15, 1
+or rax, r15
+jmp nv_add_ret
+nv_add_full:
+mov rcx, r12
+mov rdx, 13
+call nv_err
+jmp nv_add_ret
+nv_add_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_resolve:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+mov r15, r9
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_resolve_zero
+mov rdi, 65536
+nv_resolve_next:
+mov rcx, r12
+mov rdx, r13
+call nv_buf
+cmp rax, 0
+je nv_resolve_zero
+mov rbx, rax
+load64 rax, [rbx + 8]
+cmp rax, r14
+jb nv_resolve_bounds
+sub rax, r14
+mov rdx, 0x7fffffffffffffff
+and rdx, r15
+cmp rax, rdx
+jb nv_resolve_bounds
+mov rax, r15
+shr rax, 63
+cmp rax, 0
+je nv_resolve_parent
+load64 rax, [rbx + 40]
+and rax, 4
+je nv_resolve_readonly
+nv_resolve_parent:
+load64 r13, [rbx + 32]
+cmp r13, 0
+je nv_resolve_base
+load64 rax, [rbx + 16]
+mov rdx, -1
+sub rdx, r14
+cmp rdx, rax
+jb nv_resolve_bounds
+add r14, rax
+sub rdi, 1
+jne nv_resolve_next
+mov rcx, r12
+mov rdx, 7
+call nv_err
+jmp nv_resolve_ret
+nv_resolve_base:
+load64 rax, [rbx]
+cmp rax, 0
+je nv_resolve_ret
+add rax, r14
+jmp nv_resolve_ret
+nv_resolve_bounds:
+mov rcx, r12
+mov rdx, 4
+call nv_err
+jmp nv_resolve_ret
+nv_resolve_readonly:
+mov rcx, r12
+mov rdx, 9
+call nv_err
+jmp nv_resolve_ret
+nv_resolve_zero:
+mov rax, 0
+jmp nv_resolve_ret
+nv_resolve_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_alloc:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 120
+mov r12, rcx
+mov r13, rdx
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_alloc_zero
+cmp r13, 67108865
+jae nv_alloc_bounds
+load64 rbx, [r12 + 40]
+load64 rbx, [rbx + 112]
+load64 rax, [rbx + 32]
+mov rdx, 268435456
+sub rdx, r13
+cmp rdx, rax
+jb nv_alloc_bounds
+mov rcx, r12
+mov rdx, r13
+cmp rdx, 0
+jne nv_alloc_pool
+mov rdx, 1
+nv_alloc_pool:
+call nv_pool
+cmp rax, 0
+je nv_alloc_ret
+mov r14, rax
+lea rdi, [rsp + 32]
+mov rsi, 8
+mov rax, 0
+nv_alloc_tzero:
+store64 [rdi], rax
+add rdi, 8
+sub rsi, 1
+jne nv_alloc_tzero
+
+store64 [rsp + 32], r14
+store64 [rsp + 40], r13
+mov rax, 6
+store64 [rsp + 72], rax
+mov rcx, r12
+lea rdx, [rsp + 32]
+call nv_add
+cmp rax, 0
+je nv_alloc_unwind
+load64 rdx, [rbx + 32]
+add rdx, r13
+store64 [rbx + 32], rdx
+jmp nv_alloc_ret
+nv_alloc_unwind:
+mov rcx, r12
+mov rdx, r14
+call nv_unpool
+mov rax, 0
+jmp nv_alloc_ret
+nv_alloc_bounds:
+mov rcx, r12
+mov rdx, 4
+call nv_err
+jmp nv_alloc_ret
+nv_alloc_zero:
+mov rax, 0
+jmp nv_alloc_ret
+nv_alloc_ret:
+add rsp, 120
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_borrow:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 120
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+mov r15, r9
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_borrow_zero
+cmp r13, 0
+jne nv_borrow_bounds
+cmp r14, 0
+jne nv_borrow_arg
+nv_borrow_bounds:
+cmp r14, 67108865
+jae nv_borrow_badbound
+lea rdi, [rsp + 32]
+mov rsi, 8
+mov rax, 0
+nv_borrow_tzero:
+store64 [rdi], rax
+add rdi, 8
+sub rsi, 1
+jne nv_borrow_tzero
+
+store64 [rsp + 32], r13
+store64 [rsp + 40], r14
+mov rax, 0
+cmp r15, 0
+je nv_borrow_flags
+mov rax, 4
+nv_borrow_flags:
+store64 [rsp + 72], rax
+mov rcx, r12
+lea rdx, [rsp + 32]
+call nv_add
+jmp nv_borrow_ret
+nv_borrow_arg:
+mov rcx, r12
+mov rdx, 10
+call nv_err
+jmp nv_borrow_ret
+nv_borrow_badbound:
+mov rcx, r12
+mov rdx, 4
+call nv_err
+jmp nv_borrow_ret
+nv_borrow_zero:
+mov rax, 0
+jmp nv_borrow_ret
+nv_borrow_ret:
+add rsp, 120
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_free:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_free_zero
+call nv_buf
+cmp rax, 0
+je nv_free_ret
+mov rdi, rax
+load64 rax, [rdi + 8]
+cmp r14, rax
+jne nv_free_bounds
+load64 rax, [rdi + 40]
+and rax, 2
+je nv_free_mark
+load64 rbx, [r12 + 40]
+load64 rbx, [rbx + 112]
+load64 rax, [rbx + 32]
+sub rax, r14
+store64 [rbx + 32], rax
+mov rcx, r12
+load64 rdx, [rdi]
+call nv_unpool
+nv_free_mark:
+mov rax, 0
+store64 [rdi], rax
+store64 [rdi + 40], rax
+jmp nv_free_ret
+nv_free_bounds:
+mov rcx, r12
+mov rdx, 4
+call nv_err
+jmp nv_free_ret
+nv_free_zero:
+mov rax, 0
+jmp nv_free_ret
+nv_free_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_slice:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 120
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+mov r15, r9
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_slice_zero
+call nv_buf
+cmp rax, 0
+je nv_slice_ret
+mov rbx, rax
+load64 rax, [rbx + 8]
+cmp rax, r14
+jb nv_slice_bounds
+sub rax, r14
+cmp rax, r15
+jb nv_slice_bounds
+mov rcx, r12
+mov rdx, r13
+mov r8, r14
+mov r9, r15
+call nv_resolve
+cmp rax, 0
+jne nv_slice_add
+cmp r15, 0
+jne nv_slice_ret
+nv_slice_add:
+lea rdi, [rsp + 32]
+mov rsi, 8
+mov rax, 0
+nv_slice_tzero:
+store64 [rdi], rax
+add rdi, 8
+sub rsi, 1
+jne nv_slice_tzero
+
+store64 [rsp + 40], r15
+store64 [rsp + 48], r14
+store64 [rsp + 64], r13
+load64 rax, [rbx + 40]
+and rax, 4
+store64 [rsp + 72], rax
+mov rcx, r12
+lea rdx, [rsp + 32]
+call nv_add
+jmp nv_slice_ret
+nv_slice_bounds:
+mov rcx, r12
+mov rdx, 4
+call nv_err
+jmp nv_slice_ret
+nv_slice_zero:
+mov rax, 0
+jmp nv_slice_ret
+nv_slice_ret:
+add rsp, 120
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_length:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_length_zero
+call nv_buf
+cmp rax, 0
+je nv_length_ret
+load64 r14, [rax + 8]
+mov rcx, r12
+mov rdx, r13
+mov r8, 0
+mov r9, 0
+call nv_resolve
+cmp rax, 0
+jne nv_length_ok
+cmp r14, 0
+jne nv_length_zero
+nv_length_ok:
+mov rax, r14
+jmp nv_length_ret
+nv_length_zero:
+mov rax, 0
+jmp nv_length_ret
+nv_length_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_literal:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+mov r15, r9
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_literal_zero
+cmp r13, 0
+jne nv_literal_alloc
+cmp r14, 0
+jne nv_literal_arg
+nv_literal_alloc:
+mov rcx, r12
+mov rdx, r14
+call nv_alloc
+cmp rax, 0
+je nv_literal_ret
+mov rsi, rax
+mov rcx, r12
+mov rdx, rsi
+call nv_buf
+mov rdi, rax
+load64 rbx, [rdi]
+mov r8, 0
+nv_literal_copy:
+cmp r8, r14
+jae nv_literal_flags
+load8 rax, [r13 + r8 * 1]
+store8 [rbx + r8 * 1], rax
+add r8, 1
+jmp nv_literal_copy
+nv_literal_flags:
+mov rax, 3
+cmp r15, 0
+je nv_literal_store
+or rax, 4
+nv_literal_store:
+store64 [rdi + 40], rax
+mov rax, rsi
+jmp nv_literal_ret
+nv_literal_arg:
+mov rcx, r12
+mov rdx, 10
+call nv_err
+jmp nv_literal_ret
+nv_literal_zero:
+mov rax, 0
+jmp nv_literal_ret
+nv_literal_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_copy:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+mov r15, r9
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_copy_zero
+mov r8, 0
+mov r9, 0x8000000000000000
+or r9, r15
+call nv_resolve
+mov rdi, rax
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_copy_zero
+mov rcx, r12
+mov rdx, r14
+mov r8, 0
+mov r9, r15
+call nv_resolve
+mov rsi, rax
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_copy_zero
+mov rbx, 0
+cmp rdi, rsi
+jb nv_copy_forward
+je nv_copy_done
+mov rax, rdi
+sub rax, rsi
+cmp rax, r15
+jae nv_copy_forward
+mov rbx, r15
+nv_copy_backward:
+cmp rbx, 0
+je nv_copy_done
+sub rbx, 1
+load8 rax, [rsi + rbx * 1]
+store8 [rdi + rbx * 1], rax
+jmp nv_copy_backward
+nv_copy_forward:
+cmp rbx, r15
+jae nv_copy_done
+load8 rax, [rsi + rbx * 1]
+store8 [rdi + rbx * 1], rax
+add rbx, 1
+jmp nv_copy_forward
+nv_copy_done:
+mov rax, r15
+jmp nv_copy_ret
+nv_copy_zero:
+mov rax, 0
+jmp nv_copy_ret
+nv_copy_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_path:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+cmp r14, 0
+je nv_path_arg
+cmp r14, 4097
+jae nv_path_arg
+mov r8, 0
+mov r9, r14
+call nv_resolve
+cmp rax, 0
+je nv_path_ret
+mov rsi, rax
+mov rdi, 0
+nv_path_check:
+load8 rax, [rsi + rdi * 1]
+cmp rax, 0
+je nv_path_arg
+cmp rax, 128
+jae nv_path_io
+add rdi, 1
+cmp rdi, r14
+jb nv_path_check
+mov rcx, r12
+mov rdx, r14
+add rdx, 1
+shl rdx, 1
+call nv_pool
+cmp rax, 0
+je nv_path_ret
+mov r15, rax
+mov rdi, 0
+nv_path_utf16:
+load8 rax, [rsi + rdi * 1]
+store16 [r15 + rdi * 2], rax
+add rdi, 1
+cmp rdi, r14
+jb nv_path_utf16
+mov rax, 0
+store16 [r15 + rdi * 2], rax
+mov rax, r15
+jmp nv_path_ret
+nv_path_io:
+mov rcx, r12
+mov rdx, 8
+call nv_err
+jmp nv_path_ret
+nv_path_arg:
+mov rcx, r12
+mov rdx, 10
+call nv_err
+jmp nv_path_ret
+nv_path_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_file:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+load64 rbx, [r12 + 40]
+load64 rbx, [rbx + 112]
+mov rax, 0xffffffff
+and rdx, rax
+cmp rdx, 0
+je nv_file_bad
+cmp rdx, 129
+jae nv_file_bad
+sub rdx, 1
+shl rdx, 5
+load64 rax, [rbx + 72]
+cmp rax, 0
+je nv_file_bad
+add rax, rdx
+load64 rdx, [rax]
+cmp rdx, 0
+je nv_file_bad
+mov rdx, r13
+shr rdx, 32
+load64 r8, [rax + 8]
+cmp rdx, r8
+jne nv_file_bad
+jmp nv_file_ret
+nv_file_bad:
+mov rcx, r12
+mov rdx, 7
+call nv_err
+jmp nv_file_ret
+nv_file_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_open_read:
+mov r9, 0
+jmp nv_open
+nv_open_new:
+mov r9, 1
+jmp nv_open
+
+nv_open:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 72
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+mov r15, r9
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_open_zero
+load64 rbx, [r12 + 40]
+load64 rbx, [rbx + 112]
+load64 rax, [rbx + 24]
+mov rdx, 0xffffffff
+cmp rax, rdx
+jae nv_open_runtime
+load64 rbp, [rbx + 72]
+mov rdi, 0
+nv_open_slot:
+load64 rax, [rbp]
+cmp rax, 0
+je nv_open_path
+add rbp, 32
+add rdi, 1
+cmp rdi, 128
+jb nv_open_slot
+jmp nv_open_runtime
+nv_open_path:
+mov rcx, r12
+mov rdx, r13
+mov r8, r14
+call nv_path
+cmp rax, 0
+je nv_open_ret
+mov rsi, rax
+load64 rax, [rbx + 8]
+cmp rax, 0
+je nv_open_pathio
+mov rax, 0
+store64 [rsp + 40], rax
+store64 [rsp + 32], rax
+cmp r15, 0
+je nv_open_actual
+load64 rcx, [rbx + 8]
+lea rdx, [rsp + 40]
+mov r8, rsi
+mov r9, 1
+load64 rax, [rcx + 8]
+call rax
+mov rdx, 0x800000000000000e
+cmp rax, rdx
+je nv_open_actual
+load64 rcx, [rsp + 40]
+cmp rcx, 0
+je nv_open_pathio
+load64 rax, [rcx + 16]
+call rax
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jb nv_open_pathio
+mov rax, 1
+store64 [rbx + 80], rax
+jmp nv_open_pathio
+nv_open_actual:
+mov rax, 0
+store64 [rsp + 40], rax
+store64 [rsp + 32], rax
+load64 rcx, [rbx + 8]
+lea rdx, [rsp + 40]
+mov r8, rsi
+mov r9, 1
+cmp r15, 0
+je nv_open_call
+mov r9, 0x8000000000000003
+nv_open_call:
+load64 rax, [rcx + 8]
+call rax
+mov r14, rax
+mov rcx, r12
+mov rdx, rsi
+call nv_unpool
+mov rdx, 0x8000000000000000
+cmp r14, rdx
+jae nv_open_io
+load64 rax, [rsp + 40]
+cmp rax, 0
+je nv_open_io
+store64 [rbp], rax
+load64 rax, [rbx + 24]
+add rax, 1
+store64 [rbx + 24], rax
+store64 [rbp + 8], rax
+store64 [rbp + 16], r15
+shl rax, 32
+add rdi, 1
+or rax, rdi
+load64 rdx, [rbx + 56]
+add rdx, 1
+store64 [rbx + 56], rdx
+jmp nv_open_ret
+nv_open_pathio:
+mov rcx, r12
+mov rdx, rsi
+call nv_unpool
+nv_open_io:
+mov rcx, r12
+mov rdx, 8
+call nv_err
+jmp nv_open_ret
+nv_open_runtime:
+mov rcx, r12
+mov rdx, 6
+call nv_err
+jmp nv_open_ret
+nv_open_zero:
+mov rax, 0
+jmp nv_open_ret
+nv_open_ret:
+add rsp, 72
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_read:
+mov r10, 0
+jmp nv_io
+nv_write:
+mov r10, 1
+jmp nv_io
+
+nv_io:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+mov r15, r9
+mov rbp, r10
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_io_zero
+call nv_file
+cmp rax, 0
+je nv_io_ret
+mov rdi, rax
+load64 rax, [rdi + 16]
+cmp rbp, rax
+jne nv_io_bad
+mov rcx, r12
+mov rdx, r14
+mov r8, 0
+mov r9, r15
+cmp rbp, 0
+jne nv_io_resolve
+mov rax, 0x8000000000000000
+or r9, rax
+nv_io_resolve:
+call nv_resolve
+mov rsi, rax
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_io_zero
+cmp r15, 0
+je nv_io_zero
+store64 [rsp + 32], r15
+load64 rcx, [rdi]
+lea rdx, [rsp + 32]
+mov r8, rsi
+load64 rax, [rcx + 32]
+cmp rbp, 0
+je nv_io_call
+load64 rax, [rcx + 40]
+nv_io_call:
+call rax
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jae nv_io_bad
+load64 rax, [rsp + 32]
+cmp r15, rax
+jb nv_io_bad
+cmp rbp, 0
+je nv_io_ret
+cmp r15, rax
+jne nv_io_bad
+jmp nv_io_ret
+nv_io_bad:
+mov rcx, r12
+mov rdx, 8
+call nv_err
+jmp nv_io_ret
+nv_io_zero:
+mov rax, 0
+jmp nv_io_ret
+nv_io_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_close:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_close_zero
+call nv_file
+cmp rax, 0
+je nv_close_ret
+mov rdi, rax
+load64 rcx, [rdi]
+mov rax, 0
+store64 [rdi], rax
+load64 rax, [rcx + 16]
+call rax
+load64 rbx, [r12 + 40]
+load64 rbx, [rbx + 112]
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jae nv_close_bad
+load64 rax, [rbx + 56]
+sub rax, 1
+store64 [rbx + 56], rax
+nv_close_zero:
+mov rax, 0
+jmp nv_close_ret
+nv_close_bad:
+mov rax, 1
+store64 [rbx + 80], rax
+mov rcx, r12
+mov rdx, 8
+call nv_err
+jmp nv_close_ret
+nv_close_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_diag:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+mov r12, rcx
+mov r13, rdx
+mov r14, r8
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_diag_zero
+mov r8, 0
+mov r9, r14
+call nv_resolve
+mov rsi, rax
+load64 rax, [r12 + 16]
+cmp rax, 0
+jne nv_diag_zero
+cmp r14, 0
+je nv_diag_zero
+load64 rbx, [r12 + 40]
+load64 rbx, [rbx + 112]
+load64 rcx, [rbx + 16]
+cmp rcx, 0
+je nv_diag_bad
+store64 [rsp + 32], r14
+lea rdx, [rsp + 32]
+mov r8, rsi
+load64 rax, [rcx + 40]
+call rax
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jae nv_diag_bad
+load64 rax, [rsp + 32]
+cmp rax, r14
+jne nv_diag_bad
+nv_diag_zero:
+mov rax, 0
+jmp nv_diag_ret
+nv_diag_bad:
+mov rcx, r12
+mov rdx, 8
+call nv_err
+jmp nv_diag_ret
+nv_diag_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+nv_destroy:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+; Ignores ctx.error and unwinds every owned object exactly once.
+mov r12, rcx
+load64 rbx, [r12 + 40]
+cmp rbx, 0
+je nv_destroy_ok
+load64 rbx, [rbx + 112]
+load64 rdi, [rbx + 64]
+mov rsi, 0
+cmp rdi, 0
+je nv_destroy_files
+nv_destroy_buffers:
+load64 rax, [rdi + 40]
+and rax, 3
+cmp rax, 3
+jne nv_destroy_bnext
+mov rcx, r12
+load64 rdx, [rdi]
+call nv_unpool
+nv_destroy_bnext:
+mov rax, 0
+store64 [rdi], rax
+store64 [rdi + 40], rax
+add rdi, 64
+add rsi, 1
+cmp rsi, 65536
+jb nv_destroy_buffers
+nv_destroy_files:
+load64 rdi, [rbx + 72]
+mov rsi, 0
+cmp rdi, 0
+je nv_destroy_tables
+nv_destroy_fnext:
+load64 rcx, [rdi]
+cmp rcx, 0
+je nv_destroy_fadvance
+mov rax, 0
+store64 [rdi], rax
+load64 rax, [rcx + 16]
+call rax
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jae nv_destroy_fbad
+load64 rax, [rbx + 56]
+sub rax, 1
+store64 [rbx + 56], rax
+jmp nv_destroy_fadvance
+nv_destroy_fbad:
+mov rax, 1
+store64 [rbx + 80], rax
+nv_destroy_fadvance:
+add rdi, 32
+add rsi, 1
+cmp rsi, 128
+jb nv_destroy_fnext
+nv_destroy_tables:
+mov rcx, r12
+load64 rdx, [rbx + 64]
+call nv_unpool
+mov rcx, r12
+load64 rdx, [rbx + 72]
+call nv_unpool
+mov rax, 0
+store64 [rbx + 64], rax
+store64 [rbx + 72], rax
+store64 [rbx + 32], rax
+store64 [rbx + 120], rax
+mov rdi, r12
+mov rsi, 48
+nv_destroy_ctx:
+store8 [rdi], rax
+add rdi, 1
+sub rsi, 1
+jne nv_destroy_ctx
+load64 rax, [rbx + 80]
+cmp rax, 0
+jne nv_destroy_bad
+load64 rax, [rbx + 48]
+cmp rax, 0
+jne nv_destroy_bad
+load64 rax, [rbx + 56]
+cmp rax, 0
+jne nv_destroy_bad
+nv_destroy_ok:
+mov rax, 1
+jmp nv_destroy_ret
+nv_destroy_bad:
+mov rax, 0
+jmp nv_destroy_ret
+nv_destroy_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+section .rdata r
+nv_host:
+qword 0x313030304852564e, 1, 64, addr(nv_ctx)
+qword addr(nv_destroy), addr(nv_state)
+qword addr(nv_borrow), addr(nv_clear)
+section .data rw
+nv_ctx:
+zero 48
+nv_state:
+zero 128
+nv_table:
+qword 2, 128
+qword addr(nv_alloc), addr(nv_free)
+qword addr(nv_open_read), addr(nv_open_new)
+qword addr(nv_read), addr(nv_write)
+qword addr(nv_close), addr(nv_diag)
+qword addr(nv_resolve), addr(nv_slice)
+qword addr(nv_length), addr(nv_literal)
+qword addr(nv_state), addr(nv_copy)
+

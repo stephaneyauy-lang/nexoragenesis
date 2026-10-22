@@ -1,0 +1,175 @@
+module invalidation_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import abi;
+import call_contracts;
+
+// Entry point for the lot-24 invalidation gate.
+//
+// The point of this entry is that ONE compiled image answers both the QUERY
+// and the GATE that consumes it, so the two answers are comparable rather than
+// two stories about the same program. `abi.fact_validity` says which of the
+// caller's own facts still hold at a call; `call_contracts.check` says whether
+// the call was proved. A gate that only asked the second would pass a stale
+// credit for ever, because a stale credit is a 0 in the count and a 0 is what a
+// correct program produces too.
+//
+// out[4] SELECTOR
+//   1  abi.fact_validity at one call. out[0] facts examined, out[1] facts
+//      dropped because a write destroyed them, out[2] facts still live,
+//      out[3] 1 when the walk could not finish. Returns 367 and writes NOTHING
+//      in that last case, so a refusal and a caller that carried no fact are
+//      not the same observation.
+//   2  call_contracts.check over the whole module. This is the pipeline
+//      verdict: 0 proved, 326 the call was not proved.
+//   3  abi.fact_is_live on the first predicate of the caller's chosen set.
+//   4  one word per predicate of that set, from out[7], holding each
+//      predicate's liveness. Two facts are two words, so a set where one
+//      survives and one dies is legible in a single run.
+//
+// out[5] CALL ORDINAL, zero-based among the call nodes in source order, so a
+//      module with several calls can be asked about the one under test rather
+//      than whichever happens to come first. Absent (out[5]==0 and out[6]==0)
+//      means the first call.
+// out[6] SET KIND, 22 for requires and 23 for ensures; 22 when absent.
+//
+// The caller of the chosen call is the declaration whose source span contains
+// it, found the way call_contracts.check finds it, so the two agree on which
+// function is being talked about.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<5 { return 800; }
+    let selector:u64=out[4];
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false {
+        ntasm_ast.release(tree);
+        return 800;
+    }
+    let ordinal:u64=out[5];
+    let mut kind:u64=out[6];
+    if kind!=23 { kind=22; }
+    if selector==2 {
+        let code:u64=call_contracts.check(source,tree,out);
+        ntasm_ast.release(tree);
+        return code;
+    }
+    let call_id:u64=call_at(tree,ordinal);
+    if call_id==0 {
+        ntasm_ast.release(tree);
+        return 800;
+    }
+    let caller_id:u64=caller_of(tree,call_id);
+    if caller_id==0 {
+        ntasm_ast.release(tree);
+        return 800;
+    }
+    if selector==1 {
+        let code:u64=abi.fact_validity(source,tree,caller_id,call_id,out);
+        ntasm_ast.release(tree);
+        return code;
+    }
+    let set:u64=set_of(tree,caller_id,kind);
+    if set==0 {
+        ntasm_ast.release(tree);
+        return 800;
+    }
+    let predicates:ntasm_ast.Node=ntasm_ast.node_at(tree,set);
+    let mut pred_id:u64=predicates.first_child;
+    let mut index:u64=0;
+    while pred_id!=0 {
+        if pred_id>tree.node_count {
+            ntasm_ast.release(tree);
+            return 800;
+        }
+        let p:ntasm_ast.Node=ntasm_ast.node_at(tree,pred_id);
+        if p.kind==33 {
+            if selector==3 && index==0 {
+                let live:u64=abi.fact_is_live(source,tree,caller_id,call_id,
+                                              pred_id);
+                ntasm_ast.release(tree);
+                return live;
+            }
+            if selector==4 {
+                let at:u64=7*(index+1);
+                if at+1>len(out) {
+                    ntasm_ast.release(tree);
+                    return 800;
+                }
+                out[at]=abi.fact_is_live(source,tree,caller_id,call_id,pred_id);
+            }
+            index=index+1;
+        }
+        pred_id=p.next_sibling;
+    }
+    if selector==3 {
+        // The set has no predicate at all, so there is no fact to answer about.
+        ntasm_ast.release(tree);
+        return 800;
+    }
+    if selector==4 {
+        // The COUNT is seven words past the first row, the same discipline
+        // abi.obligations uses and for the same reason: a row written at
+        // out[0] would sit where a reader expects the number of facts.
+        if 7*(index+1)+1>len(out) {
+            ntasm_ast.release(tree);
+            return 800;
+        }
+        out[0]=index;
+        out[1]=0;
+    }
+    ntasm_ast.release(tree);
+    return 0;
+}
+
+// The ordinal-th call node (kind 28, or kind 35 with aux 1) in source order,
+// 0 when the tree holds fewer. The kind test is the one call_contracts.is_call
+// applies, restated here because that function is private to its file.
+fn call_at(tree:ntasm_ast.Tree,ordinal:u64)->u64 {
+    let mut id:u64=1;
+    let mut seen:u64=0;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==28 || (n.kind==35 && n.aux==1) {
+            if seen==ordinal { return id; }
+            seen=seen+1;
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// The function or import whose source span contains the node `id`. 0 when no
+// declaration does, which is a module whose call is not in any body.
+fn caller_of(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let at:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let mut d:u64=1;
+    let mut answer:u64=0;
+    while d<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,d);
+        if n.kind==18 && n.start<=at.start && at.end<=n.end { answer=d; }
+        d=d+1;
+    }
+    return answer;
+}
+
+// The requires (22) or ensures (23) set of a declaration, 0 when it spells
+// none. The set is the kind-K node's only child and that child carries kind K
+// again, the shape abi.fact_set_id reads from its side of the wall.
+fn set_of(tree:ntasm_ast.Tree,id:u64,kind:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let decl:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let mut c:u64=decl.first_child;
+    while c!=0 {
+        if c>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,c);
+        if n.kind==kind {
+            if n.first_child==0 || n.first_child!=n.last_child { return 0; }
+            if n.first_child>tree.node_count { return 0; }
+            if ntasm_ast.node_at(tree,n.first_child).kind!=kind { return 0; }
+            return n.first_child;
+        }
+        c=n.next_sibling;
+    }
+    return 0;
+}

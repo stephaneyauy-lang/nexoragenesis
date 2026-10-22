@@ -1,0 +1,144 @@
+module x64_lower_nxo_function_bodies_entry;
+import ntasm_ast;import ntasm_parser;import ntasm_nxo;import ntasm_nxo_pe;import ntasm_pe;
+import x64_lower_nxo;import x64_lower_control;import abi;
+
+// Gate entry for the general multi-function body producer.
+//   mode 0: build_function_bodies. out = [nxo_size:u64][pe_size:u64][nxo][pe].
+//   mode 1: lower_wide over every node id. out = [length:u64][raw bytes].
+//   mode 2: lower_wide_range over (1,tree.node_count). out = [length:u64][raw bytes].
+//   mode 3: lower_wide_range over the empty range (1,0). Must refuse with 800.
+//   mode 4: build_framed_functions. Same output shape as mode 0.
+//   mode 5: as mode 0, object bytes only, no PE conversion.
+//   mode 6: as mode 4, object bytes only, no PE conversion.
+//     out = [nxo_size:u64][0:u64][nxo]. This is the shape a program with no
+//     exported main can reach at all: ntasm_nxo_pe.convert answers 803 for an
+//     object whose entry is 0, which is the entry the C reference writes for
+//     such a program (object_build.c:343-351), and nt_object_materialize
+//     refuses the same object with 800. A gate that can only see the object
+//     through the PE route therefore cannot observe an entryless object AT
+//     ALL, and the 803 it reports is its own route's answer, not the
+//     producer's. Modes 0 and 4 are unchanged.
+// Every mode is transactional: the output buffer is untouched on any failure.
+
+// Two words per declaration ordinal and parameter ordinal, fifteen parameters
+// and sixty four declarations, which is the nx64-abi-v0 capacity abi.nova
+// checks. abi.nova is the only owner of the register assignment, so the table is
+// filled here and handed to the producer: word 0 is the architectural GPR of the
+// default incoming register from abi.argument_register, word 1 the physical
+// family of an explicit @binding from abi.bound_family. The ordinals follow
+// abi.declaration_at, so a function and an import share one numbering. No gate
+// that compiles x64_lower_nxo.nova lists abi.nova among its compiler inputs, so
+// the dependency is injected here rather than imported into the producer.
+fn abi_table(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false||len(out)<1920{return 800;}
+    let mut clear:u64=0;
+    while clear<1920 {out[clear]=0;clear=clear+1;}
+    let mut ordinal:u64=0;let mut id:u64=1;
+    while id<=tree.node_count&&ordinal<64 {
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if node.kind==18||node.kind==9 {
+            let declaration:u64=abi.declaration_at(tree,ordinal);
+            if declaration==0{return 800;}
+            let mut p:u64=0;let mut c:u64=node.first_child;
+            while c!=0&&p<15 {
+                let cn:ntasm_ast.Node=ntasm_ast.node_at(tree,c);
+                if cn.kind==19 {
+                    let at:u64=(ordinal*15+p)*2;
+                    out[at]=abi.argument_register(source,tree,declaration,p);
+                    out[at+1]=abi.bound_family(source,tree,declaration,p);
+                    p=p+1;
+                }
+                c=cn.next_sibling;
+            }
+            ordinal=ordinal+1;
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// Serialize the produced object and its PE adapter into out. The object bytes are
+// consumed; the output buffer is left untouched on any failure.
+fn deliver(object_bytes:buf<u8>,out:buf<u8>)->u64 {
+    let readback:ntasm_nxo.ReadResult=ntasm_nxo.read(object_bytes);
+    if readback.code!=0{rt_free(runtime(),object_bytes);return readback.code;}
+    let object:ntasm_nxo.Object=readback.object;
+    let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(object);
+    ntasm_nxo.release(object);
+    let pe_bytes:buf<u8>=converted.bytes;
+    if converted.code!=0{rt_free(runtime(),object_bytes);rt_free(runtime(),pe_bytes);return converted.code;}
+    let nxo_size:u64=len(object_bytes);let pe_size:u64=len(pe_bytes);
+    if nxo_size+pe_size>len(out)-16 {
+        rt_free(runtime(),object_bytes);rt_free(runtime(),pe_bytes);return 800;
+    }
+    ntasm_pe.put64(out,0,nxo_size);ntasm_pe.put64(out,8,pe_size);
+    ntasm_pe.copy(out,16,object_bytes);
+    ntasm_pe.copy(out,16+nxo_size,pe_bytes);
+    rt_free(runtime(),object_bytes);rt_free(runtime(),pe_bytes);return 0;
+}
+
+// The object bytes alone, with no PE conversion. The PE adapter refuses an
+// entryless object with 803, and the C reference refuses the same object at
+// nt_object_materialize with 800, so a program whose only export is not named
+// main is reachable only through here. Nothing is validated on this path
+// beyond the lengths: the point is to hand back exactly what the producer
+// wrote and let the C reader in the gate decide what it is.
+fn deliver_nxo(object_bytes:buf<u8>,out:buf<u8>)->u64 {
+    let nxo_size:u64=len(object_bytes);
+    if nxo_size>len(out)-16 {
+        rt_free(runtime(),object_bytes);return 800;
+    }
+    ntasm_pe.put64(out,0,nxo_size);ntasm_pe.put64(out,8,0);
+    ntasm_pe.copy(out,16,object_bytes);
+    rt_free(runtime(),object_bytes);return 0;
+}
+
+export fn main(source:buf<u8>,mode:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false{ntasm_ast.release(tree);return 800;}
+    let mut abi_words:buf<u64>=alloc(runtime(),0);
+    let placeholder:buf<u8>=alloc(runtime(),0);
+    let mut written:ntasm_nxo.WriteResult=ntasm_nxo.WriteResult{code:800,bytes:placeholder};
+    if mode==0||mode==4||mode==5||mode==6 {
+        // written is replaced below, so the placeholder its bytes name is
+        // released first rather than left to the context.
+        rt_free(runtime(),placeholder);
+        if mode==4||mode==6 {
+            abi_words=alloc(runtime(),1920);
+            if abi_table(source,tree,abi_words)!=0 {
+                rt_free(runtime(),abi_words);ntasm_ast.release(tree);return 800;
+            }
+            written=x64_lower_nxo.build_framed_functions(source,tree,1,3,abi_words);
+            rt_free(runtime(),abi_words);
+        } else {
+            written=x64_lower_nxo.build_function_bodies(source,tree,1,3);
+        }
+        ntasm_ast.release(tree);
+        let object_bytes:buf<u8>=written.bytes;
+        if written.code!=0{rt_free(runtime(),object_bytes);return written.code;}
+        // Modes 5 and 6 are 0 and 4 with the PE conversion left out, and each
+        // reaches the SAME producer as the mode it is named after: 5 the
+        // frameless one, 6 the framed one. They are separate numbers so a gate
+        // asking for the frameless object can never be answered by the framed
+        // producer, which is the mistake a single shared number invites.
+        if mode==5||mode==6{return deliver_nxo(object_bytes,out);}
+        return deliver(object_bytes,out);
+    }
+    let unused:buf<u8>=written.bytes;rt_free(runtime(),unused);
+    if mode==1||mode==2||mode==3 {
+        let size:buf<u64>=alloc(runtime(),1);
+        let body:buf<u8>=slice(out,8,len(out)-8);
+        let mut code:u64=0;
+        let mut length:u64=0;
+        if mode==1{code=x64_lower_control.lower_wide(source,tree,1,3,body,size);}
+        else if mode==2{code=x64_lower_control.lower_wide_range(source,tree,1,3,body,size,1,tree.node_count);}
+        else{code=x64_lower_control.lower_wide_range(source,tree,1,3,body,size,1,0);}
+        if code==0{length=size[0];}
+        rt_free(runtime(),size);
+        ntasm_ast.release(tree);
+        if code==0{ntasm_pe.put64(out,0,length);}
+        return code;
+    }
+    ntasm_ast.release(tree);return 800;
+}

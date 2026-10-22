@@ -1,0 +1,105 @@
+module machine_driver_entry;
+
+import machine_pipeline;
+
+// ===========================================================================
+// THE PRODUCTION ENTRY. `compiler/c/nova/backend/machine_driver.c` compiles
+// this file together with its import closure and CALLS IT. Nothing else in the
+// tree drives `machine_pipeline` from production code: the other callers are
+// gates under tests/, and a gate that throws the image away is a measurement,
+// not a product.
+//
+// WHY AN ENTRY MODULE AT ALL, AND WHY THIS ONE. `nova_compile_many_v2` builds a
+// program whose PUBLIC entry is a synthesised `main` that dispatches to the one
+// module function named `main` (nova.c refuses with 701 when two modules
+// declare one, and when none does). So a C caller cannot call `build_pe`
+// directly: it calls whatever `main` is, and `main` is this file. It is a
+// THIN adapter on purpose -- it names two published exports and owns no
+// pipeline logic, so the thing that decides a program's fate is still
+// `machine_pipeline`.
+//
+// IT IMPORTS EXACTLY ONE MODULE, and that is a measured constraint rather than
+// a taste. This closure is forty-eight modules and its compiled image is close
+// to the 16 MiB ceiling `nova/run_host.c` refuses to map; adding the linker's
+// six modules to the SAME image pushed it over, and the symptom was a driver
+// that could not start. The linker is therefore its own entry --
+// `machine-link-entry.nova`, five modules -- and the C driver holds two small
+// images instead of one large one that does not fit. A link step that needs no
+// compiler should not pay for a compiler.
+//
+// IT DOES NOT CALL `x64_lower_nxo` OR `stub_table`, AND THAT IS THE POINT. Both
+// take an `ntasm_ast.Tree` and would answer a question about the AST, so an
+// entry that called one and reported a Machine IR would be publishing the AST
+// path under a Machine IR's name. A reader confirms the absence with one grep
+// over the single `import` line above.
+//
+// THE MODES. `want` selects the face; the C header declares the same numbers and
+// REFUSES TO OPEN unless this module publishes the same ones. Two files writing
+// the same constant and never comparing them is how a caller ends up reading
+// report[8] as a stage it is not.
+//
+//   0  the VOCABULARY, into report[0..13]: the two mode numbers, the link
+//      mode's number, the report width, the pipeline's two refusal codes and
+//      eight of its ten stages. A C caller that hard-coded them could only say
+//      they agree TODAY; this can say they are the same words.
+//   1  machine_pipeline.build_object: source text -> one NXO container.
+//   2  machine_pipeline.build_pe:     source text -> one PE container.
+//   3  UNUSED BY THE C DRIVER. Reserved rather than deleted: `want` values are
+//      not required to be dense, and a gap names itself.
+//   4  published as the LINK face's number and NOT implemented here. The link
+//      lives in machine-link-entry.nova for the reason the header above gives;
+//      publishing the number from both entries is what lets the C driver check
+//      that the two agree before it calls either.
+//   8  the TWO stages report[] cannot carry. report[8] and report[9] are where a
+//      refusal writes the stage and the code, so a caller asking this module
+//      what STAGE_LINK and STAGE_DELIVER are would be asking a question whose
+//      answer is the pair it is about to overwrite. The pipeline's report is
+//      fourteen words and the driver wants sixteen facts, which is the whole
+//      reason this mode exists.
+//
+// ON report[]: report[0..3] is whatever stage wrote it and report[8] names that
+// stage, exactly as `machine_pipeline` publishes. Modes 0 and 8 are the ONE
+// exception and they say so here: on those two modes report[8] is not a stage.
+// The C driver never reads report[8] on mode 0 or mode 8.
+// ===========================================================================
+
+// The two stages the report cannot carry, read through the pipeline's own
+// vocabulary rather than restated here.
+export fn STAGE_LINK()->u64 { return machine_pipeline.STAGE_LINK(); }
+export fn STAGE_DELIVER()->u64 { return machine_pipeline.STAGE_DELIVER(); }
+
+export fn main(source:buf<u8>,want:u64,count:u64,out:buf<u8>,
+        length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<machine_pipeline.REPORT_WORDS() { return 800; }
+    if len(length)<1 { return 800; }
+    // Written before any work, so a caller that reads it after a refusal reads
+    // this zero and not the length of a prefix.
+    length[0]=0;
+    let mut i:u64=0;
+    while i<machine_pipeline.REPORT_WORDS() { report[i]=0; i=i+1; }
+    if want==0 {
+        report[0]=1;
+        report[1]=2;
+        report[2]=4;
+        report[3]=machine_pipeline.REPORT_WORDS();
+        report[4]=machine_pipeline.E_OUTPUT();
+        report[5]=machine_pipeline.E_BOUND();
+        report[6]=machine_pipeline.STAGE_PARSE();
+        report[7]=machine_pipeline.STAGE_EXPAND();
+        report[8]=machine_pipeline.STAGE_VALIDATE();
+        report[9]=machine_pipeline.STAGE_NTIR();
+        report[10]=machine_pipeline.STAGE_LOWER();
+        report[11]=machine_pipeline.STAGE_OBJECT();
+        report[12]=machine_pipeline.STAGE_READ();
+        report[13]=machine_pipeline.STAGE_VERIFY();
+        return 0;
+    }
+    if want==8 {
+        report[0]=STAGE_LINK();
+        report[1]=STAGE_DELIVER();
+        return 0;
+    }
+    if want==1 { return machine_pipeline.build_object(source,out,length,report); }
+    if want==2 { return machine_pipeline.build_pe(source,out,length,report); }
+    return 800;
+}

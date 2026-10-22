@@ -1,0 +1,126 @@
+module types;
+
+import ntasm_ast;
+
+// Byte-wise comparison of a source range against a literal, the shape test
+// every name of this module shares.
+fn same(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool{if start>end||end>len(source)||(end-start)!=len(text){return false;}let mut i:u64=0;while i<len(text){if source[start+i]!=text[i]{return false;}i=i+1;}return true;}
+fn scalar(source:buf<u8>,name:ntasm_ast.Node)->bool{let a:buf<u8>="u8";if same(source,name.start,name.end,a){return true;}let b:buf<u8>="u16";if same(source,name.start,name.end,b){return true;}let c:buf<u8>="u32";if same(source,name.start,name.end,c){return true;}let d:buf<u8>="u64";if same(source,name.start,name.end,d){return true;}let e:buf<u8>="i8";if same(source,name.start,name.end,e){return true;}let f:buf<u8>="i16";if same(source,name.start,name.end,f){return true;}let g:buf<u8>="i32";if same(source,name.start,name.end,g){return true;}let h:buf<u8>="i64";if same(source,name.start,name.end,h){return true;}let i:buf<u8>="bool";if same(source,name.start,name.end,i){return true;}let j:buf<u8>="never";return same(source,name.start,name.end,j);}
+
+// The closed ast.* vocabulary of ntasm_macro_expand.nova: the parameter kinds
+// expr and type, and the result kinds expr, stmt, decl, type and block. A
+// spelling outside it is counted as alien rather than refused, because
+// ntasm_macro_expand already reports the module as 372 and this pass must not
+// start rejecting a type it has always accepted.
+fn ast_kind(source:buf<u8>,name:ntasm_ast.Node)->bool{let a:buf<u8>="expr";if same(source,name.start,name.end,a){return true;}let b:buf<u8>="type";if same(source,name.start,name.end,b){return true;}let c:buf<u8>="stmt";if same(source,name.start,name.end,c){return true;}let d:buf<u8>="decl";if same(source,name.start,name.end,d){return true;}let e:buf<u8>="block";return same(source,name.start,name.end,e);}
+
+// The name that opens an expand<..> form, a $T splice or an ast.* kind: a
+// single name node, spelled non empty inside the source. Any other shape is a
+// structural failure, so the caller turns false into the 800.
+fn named(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool{if id==0||id>tree.node_count{return false;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);return n.kind==90&&n.start<n.end&&n.end<=len(source);}
+// The next sibling of a node, or 0 once the id leaves the tree.
+fn sib(tree:ntasm_ast.Tree,id:u64)->u64{if id==0||id>tree.node_count{return 0;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if n.next_sibling>tree.node_count{return 0;}return n.next_sibling;}
+
+// Validate the closed scalar catalog and the array length boundary, and
+// recognise the three macro type forms one by one. Composite ptr and array
+// types keep their parser shapes. Node aux 0 is a plain name, 1 ptr<space,T>,
+// 2 array<T,len>, 3 expand<..> naming a macro and passing it value arguments,
+// 4 the macro type splice $T, which the sigil introduces immediately before the
+// one identifier it names, and 5 a macro parameter kind ast.expr. The first
+// failure wins: 350 unknown scalar, 351 zero array, 800 structural with no
+// write at all. The source and the tree are only read during the scan, and
+// the caller keeps the source, the tree and out.
+//
+// Success writes the scalar, pointer, array and macro type form counts to
+// out[0..3], out[3] being the total of the three macro type forms. When out
+// carries eight words, out[4..6] report the expand<..>, $T and ast.* forms one
+// by one and out[7] the ast.* spellings outside the closed vocabulary, so a
+// caller can tell the three apart instead of reading one lumped total. A four
+// word buffer still gets the original four counters, which is what the
+// pipeline passes. Error 350 and 351 write the line and the column of the
+// first offending node to out[0..1].
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false||tree.node_count==0||len(out)<4 { return 800; }
+    let mut scalars:u64=0;
+    let mut pointers:u64=0;
+    let mut arrays:u64=0;
+    let mut other:u64=0;
+    let mut expands:u64=0;
+    let mut splices:u64=0;
+    let mut asts:u64=0;
+    let mut alien:u64=0;
+    let mut code:u64=0;
+    let mut line:u64=0;
+    let mut column:u64=0;
+    let mut id:u64=1;
+    while id<=tree.node_count&&code==0 {
+        let type_:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if type_.kind==36 {
+            if type_.aux==0 {
+                if type_.first_child==0||type_.first_child!=type_.last_child||type_.first_child>tree.node_count {
+                    code=800;
+                } else {
+                    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,type_.first_child);
+                    if name.kind!=90||name.start>name.end||name.end>len(source) {
+                        code=800;
+                    } else if scalar(source,name)==false {
+                        code=350;line=name.line;column=name.column;
+                    } else { scalars=scalars+1; }
+                }
+            } else if type_.aux==1 {
+                pointers=pointers+1;
+            } else if type_.aux==2 {
+                arrays=arrays+1;
+                if type_.last_child==0||type_.last_child>tree.node_count {
+                    code=800;
+                } else {
+                    let length:ntasm_ast.Node=ntasm_ast.node_at(tree,type_.last_child);
+                    if length.kind!=94 { code=800; }
+                    else if length.aux==0 { code=351;line=length.line;column=length.column; }
+                }
+            } else if type_.aux==3 {
+                // expand<..>: the head names a macro, every later sibling is a
+                // value argument the caller passes.
+                if named(source,tree,type_.first_child)==false {
+                    code=800;
+                } else {
+                    let mut arg:u64=sib(tree,type_.first_child);
+                    while arg!=0 {
+                        let value:ntasm_ast.Node=ntasm_ast.node_at(tree,arg);
+                        if value.kind!=35&&value.kind!=94 { code=800;arg=0; }
+                        else { arg=sib(tree,arg); }
+                    }
+                    if code==0 { expands=expands+1;other=other+1; }
+                }
+            } else if type_.aux==4 {
+                // $T: the sigil introduces exactly one identifier, so the only
+                // child is a name one byte into the node span and ending with it.
+                if named(source,tree,type_.first_child)==false||type_.first_child!=type_.last_child {
+                    code=800;
+                } else {
+                    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,type_.first_child);
+                    if name.start!=type_.start+1||name.end!=type_.end { code=800; }
+                    else { splices=splices+1;other=other+1; }
+                }
+            } else if type_.aux==5 {
+                // ast.<kind>: a qualified spelling, so the only child is the
+                // final segment alone. The vocabulary is reported, not enforced.
+                if named(source,tree,type_.first_child)==false||type_.first_child!=type_.last_child {
+                    code=800;
+                } else {
+                    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,type_.first_child);
+                    asts=asts+1;other=other+1;
+                    if ast_kind(source,name)==false { alien=alien+1; }
+                }
+            } else { code=800; }
+        }
+        id=id+1;
+    }
+    if code==0 {
+        out[0]=scalars;out[1]=pointers;out[2]=arrays;out[3]=other;
+        if len(out)>=8 { out[4]=expands;out[5]=splices;out[6]=asts;out[7]=alien; }
+    } else if code==350||code==351 {
+        out[0]=line;out[1]=column;out[2]=0;out[3]=0;
+    }
+    return code;
+}

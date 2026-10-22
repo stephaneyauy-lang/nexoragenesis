@@ -1,0 +1,58 @@
+module ntasm_nxo_link_pe;
+import ntasm_nxo_merge;
+import ntasm_nxo;
+import ntasm_nxo_pe;
+
+fn failed(code:u64)->ntasm_nxo_pe.ConvertResult {
+    let empty:buf<u8>=alloc(runtime(),0);
+    return ntasm_nxo_pe.ConvertResult{code:code,bytes:empty};
+}
+
+export fn link_pe(left:buf<u8>,right:buf<u8>)->ntasm_nxo_pe.ConvertResult {
+    let merged:ntasm_nxo.WriteResult=ntasm_nxo_merge.merge(left,right);
+    let merged_bytes:buf<u8>=merged.bytes;
+    if merged.code!=0 { rt_free(runtime(),merged_bytes);return failed(merged.code); }
+    let read_result:ntasm_nxo.ReadResult=ntasm_nxo.read(merged_bytes);
+    if read_result.code!=0 { rt_free(runtime(),merged_bytes);return failed(read_result.code); }
+    let object:ntasm_nxo.Object=read_result.object;
+    let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(object);
+    ntasm_nxo.release(object);
+    rt_free(runtime(),merged_bytes);
+    return converted;
+}
+
+// Linker phase 1 + phase 2 over 1..64 objects, so a multi-module program can
+// reach a PE. This is link_pe at list width and nothing else: the only change
+// is that the merge is ntasm_nxo_merge.merge_list instead of the two-object
+// merge, so there is a single mirror of compiler/c/ntasm/formats/object_link.c in
+// the tree and merge_list is already oracle compared at every count it accepts.
+//
+// `inputs` is the arena merge_list reads: `count` 16-byte (offset,length)
+// descriptors followed by the NXO payloads, because buf<u8> is the only type
+// that crosses the Nova boundary. merge_list keeps one struct Unit{file:buf<u8>}
+// per unit for the whole call, since a read NXO views its sections and strings
+// inside the buffer it was given and rt_free only accepts a simple name; that
+// wrapper lives with the arena reader in nxo_merge.nova, and this function
+// borrows the arena without ever slicing or freeing it.
+//
+// Reachable ceiling: convert caps every merged section at 16MiB, so a PE can
+// carry at most 48MiB of linked payload. One arena borrow is capped at 64MiB by
+// runtime_v2.c (BYTES_MAX), which is above that, so the arena is never the
+// binding limit and a second borrow parameter would buy nothing until convert
+// itself is widened. The binding limit is therefore 16MiB per section, and the
+// arena that expresses 48MiB of payload is 48MiB plus the per object NXO
+// framing, still inside one borrow. The 800/820/821/823/824/825/826 codes come
+// from the merge and the 801..807 codes from the conversion, unchanged. On any
+// code the result carries no bytes.
+export fn link_pe_list(inputs:buf<u8>,count:u64)->ntasm_nxo_pe.ConvertResult {
+    let merged:ntasm_nxo.WriteResult=ntasm_nxo_merge.merge_list(inputs,count);
+    let merged_bytes:buf<u8>=merged.bytes;
+    if merged.code!=0 { rt_free(runtime(),merged_bytes);return failed(merged.code); }
+    let read_result:ntasm_nxo.ReadResult=ntasm_nxo.read(merged_bytes);
+    if read_result.code!=0 { rt_free(runtime(),merged_bytes);return failed(read_result.code); }
+    let object:ntasm_nxo.Object=read_result.object;
+    let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(object);
+    ntasm_nxo.release(object);
+    rt_free(runtime(),merged_bytes);
+    return converted;
+}

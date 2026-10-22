@@ -1,0 +1,768 @@
+# B1.2-r1 — prototype de ledger abandonné
+
+> **OBSOLÈTE — NON MATÉRIALISÉ — NE PAS UTILISER COMME PRODUCTEUR.**
+
+Ce prototype manuel a été conçu après le RED, mais n'a jamais été matérialisé ni
+exécuté. Son hash `8f1264…aaee` diffère du candidat NASM réellement vérifié
+`19b302…bbddd`; aucun GREEN ne provient du dump ci-dessous. L'unique autorité
+temporaire B1.2 est le source externe quarantainé
+`legacy/nasm/seed-b1.2-r1.asm` avec son manifeste. Le dump est
+conservé uniquement pour l'historique d'audit.
+
+- taille attendue : `0x1E00` = **7 680 octets**;
+- SHA-256 attendu :
+  `8f12646f21db5320f0957badea5605ce0cd05510d8b76787df4175eee2b9aaee`;
+- code utile `.text` : `0x10A7` octets;
+- image PE32+ : quatre sections, aucune importation, aucune W+X, aucun overlay;
+- succès temporaire unique : `NG_B1_2_PHYSICAL_OK\r\n`;
+- aucune chaîne, sonde ou opération visant `\NTASM1.EFI`.
+
+## 1. Autorités et RED observé
+
+Le comportement suit `spec/ntasm/ntasm-s0.md`, `spec/formats/seed-pe32.md`,
+`legacy/docs/bootstrap/b1-implementation-map.md`,
+`legacy/docs/bootstrap/b1-2-design.md`,
+`docs/testing/b1-2-test-protocol.md` et
+`legacy/ntasm-s0/b1-2-fixtures.md`.
+
+Les RED préalables sont archivés sous :
+
+- `out/b1/step-2/20260902-153157-9e69d8cbecfc4e41bb99552c5cea5433/red-matrix-13/`;
+- `out/b1/step-2/20260902-154607-3185259635a54b089f8f6d1fbe9ad40e/red-matrix-extra/`.
+
+B12-00 et B12-23 y restent les deux contrôles hérités GREEN. Les 22 autres
+oracles B1.2 sont RED face à B1.1-r1.
+
+## 2. Layout PE32+ canonique
+
+Tous les entiers multioctets sont little-endian. Les champs non cités sont nuls.
+
+| Zone | Offset fichier | RVA | Taille utile | Taille brute |
+|---|---:|---:|---:|---:|
+| headers | `0x0000` | — | `0x0228` | `0x0400` |
+| `.text` RX | `0x0400` | `0x1000` | `0x10A7` | `0x1200` |
+| `.rdata` R | `0x1600` | `0x3000` | `0x0308` | `0x0400` |
+| `.data` RW | `0x1A00` | `0x4000` | `0x0008` | `0x0200` |
+| `.reloc` R/discardable | `0x1C00` | `0x5000` | `0x000C` | `0x0200` |
+
+Champs principaux :
+
+| Champ | Valeur |
+|---|---:|
+| machine / sections | `0x8664` / `4` |
+| Optional Header | PE32+ `0x020B`, taille `0x00F0` |
+| caractéristiques COFF | `0x0022` |
+| entrée / base code | `0x1000` / `0x1000` |
+| ImageBase | `0x0000000140000000` |
+| SectionAlignment / FileAlignment | `0x1000` / `0x0200` |
+| SizeOfCode / SizeOfInitializedData | `0x1200` / `0x0800` |
+| SizeOfImage / SizeOfHeaders | `0x6000` / `0x0400` |
+| Subsystem / DllCharacteristics | `10` / `0x0140` |
+| stack reserve/commit | `0x100000` / `0x1000` |
+| heap reserve/commit | `0x100000` / `0x1000` |
+| data directories | `16`; seule l’entrée 5 vaut `0x5000 / 0x000C` |
+
+La table des sections commence à `0x0188`. Les caractéristiques exactes sont
+`.text=0x60000020`, `.rdata=0x40000040`, `.data=0xC0000040` et
+`.reloc=0x42000040`.
+
+## 3. ABI et cadre pile
+
+Huit non-volatils sont empilés (`rbx`, `rbp`, `rsi`, `rdi`, `r12..r15`), puis
+`sub rsp,0xE8` aligne RSP sur 16 avant chaque appel. Le cadre inclut en
+permanence le shadow space de 32 octets.
+
+| Offset cadre | Usage |
+|---:|---|
+| `0x00..0x1F` | shadow space |
+| `0x20` | cinquième argument `Open.Attributes=0` |
+| `0x28`, `0x30` | out-slots LoadedImage / SimpleFS |
+| `0x38`, `0x40` | handles root / source |
+| `0x48`, `0x50` | `GetInfo.BufferSize` / `Read.BufferSize` |
+| `0x58`, `0x60` | WORK raw / payload |
+| `0x68`, `0x70` | SRC raw / payload |
+| `0x78`, `0x80` | OUT raw / payload |
+| `0x88` | longueur source cumulée |
+| `0x90`, `0x98`, `0xA0`, `0xA8` | code, ligne, colonne, offset diagnostic |
+| `0xB0` | ExitStatus |
+| `0xB8` | flag ligne tentée |
+| `0xC0` | premier statut `FreePool` fautif |
+| `0xC8` | lignes physiques terminées |
+| `0xD0` | capacité restante du `Read` courant |
+| `0xD8` | statut EFI du dernier `Read`, préservé pendant le checkpoint |
+| `0xE0` | ownership mask : WORK/SRC/OUT/root/source = bits `0..4` |
+
+`r12=ImageHandle`, `r13=SystemTable`, `r14=BootServices` et `r15=ConOut` sont
+conservés jusqu’à l’épilogue. Aucun état ne dépend d’un volatile à travers un
+appel firmware.
+
+## 4. Mapping `.text`
+
+| RVA | Fin | Rôle |
+|---:|---:|---|
+| `0x1000` | `0x1092` | prologue, zéro du cadre, validation SystemTable/ConOut/BootServices |
+| `0x1093` | `0x1119` | `AllocatePool(WORK,0x1D020)`, gardes, ownership WORK, zéro `0x1D000` |
+| `0x111A` | `0x1186` | `AllocatePool(SRC,0x10020)`, gardes et ownership SRC |
+| `0x1187` | `0x11F6` | `AllocatePool(OUT,0x10020)`, gardes et ownership OUT; payload inchangé |
+| `0x11F7` | `0x126A` | LoadedImage, DeviceHandle et SimpleFS |
+| `0x126B` | `0x12F0` | OpenVolume, ouverture READ de `\NTASM1.NTASM` |
+| `0x12F1` | `0x134A` | `GetInfo`, taille `0x50..0x200`, Attribute `+0x48`, DIRECTORY `0x10` |
+| `0x134B` | `0x1407` | unique site Read en boucle, contrôle canari après chaque appel, sentinelle, Close sûr |
+| `0x1408` | `0x15D8` | scanner ASCII/EOL/BOM borné, records de lignes, limites 255/4096, `format pe64` |
+| `0x15D9` | `0x16EF` | setters E001/E002/E100/E101/E200/E500 et positions |
+| `0x16F0` | `0x17F3` | dispatch vers cleanup à ownership séparé, Close sans clear prématuré |
+| `0x17F4` | `0x1919` | trampoline du contrôle canari pré-FreePool, E603 prioritaire |
+| `0x191A` | `0x19CB` | diagnostic dynamique, E603/E500 statiques, OutputString avant libération |
+| `0x19CC` | `0x1A2B` | dispatch FreePool OUT/SRC/WORK; clear ownership seulement sur succès |
+| `0x1A2C` | `0x1A9F` | E604 statique ou marqueur succès après cleanup |
+| `0x1AA0` | `0x1AE1` | trampoline Exit, padding NOP, retour ABI |
+| `0x1AE2` | `0x1C88` | copy, memcmp, formateurs, statut FreePool, sorties statiques, Exit sûr |
+| `0x1C89` | `0x1D07` | propagation EFI E001/E002 et fallback EFI_DEVICE_ERROR |
+| `0x1D08` | `0x1D6C` | pose atomique des ownerships WORK/SRC/OUT/root/source |
+| `0x1D6D` | `0x1DEE` | checkpoints canari post-init/post-Read/post-scan et Close source sûr |
+| `0x1DEF` | `0x1E78` | cleanup source/root piloté par ownership séparé |
+| `0x1E79` | `0x1F86` | FreePool pilotés par ownership, pointeurs conservés sur erreur |
+| `0x1F87` | `0x20A6` | vérification commune des six gardes |
+
+Points d’entrée internes utiles :
+
+| RVA | Nom |
+|---:|---|
+| `0x134B` | `read_loop` |
+| `0x1426` | `scan_loop` |
+| `0x14EF` | `record_eol` |
+| `0x16F0` | `cleanup` |
+| `0x17F4` | `check_work_guard` |
+| `0x1840` | `check_src_guard` |
+| `0x188C` | `check_out_guard` |
+| `0x18DD` | `canary_fail_E603` |
+| `0x191A` | `report_before_free` |
+| `0x19CC` | `free_out` |
+| `0x19EC` | `free_src` |
+| `0x1A0C` | `free_work` |
+| `0x1AE2` | `copy_n` |
+| `0x1AFF` | `memcmp_n` |
+| `0x1B2C` | `format_base` |
+| `0x1B95` | `write_hex` |
+| `0x1BD6` | `record_free_error` |
+| `0x1C47` | `safe_exit` |
+| `0x1C77` | `load_openvolume_checked` |
+| `0x1C89`, `0x1CC1`, `0x1CF9` | `firmware_E001`, `firmware_E002`, `device_E002` |
+| `0x1D6D`, `0x1D8A`, `0x1DD2` | checkpoints post-init, post-Read, post-scan |
+| `0x1DEF`, `0x1E2B` | entrées cleanup source/root |
+| `0x1E79`, `0x1ED3`, `0x1F2D` | entrées FreePool OUT/SRC/WORK |
+| `0x1F87` | `verify_guards` |
+
+## 5. Appels firmware et helpers
+
+Les 18 sites indirects sont :
+
+| RVA | Appel |
+|---:|---|
+| `0x10AD`, `0x1134`, `0x11A1` | AllocatePool WORK, SRC, OUT |
+| `0x1214`, `0x1253` | HandleProtocol LoadedImage, SimpleFS |
+| `0x1283` | OpenVolume |
+| `0x12CC` | Open source READ |
+| `0x1312` | GetInfo EFI_FILE_INFO |
+| `0x1391` | **unique site Read**, exécuté en boucle |
+| `0x13F3` | Close source avant scanner |
+| `0x170A`, `0x178C` | Close conditionnels source/root dans cleanup |
+| `0x19CA` | OutputString diagnostic primaire |
+| `0x19DD`, `0x19FD`, `0x1A1D` | FreePool OUT, SRC, WORK |
+| `0x1A9E` | OutputString E604 ou succès après cleanup |
+| `0x1C70` | Exit |
+
+Il existe 27 appels directs : six `copy_n`, les appels `memcmp_n` des
+checkpoints, un `format_base`, trois `write_hex`, les chemins
+`record_free_error` et quatre appels de checkpoint à `verify_guards`.
+
+## 6. Pools, GetInfo et scanner
+
+| Pool | Payload | Demande brute | Gardes |
+|---|---:|---:|---|
+| WORK | `0x1D000` | `0x1D020` | RVA constantes `0x3050`, `0x3060` |
+| SRC | `0x10000` | `0x10020` | RVA constantes `0x3070`, `0x3080` |
+| OUT | `0x10000` | `0x10020` | RVA constantes `0x3090`, `0x30A0` |
+
+Le payload commence toujours à `raw+0x10`; la garde POST commence à
+`raw+payload+0x10`. WORK est zéroté par `0x3A00` stores qword. Le buffer
+EFI_FILE_INFO est `WORK+0x1CA00`; le qword Attribute est lu à `WORK+0x1CA48`.
+L’ownership est distinct des pointeurs : un bit est posé seulement après
+allocation/ouverture réussie et effacé seulement après Close/FreePool réussi.
+
+Le scanner charge un octet seulement après `cursor < source_len`. Le lookahead
+BOM exige au moins trois octets; le lookahead CR exige un successeur. Les
+records physiques de huit octets commencent à `WORK+0x14400` et codent début,
+longueur, largeur EOL et réserve. La 4 097e ligne et le 256e octet sont refusés
+avant écriture/incrément.
+
+## 7. Diagnostics, cleanup et absence de sortie
+
+Le diagnostic dynamique part du gabarit RVA `0x30C0`. Les codes internes sont
+stockés comme valeurs décimales réelles : 1, 2, 100, 101, 200, 500, 603, 604.
+Les lignes/colonnes sont quatre chiffres hexadécimaux et l’offset huit.
+
+E603 utilise directement la chaîne statique RVA `0x3140` sans lire WORK. Il
+remplace tout diagnostic. E604 utilise la chaîne statique RVA `0x3190` seulement
+si aucune ligne antérieure n’a été tentée; le premier statut EFI négatif de
+FreePool est propagé, un retour positif non nul devient EFI_DEVICE_ERROR.
+
+Les statuts EFI négatifs de HandleProtocol/OpenVolume/Open/GetInfo/Read/Close
+sont conservés comme ExitStatus. Une méthode absente, un compte `GetInfo` ou
+`Read` incohérent et tout succès non nul de FreePool deviennent
+EFI_DEVICE_ERROR.
+
+Les gardes sont vérifiées après les trois initialisations, après chaque retour
+de Read avant interprétation de son statut, après le scan physique et juste
+avant FreePool.
+
+Le cleanup ferme les handles, contrôle les six gardes, affiche le diagnostic
+primaire tant que WORK est valide, tente les trois FreePool en ordre inverse,
+puis affiche soit E604, soit le succès. Il n’existe aucun mode WRITE/CREATE,
+aucun appel Write/Flush et aucune chaîne `NTASM1.EFI`.
+
+## 8. `.rdata`, `.data` et `.reloc`
+
+| RVA | Taille | Contenu |
+|---:|---:|---|
+| `0x3000` | 16 | LoadedImage GUID |
+| `0x3010` | 16 | SimpleFS GUID |
+| `0x3020` | 16 | EFI_FILE_INFO GUID |
+| `0x3030` | 28 | `\NTASM1.NTASM` CHAR16Z |
+| `0x3050..0x30AF` | 96 | six gardes normatives distinctes |
+| `0x30B0` | 11 | `format pe64` ASCII |
+| `0x30C0` | 68 | gabarit diagnostic CHAR16Z |
+| `0x3110` | 44 | succès B1.2 CHAR16Z |
+| `0x3140`, `0x3190` | 68 chacune | E603 / E604 statiques |
+| `0x31E0`, `0x3230`, `0x3280` | 68 chacune | E500 / E001 / E002 statiques |
+| `0x3300` | 8 | `ImageBase+RVA(entry)=0x0000000140001000` |
+
+`.data[0..7]` vaut zéro. Le bloc `.reloc` est exactement :
+
+```text
+00 30 00 00 0C 00 00 00 00 A3 00 00
+```
+
+Il décrit PageRVA `0x3000`, BlockSize 12, une relocation DIR64 au RVA `0x3300`
+et une entrée ABSOLUTE nulle.
+
+## 9. Oracles et audit statique
+
+| IDs | Résultat |
+|---|---|
+| B12-01, 02, 08, 10, 16, 17, 18, 21, 22 | `NG_B1_2_PHYSICAL_OK` |
+| B12-00 | E100 L0 C0 O0 |
+| B12-03 | E500 L0 C0 O0 |
+| B12-04, 06, 07, 13, 19, 20 | E100 L2 C1 O0C |
+| B12-05, 14, 15 | E100 L1 C1 O0 |
+| B12-09 | E101 L2 C0100 O010B |
+| B12-11 | E500 L1001 C1 O100B |
+| B12-12 | E100 L1 C000C O000B |
+| B12-23 | E200 L1 C1 O0 |
+
+Inspection indépendante du code utile :
+
+- 1 156 instructions décodées, NOP de trampolines inclus;
+- 202 branches directes et 27 appels directs;
+- 18 appels indirects;
+- 25 références RIP vers 18 cibles uniques, toutes dans `.rdata`;
+- aucune cible directe au milieu d’une instruction;
+- aucun opcode invalide;
+- aucun accès RIP hors des RVA
+  `3000,3010,3020,3030,3050,3060,3070,3080,3090,30A0,30B0,30C0,3110,3140,3190,31E0,3230,3280`.
+
+## 10. Hex dump canonique complet
+
+Le bloc suivant contient exactement 480 lignes de 16 octets, offsets continus
+`0x0000..0x1DF0`. Aucun champ ne doit être reconstruit autrement.
+
+```text
+0000  4D 5A 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0010  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0030  00 00 00 00 00 00 00 00 00 00 00 00 80 00 00 00
+0040  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0050  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0060  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0070  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0080  50 45 00 00 64 86 04 00 00 00 00 00 00 00 00 00
+0090  00 00 00 00 F0 00 22 00 0B 02 00 00 00 12 00 00
+00a0  00 08 00 00 00 00 00 00 00 10 00 00 00 10 00 00
+00b0  00 00 00 40 01 00 00 00 00 10 00 00 00 02 00 00
+00c0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00d0  00 60 00 00 00 04 00 00 00 00 00 00 0A 00 40 01
+00e0  00 00 10 00 00 00 00 00 00 10 00 00 00 00 00 00
+00f0  00 00 10 00 00 00 00 00 00 10 00 00 00 00 00 00
+0100  00 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00
+0110  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0120  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0130  00 50 00 00 0C 00 00 00 00 00 00 00 00 00 00 00
+0140  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0150  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0160  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0170  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0180  00 00 00 00 00 00 00 00 2E 74 65 78 74 00 00 00
+0190  A7 10 00 00 00 10 00 00 00 12 00 00 00 04 00 00
+01a0  00 00 00 00 00 00 00 00 00 00 00 00 20 00 00 60
+01b0  2E 72 64 61 74 61 00 00 08 03 00 00 00 30 00 00
+01c0  00 04 00 00 00 16 00 00 00 00 00 00 00 00 00 00
+01d0  00 00 00 00 40 00 00 40 2E 64 61 74 61 00 00 00
+01e0  08 00 00 00 00 40 00 00 00 02 00 00 00 1A 00 00
+01f0  00 00 00 00 00 00 00 00 00 00 00 00 40 00 00 C0
+0200  2E 72 65 6C 6F 63 00 00 0C 00 00 00 00 50 00 00
+0210  00 02 00 00 00 1C 00 00 00 00 00 00 00 00 00 00
+0220  00 00 00 00 40 00 00 42 00 00 00 00 00 00 00 00
+0230  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0240  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0250  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0260  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0270  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0280  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0290  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+02a0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+02b0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+02c0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+02d0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+02e0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+02f0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0300  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0310  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0320  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0330  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0340  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0350  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0360  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0370  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0380  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0390  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+03a0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+03b0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+03c0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+03d0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+03e0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+03f0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0400  53 55 56 57 41 54 41 55 41 56 41 57 48 81 EC E8
+0410  00 00 00 48 89 E5 49 89 CC 49 89 D5 48 8D 7D 28
+0420  31 C0 B9 18 00 00 00 48 89 07 48 83 C7 08 FF C9
+0430  0F 85 F1 FF FF FF 4D 85 ED 0F 84 C1 05 00 00 4D
+0440  8B 7D 40 4D 8B 75 60 4D 85 FF 0F 84 B0 05 00 00
+0450  4D 85 F6 0F 84 A7 05 00 00 49 8B 46 40 48 85 C0
+0460  0F 84 9A 05 00 00 49 8B 46 48 48 85 C0 0F 84 8D
+0470  05 00 00 49 8B 86 98 00 00 00 48 85 C0 0F 84 7D
+0480  05 00 00 49 8B 86 D8 00 00 00 48 85 C0 0F 84 6D
+0490  05 00 00 48 C7 45 58 00 00 00 00 49 8B 46 40 B9
+04a0  02 00 00 00 BA 20 D0 01 00 4C 8D 45 58 FF D0 48
+04b0  85 C0 0F 88 21 05 00 00 48 8B 45 58 48 85 C0 0F
+04c0  84 14 05 00 00 E9 3E 0C 00 00 90 90 90 48 8B 4D
+04d0  58 48 8D 15 78 1F 00 00 41 B8 10 00 00 00 E8 FF
+04e0  09 00 00 48 8B 4D 58 48 81 C1 10 D0 01 00 48 8D
+04f0  15 6B 1F 00 00 41 B8 10 00 00 00 E8 E2 09 00 00
+0500  48 8B 7D 60 31 C0 B9 00 3A 00 00 48 89 07 48 83
+0510  C7 08 FF C9 0F 85 F1 FF FF FF 48 C7 45 68 00 00
+0520  00 00 49 8B 46 40 B9 02 00 00 00 BA 20 00 01 00
+0530  4C 8D 45 68 FF D0 48 85 C0 0F 88 A7 04 00 00 48
+0540  8B 45 68 48 85 C0 0F 84 9A 04 00 00 E9 CB 0B 00
+0550  00 90 90 90 48 8B 4D 68 48 8D 15 11 1F 00 00 41
+0560  B8 10 00 00 00 E8 78 09 00 00 48 8B 4D 68 48 81
+0570  C1 10 00 01 00 48 8D 15 04 1F 00 00 41 B8 10 00
+0580  00 00 E8 5B 09 00 00 48 C7 45 78 00 00 00 00 49
+0590  8B 46 40 B9 02 00 00 00 BA 20 00 01 00 4C 8D 45
+05a0  78 FF D0 48 85 C0 0F 88 47 04 00 00 48 8B 45 78
+05b0  48 85 C0 0F 84 3A 04 00 00 E9 72 0B 00 00 90 90
+05c0  90 90 90 90 48 8B 4D 78 48 8D 15 C1 1E 00 00 41
+05d0  B8 10 00 00 00 E8 08 09 00 00 48 8B 4D 78 48 81
+05e0  C1 10 00 01 00 48 8D 15 B4 1E 00 00 41 B8 10 00
+05f0  00 00 E8 EB 08 00 00 E9 71 0B 00 00 90 90 90 90
+0600  90 90 48 8D 15 F7 1D 00 00 4C 8D 45 28 49 8B 86
+0610  98 00 00 00 FF D0 48 85 C0 0F 88 6A 0A 00 00 48
+0620  8B 45 28 48 85 C0 0F 84 D4 03 00 00 48 8B 48 18
+0630  48 85 C9 0F 84 C7 03 00 00 48 C7 45 30 00 00 00
+0640  00 48 8D 15 C8 1D 00 00 4C 8D 45 30 49 8B 86 98
+0650  00 00 00 FF D0 48 85 C0 0F 88 2B 0A 00 00 48 8B
+0660  4D 30 48 85 C9 0F 84 95 03 00 00 E9 07 0A 00 00
+0670  90 0F 84 89 03 00 00 48 C7 45 38 00 00 00 00 48
+0680  8D 55 38 FF D0 48 85 C0 0F 88 FB 09 00 00 48 8B
+0690  5D 38 48 85 DB 0F 84 65 03 00 00 E9 A7 0A 00 00
+06a0  90 90 0F 84 58 03 00 00 48 C7 45 40 00 00 00 00
+06b0  48 89 D9 48 8D 55 40 4C 8D 05 72 1D 00 00 41 B9
+06c0  01 00 00 00 48 C7 45 20 00 00 00 00 FF D0 48 85
+06d0  C0 0F 88 B2 09 00 00 48 8B 75 40 48 85 F6 0F 84
+06e0  1C 03 00 00 E9 71 0A 00 00 90 90 0F 84 08 0A 00
+06f0  00 48 C7 45 48 00 02 00 00 48 89 F1 48 8D 15 1D
+0700  1D 00 00 4C 8D 45 48 4C 8B 4D 60 49 81 C1 00 CA
+0710  01 00 FF D0 48 85 C0 0F 88 A4 09 00 00 48 8B 45
+0720  48 48 83 F8 50 0F 82 CE 09 00 00 48 3D 00 02 00
+0730  00 0F 87 C2 09 00 00 48 8B 4D 60 48 8B 91 48 CA
+0740  01 00 F6 C2 10 0F 85 AE 09 00 00 48 8B 8D 88 00
+0750  00 00 48 81 F9 00 00 01 00 0F 83 D5 02 00 00 B8
+0760  00 00 01 00 48 29 C8 48 89 85 D0 00 00 00 48 89
+0770  45 50 48 8B 46 20 48 85 C0 0F 84 7A 09 00 00 48
+0780  89 F1 48 8D 55 50 4C 8B 45 70 4C 03 85 88 00 00
+0790  00 FF D0 E9 F2 09 00 00 90 90 90 90 48 8B 45 50
+07a0  48 3B 85 D0 00 00 00 0F 87 4C 09 00 00 48 85 C0
+07b0  0F 84 1F 00 00 00 48 03 85 88 00 00 00 48 3D 00
+07c0  00 01 00 0F 83 6B 02 00 00 48 89 85 88 00 00 00
+07d0  E9 76 FF FF FF 48 83 BD 88 00 00 00 00 0F 84 31
+07e0  02 00 00 48 8B 46 10 48 85 C0 0F 84 09 09 00 00
+07f0  48 89 F1 FF D0 E9 B9 09 00 00 90 90 90 90 90 90
+0800  90 90 90 90 90 90 90 90 48 8B 7D 70 45 31 C0 41
+0810  B9 01 00 00 00 45 31 D2 45 31 DB 48 C7 85 C8 00
+0820  00 00 00 00 00 00 4C 3B 85 88 00 00 00 0F 83 43
+0830  01 00 00 8B 85 C8 00 00 00 3D 00 10 00 00 0F 84
+0840  1D 01 00 00 4D 85 C0 0F 85 31 00 00 00 48 8B 85
+0850  88 00 00 00 4C 29 C0 48 83 F8 03 0F 82 1D 00 00
+0860  00 80 3F EF 0F 85 14 00 00 00 80 7F 01 BB 0F 85
+0870  0A 00 00 00 80 7F 02 BF 0F 84 BA 00 00 00 42 0F
+0880  B6 04 07 3C 0D 0F 84 38 00 00 00 3C 0A 0F 84 57
+0890  00 00 00 3C 09 0F 84 10 00 00 00 3C 20 0F 82 95
+08a0  00 00 00 3C 7E 0F 87 8D 00 00 00 41 81 FB FF 00
+08b0  00 00 0F 84 94 00 00 00 49 FF C3 49 FF C0 E9 63
+08c0  FF FF FF 49 8D 40 01 48 3B 85 88 00 00 00 0F 83
+08d0  64 00 00 00 42 80 7C 07 01 0A 0F 85 58 00 00 00
+08e0  B9 02 00 00 00 E9 05 00 00 00 B9 01 00 00 00 8B
+08f0  85 C8 00 00 00 48 8B 55 60 48 81 C2 00 44 01 00
+0900  48 8D 14 C2 48 89 D6 44 89 D2 44 89 D8 48 C1 E0
+0910  20 48 09 C2 0F B6 C1 48 C1 E0 30 48 09 C2 48 89
+0920  16 FF 85 C8 00 00 00 49 01 C8 4D 89 C2 45 31 DB
+0930  41 FF C1 E9 EE FE FF FF BF 64 00 00 00 4C 89 C8
+0940  49 8D 53 01 4C 89 C1 E9 72 01 00 00 BF 65 00 00
+0950  00 4C 89 C8 BA 00 01 00 00 4C 89 C1 E9 5D 01 00
+0960  00 BF F4 01 00 00 4C 89 C8 BA 01 00 00 00 4C 89
+0970  C1 E9 48 01 00 00 4D 85 DB 0F 85 42 00 00 00 E9
+0980  4E 08 00 00 90 90 90 90 90 90 48 C1 E8 20 48 25
+0990  FF FF 00 00 48 83 F8 0B 0F 85 80 00 00 00 48 8B
+09a0  4D 70 48 8D 15 07 1B 00 00 41 B8 0B 00 00 00 E8
+09b0  4B 05 00 00 85 C0 0F 85 62 00 00 00 E9 2F 01 00
+09c0  00 BF 64 00 00 00 4C 89 C8 49 8D 53 01 48 8B 8D
+09d0  88 00 00 00 E9 E5 00 00 00 48 C7 45 58 00 00 00
+09e0  00 E9 58 00 00 00 48 C7 45 68 00 00 00 00 E9 4B
+09f0  00 00 00 48 C7 45 78 00 00 00 00 E9 3E 00 00 00
+0a00  BF 01 00 00 00 E9 76 00 00 00 BF 02 00 00 00 E9
+0a10  6C 00 00 00 BF 64 00 00 00 E9 62 00 00 00 BF C8
+0a20  00 00 00 B8 01 00 00 00 BA 01 00 00 00 31 C9 E9
+0a30  8A 00 00 00 BF F4 01 00 00 E9 42 00 00 00 48 C7
+0a40  85 90 00 00 00 F4 01 00 00 48 C7 85 98 00 00 00
+0a50  00 00 00 00 48 C7 85 A0 00 00 00 00 00 00 00 48
+0a60  C7 85 A8 00 00 00 00 00 00 00 48 B8 09 00 00 00
+0a70  00 00 00 80 48 89 85 B0 00 00 00 E9 70 00 00 00
+0a80  48 89 BD 90 00 00 00 48 C7 85 98 00 00 00 00 00
+0a90  00 00 48 C7 85 A0 00 00 00 00 00 00 00 48 C7 85
+0aa0  A8 00 00 00 00 00 00 00 48 B8 01 00 00 00 00 00
+0ab0  00 80 48 89 85 B0 00 00 00 E9 32 00 00 00 48 89
+0ac0  BD 90 00 00 00 48 89 85 98 00 00 00 48 89 95 A0
+0ad0  00 00 00 48 89 8D A8 00 00 00 48 B8 01 00 00 00
+0ae0  00 00 00 80 48 89 85 B0 00 00 00 E9 00 00 00 00
+0af0  E9 FA 06 00 00 90 90 90 90 90 90 90 90 48 8B 41
+0b00  10 48 85 C0 0F 84 18 00 00 00 FF D0 E9 FD 06 00
+0b10  00 90 90 90 90 90 90 90 90 90 90 90 90 E9 50 00
+0b20  00 00 48 B8 07 00 00 00 00 00 00 80 E9 00 00 00
+0b30  00 48 83 BD 90 00 00 00 00 0F 85 33 00 00 00 48
+0b40  C7 85 90 00 00 00 02 00 00 00 48 C7 85 98 00 00
+0b50  00 00 00 00 00 48 C7 85 A0 00 00 00 00 00 00 00
+0b60  48 C7 85 A8 00 00 00 00 00 00 00 48 89 85 B0 00
+0b70  00 00 E9 B4 06 00 00 90 90 90 90 90 90 90 90 48
+0b80  8B 41 10 48 85 C0 0F 84 18 00 00 00 FF D0 E9 B7
+0b90  06 00 00 90 90 90 90 90 90 90 90 90 90 90 90 E9
+0ba0  50 00 00 00 48 B8 07 00 00 00 00 00 00 80 E9 00
+0bb0  00 00 00 48 83 BD 90 00 00 00 00 0F 85 33 00 00
+0bc0  00 48 C7 85 90 00 00 00 02 00 00 00 48 C7 85 98
+0bd0  00 00 00 00 00 00 00 48 C7 85 A0 00 00 00 00 00
+0be0  00 00 48 C7 85 A8 00 00 00 00 00 00 00 48 89 85
+0bf0  B0 00 00 00 E9 6E 06 00 00 90 90 90 90 90 90 90
+0c00  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c10  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c20  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c30  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c40  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c50  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c60  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c70  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c80  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0c90  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0ca0  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0cb0  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0cc0  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0cd0  90 90 90 90 90 90 90 90 90 90 90 90 90 48 C7 85
+0ce0  90 00 00 00 5B 02 00 00 48 C7 85 98 00 00 00 00
+0cf0  00 00 00 48 C7 85 A0 00 00 00 00 00 00 00 48 C7
+0d00  85 A8 00 00 00 00 00 00 00 48 B8 01 00 00 00 00
+0d10  00 00 80 48 89 85 B0 00 00 00 48 8B 85 90 00 00
+0d20  00 48 85 C0 0F 84 A2 00 00 00 48 C7 85 B8 00 00
+0d30  00 01 00 00 00 48 3D 5B 02 00 00 0F 84 5D 00 00
+0d40  00 48 83 7D 60 00 0F 84 BC 02 00 00 E8 DB 01 00
+0d50  00 48 89 C3 48 8B 8D 98 00 00 00 48 8D 53 16 41
+0d60  B8 04 00 00 00 E8 2B 02 00 00 48 8B 8D A0 00 00
+0d70  00 48 8D 53 22 41 B8 04 00 00 00 E8 15 02 00 00
+0d80  48 8B 8D A8 00 00 00 48 8D 53 2E 41 B8 08 00 00
+0d90  00 E8 FF 01 00 00 48 89 DA E9 13 00 00 00 48 8D
+0da0  15 9B 17 00 00 E9 07 00 00 00 48 8D 15 2F 18 00
+0db0  00 4D 85 FF 0F 84 12 00 00 00 49 8B 47 08 48 85
+0dc0  C0 0F 84 05 00 00 00 4C 89 F9 FF D0 E9 A8 04 00
+0dd0  00 90 90 90 90 90 90 90 90 49 8B 46 48 FF D0 E9
+0de0  C8 04 00 00 90 90 90 90 90 90 90 90 E9 E2 04 00
+0df0  00 90 90 90 90 90 90 90 90 49 8B 46 48 FF D0 E9
+0e00  02 05 00 00 90 90 90 90 90 90 90 90 E9 1C 05 00
+0e10  00 90 90 90 90 90 90 90 90 49 8B 46 48 FF D0 E9
+0e20  3C 05 00 00 90 90 90 90 90 90 90 90 48 83 BD B8
+0e30  00 00 00 00 0F 85 66 00 00 00 48 8B 85 C0 00 00
+0e40  00 48 85 C0 0F 84 29 00 00 00 48 C7 85 90 00 00
+0e50  00 5C 02 00 00 48 89 85 B0 00 00 00 48 C7 85 B8
+0e60  00 00 00 01 00 00 00 48 8D 15 22 17 00 00 E9 12
+0e70  00 00 00 48 C7 85 B0 00 00 00 00 00 00 00 48 8D
+0e80  15 8B 16 00 00 4D 85 FF 0F 84 12 00 00 00 49 8B
+0e90  47 08 48 85 C0 0F 84 05 00 00 00 4C 89 F9 FF D0
+0ea0  E9 A2 01 00 00 90 90 90 90 90 90 90 90 90 90 90
+0eb0  90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+0ec0  90 90 90 90 90 90 90 48 8B 85 B0 00 00 00 48 81
+0ed0  C4 E8 00 00 00 41 5F 41 5E 41 5D 41 5C 5F 5E 5D
+0ee0  5B C3 4D 85 C0 0F 84 13 00 00 00 8A 02 88 01 48
+0ef0  FF C2 48 FF C1 49 FF C8 0F 85 ED FF FF FF C3 31
+0f00  C0 4D 85 C0 0F 84 1B 00 00 00 44 8A 09 44 3A 0A
+0f10  0F 85 10 00 00 00 48 FF C1 48 FF C2 49 FF C8 0F
+0f20  85 E5 FF FF FF C3 B8 01 00 00 00 C3 4C 8B 5D 60
+0f30  49 81 C3 00 C9 01 00 4D 89 DA 48 8D 15 7F 15 00
+0f40  00 41 B8 44 00 00 00 8A 02 41 88 02 48 FF C2 49
+0f50  FF C2 49 FF C8 0F 85 EC FF FF FF 48 8B 85 90 00
+0f60  00 00 31 D2 B9 64 00 00 00 48 F7 F1 83 C0 30 66
+0f70  41 89 43 0C 48 89 D0 31 D2 B9 0A 00 00 00 48 F7
+0f80  F1 83 C0 30 66 41 89 43 0E 83 C2 30 66 41 89 53
+0f90  10 4C 89 D8 C3 48 89 C8 45 89 C1 41 FF C9 4A 8D
+0fa0  14 4A 49 89 C2 41 83 E2 0F 41 83 FA 09 0F 86 09
+0fb0  00 00 00 41 83 C2 37 E9 04 00 00 00 41 83 C2 30
+0fc0  66 44 89 12 48 C1 E8 04 48 83 EA 02 41 FF C8 0F
+0fd0  85 CD FF FF FF C3 48 85 C0 0F 84 28 00 00 00 48
+0fe0  83 BD C0 00 00 00 00 0F 85 1A 00 00 00 48 85 C0
+0ff0  0F 88 0A 00 00 00 48 B8 07 00 00 00 00 00 00 80
+1000  48 89 85 C0 00 00 00 C3 48 8B 85 90 00 00 00 48
+1010  83 F8 01 0F 84 16 00 00 00 48 83 F8 02 0F 84 18
+1020  00 00 00 48 8D 15 B6 15 00 00 E9 82 FD FF FF 48
+1030  8D 15 FA 15 00 00 E9 76 FD FF FF 48 8D 15 3E 16
+1040  00 00 E9 6A FD FF FF 4D 85 F6 0F 84 77 FE FF FF
+1050  49 8B 86 D8 00 00 00 48 85 C0 0F 84 67 FE FF FF
+1060  4C 89 E1 48 8B 95 B0 00 00 00 45 31 C0 45 31 C9
+1070  FF D0 E9 57 FE FF FF 48 8B 41 08 48 85 C0 0F 84
+1080  7C F9 FF FF E9 E8 F5 FF FF 48 C7 85 90 00 00 00
+1090  01 00 00 00 48 C7 85 98 00 00 00 00 00 00 00 48
+10a0  C7 85 A0 00 00 00 00 00 00 00 48 C7 85 A8 00 00
+10b0  00 00 00 00 00 48 89 85 B0 00 00 00 E9 2F FA FF
+10c0  FF 48 C7 85 90 00 00 00 02 00 00 00 48 C7 85 98
+10d0  00 00 00 00 00 00 00 48 C7 85 A0 00 00 00 00 00
+10e0  00 00 48 C7 85 A8 00 00 00 00 00 00 00 48 89 85
+10f0  B0 00 00 00 E9 F7 F9 FF FF 48 B8 07 00 00 00 00
+1100  00 00 80 E9 B9 FF FF FF 80 8D E0 00 00 00 01 48
+1110  8D 48 10 48 89 4D 60 E9 B1 F3 FF FF 80 8D E0 00
+1120  00 00 02 48 8D 48 10 48 89 4D 70 E9 24 F4 FF FF
+1130  80 8D E0 00 00 00 04 48 8D 48 10 48 89 8D 80 00
+1140  00 00 E9 7D F4 FF FF 80 8D E0 00 00 00 08 48 8B
+1150  43 08 48 85 C0 E9 48 F5 FF FF 80 8D E0 00 00 00
+1160  10 48 8B 46 40 48 85 C0 E9 7E F5 FF FF E8 15 02
+1170  00 00 85 C0 0F 85 63 FB FF FF 48 C7 45 28 00 00
+1180  00 00 4C 89 E1 E9 78 F4 FF FF 48 89 85 D8 00 00
+1190  00 E8 F1 01 00 00 85 C0 0F 85 3F FB FF FF 48 8B
+11a0  85 D8 00 00 00 48 85 C0 0F 88 13 FF FF FF E9 E9
+11b0  F5 FF FF 48 85 C0 0F 88 05 FF FF FF 48 C7 45 40
+11c0  00 00 00 00 80 A5 E0 00 00 00 EF 31 F6 E9 36 F6
+11d0  FF FF E8 B0 01 00 00 85 C0 0F 85 FE FA FF FF 48
+11e0  8B 45 60 48 8B 80 00 44 01 00 E9 9B F7 FF FF F6
+11f0  85 E0 00 00 00 10 0F 84 76 F9 FF FF 48 8B 4D 40
+1200  48 85 C9 0F 84 19 F9 FF FF E9 EF F8 FF FF 48 85
+1210  C0 0F 88 1A F9 FF FF 48 C7 45 40 00 00 00 00 80
+1220  A5 E0 00 00 00 EF E9 47 F9 FF FF F6 85 E0 00 00
+1230  00 08 0F 84 BC F9 FF FF 48 8B 4D 38 48 85 C9 0F
+1240  84 5F F9 FF FF E9 35 F9 FF FF 48 85 C0 0F 88 60
+1250  F9 FF FF 48 C7 45 38 00 00 00 00 80 A5 E0 00 00
+1260  00 F7 E9 8D F9 FF FF E8 1B 01 00 00 85 C0 0F 85
+1270  69 FA FF FF E9 A1 FA FF FF F6 85 E0 00 00 00 04
+1280  0F 84 66 FB FF FF 48 8B 4D 78 48 85 C9 0F 84 05
+1290  00 00 00 E9 41 FB FF FF 48 B8 07 00 00 00 00 00
+12a0  00 80 E8 2F FD FF FF E9 40 FB FF FF 48 85 C0 0F
+12b0  85 14 00 00 00 48 C7 45 78 00 00 00 00 80 A5 E0
+12c0  00 00 00 FB E9 23 FB FF FF E8 08 FD FF FF E9 19
+12d0  FB FF FF F6 85 E0 00 00 00 02 0F 84 2C FB FF FF
+12e0  48 8B 4D 68 48 85 C9 0F 84 05 00 00 00 E9 07 FB
+12f0  FF FF 48 B8 07 00 00 00 00 00 00 80 E8 D5 FC FF
+1300  FF E9 06 FB FF FF 48 85 C0 0F 85 14 00 00 00 48
+1310  C7 45 68 00 00 00 00 80 A5 E0 00 00 00 FD E9 E9
+1320  FA FF FF E8 AE FC FF FF E9 DF FA FF FF F6 85 E0
+1330  00 00 00 01 0F 84 F2 FA FF FF 48 8B 4D 58 48 85
+1340  C9 0F 84 05 00 00 00 E9 CD FA FF FF 48 B8 07 00
+1350  00 00 00 00 00 80 E8 7B FC FF FF E9 CC FA FF FF
+1360  48 85 C0 0F 85 14 00 00 00 48 C7 45 58 00 00 00
+1370  00 80 A5 E0 00 00 00 FE E9 AF FA FF FF E8 54 FC
+1380  FF FF E9 A5 FA FF FF 48 83 EC 28 F6 85 E0 00 00
+1390  00 01 0F 84 4C 00 00 00 48 8B 4D 58 48 85 C9 0F
+13a0  84 F8 00 00 00 48 8D 15 A4 10 00 00 41 B8 10 00
+13b0  00 00 E8 48 FB FF FF 85 C0 0F 85 DE 00 00 00 48
+13c0  8B 4D 58 48 81 C1 10 D0 01 00 48 8D 15 8F 10 00
+13d0  00 41 B8 10 00 00 00 E8 23 FB FF FF 85 C0 0F 85
+13e0  B9 00 00 00 F6 85 E0 00 00 00 02 0F 84 4C 00 00
+13f0  00 48 8B 4D 68 48 85 C9 0F 84 9F 00 00 00 48 8D
+1400  15 6B 10 00 00 41 B8 10 00 00 00 E8 EF FA FF FF
+1410  85 C0 0F 85 85 00 00 00 48 8B 4D 68 48 81 C1 10
+1420  00 01 00 48 8D 15 56 10 00 00 41 B8 10 00 00 00
+1430  E8 CA FA FF FF 85 C0 0F 85 60 00 00 00 F6 85 E0
+1440  00 00 00 04 0F 84 4C 00 00 00 48 8B 4D 78 48 85
+1450  C9 0F 84 46 00 00 00 48 8D 15 32 10 00 00 41 B8
+1460  10 00 00 00 E8 96 FA FF FF 85 C0 0F 85 2C 00 00
+1470  00 48 8B 4D 78 48 81 C1 10 00 01 00 48 8D 15 1D
+1480  10 00 00 41 B8 10 00 00 00 E8 71 FA FF FF 85 C0
+1490  0F 85 07 00 00 00 31 C0 48 83 C4 28 C3 B8 01 00
+14a0  00 00 48 83 C4 28 C3 00 00 00 00 00 00 00 00 00
+14b0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+14c0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+14d0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+14e0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+14f0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1500  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1510  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1520  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1530  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1540  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1550  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1560  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1570  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1580  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1590  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+15a0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+15b0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+15c0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+15d0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+15e0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+15f0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1600  A1 31 1B 5B 62 95 D2 11 8E 3F 00 A0 C9 69 72 3B
+1610  22 5B 4E 96 59 64 D2 11 8E 39 00 A0 C9 69 72 3B
+1620  92 6E 57 09 3F 6D D2 11 8E 39 00 A0 C9 69 72 3B
+1630  5C 00 4E 00 54 00 41 00 53 00 4D 00 31 00 2E 00
+1640  4E 00 54 00 41 00 53 00 4D 00 00 00 00 00 00 00
+1650  A5 5A C3 3C 96 69 F0 0F 55 AA 33 CC 78 87 E1 1E
+1660  1E E1 87 78 CC 33 AA 55 0F F0 69 96 3C C3 5A A5
+1670  99 66 FF 00 AA 55 CC 33 69 96 0F F0 44 BB DD 22
+1680  22 DD BB 44 F0 0F 96 69 33 CC 55 AA 00 FF 66 99
+1690  66 99 00 FF 55 AA 33 CC 96 69 F0 0F BB 44 22 DD
+16a0  DD 22 44 BB 0F F0 69 96 CC 33 AA 55 FF 00 99 66
+16b0  66 6F 72 6D 61 74 20 70 65 36 34 00 00 00 00 00
+16c0  4E 00 47 00 53 00 30 00 20 00 45 00 30 00 30 00
+16d0  30 00 20 00 4C 00 30 00 30 00 30 00 30 00 20 00
+16e0  43 00 30 00 30 00 30 00 30 00 20 00 4F 00 30 00
+16f0  30 00 30 00 30 00 30 00 30 00 30 00 30 00 0D 00
+1700  0A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1710  4E 00 47 00 5F 00 42 00 31 00 5F 00 32 00 5F 00
+1720  50 00 48 00 59 00 53 00 49 00 43 00 41 00 4C 00
+1730  5F 00 4F 00 4B 00 0D 00 0A 00 00 00 00 00 00 00
+1740  4E 00 47 00 53 00 30 00 20 00 45 00 36 00 30 00
+1750  33 00 20 00 4C 00 30 00 30 00 30 00 30 00 20 00
+1760  43 00 30 00 30 00 30 00 30 00 20 00 4F 00 30 00
+1770  30 00 30 00 30 00 30 00 30 00 30 00 30 00 0D 00
+1780  0A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1790  4E 00 47 00 53 00 30 00 20 00 45 00 36 00 30 00
+17a0  34 00 20 00 4C 00 30 00 30 00 30 00 30 00 20 00
+17b0  43 00 30 00 30 00 30 00 30 00 20 00 4F 00 30 00
+17c0  30 00 30 00 30 00 30 00 30 00 30 00 30 00 0D 00
+17d0  0A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+17e0  4E 00 47 00 53 00 30 00 20 00 45 00 35 00 30 00
+17f0  30 00 20 00 4C 00 30 00 30 00 30 00 30 00 20 00
+1800  43 00 30 00 30 00 30 00 30 00 20 00 4F 00 30 00
+1810  30 00 30 00 30 00 30 00 30 00 30 00 30 00 0D 00
+1820  0A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1830  4E 00 47 00 53 00 30 00 20 00 45 00 30 00 30 00
+1840  31 00 20 00 4C 00 30 00 30 00 30 00 30 00 20 00
+1850  43 00 30 00 30 00 30 00 30 00 20 00 4F 00 30 00
+1860  30 00 30 00 30 00 30 00 30 00 30 00 30 00 0D 00
+1870  0A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1880  4E 00 47 00 53 00 30 00 20 00 45 00 30 00 30 00
+1890  32 00 20 00 4C 00 30 00 30 00 30 00 30 00 20 00
+18a0  43 00 30 00 30 00 30 00 30 00 20 00 4F 00 30 00
+18b0  30 00 30 00 30 00 30 00 30 00 30 00 30 00 0D 00
+18c0  0A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+18d0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+18e0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+18f0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1900  00 10 00 40 01 00 00 00 00 00 00 00 00 00 00 00
+1910  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1920  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1930  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1940  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1950  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1960  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1970  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1980  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1990  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+19a0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+19b0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+19c0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+19d0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+19e0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+19f0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a00  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a10  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a20  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a30  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a40  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a50  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a60  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a70  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a80  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1a90  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1aa0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1ab0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1ac0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1ad0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1ae0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1af0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b00  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b10  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b20  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b30  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b40  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b50  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b60  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b70  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b80  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1b90  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1ba0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1bb0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1bc0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1bd0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1be0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1bf0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c00  00 30 00 00 0C 00 00 00 00 A3 00 00 00 00 00 00
+1c10  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c20  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c30  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c40  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c50  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c60  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c70  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c80  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1c90  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1ca0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1cb0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1cc0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1cd0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1ce0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1cf0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d00  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d10  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d20  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d30  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d40  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d50  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d60  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d70  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d80  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1d90  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1da0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1db0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1dc0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1dd0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1de0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+1df0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+## 11. Interdiction de matérialisation
+
+Ne pas décoder ce dump en `seed-b1.2-r1.efi`, ne pas le comparer comme golden
+au candidat vérifié et ne pas utiliser ses métriques pour annoncer B1.2. Il peut
+uniquement servir à comprendre l'ancienne tentative. La provenance, les hashes,
+l'inspection et les boots B1.2 autoritatifs sont reliés depuis le manifeste
+GREEN canonique.

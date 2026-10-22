@@ -1,0 +1,4 @@
+module grammar.test
+target x86_64-nexora-none
+const x:expand T(1,
+)=0;

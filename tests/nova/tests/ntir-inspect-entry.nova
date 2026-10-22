@@ -1,0 +1,97 @@
+module ntir_inspect_entry;
+import ntasm_ast;
+import ntasm_parser;
+import ntasm_macro_splice;
+import ntir;
+import ntasm_ntir_inspect;
+
+// One entry, seven modes, so a gate can reach every claim ntir_inspect.nova
+// makes without a second image and without a second parser.
+//
+// THE IMAGE IS BUILT BY THE NORMAL ROUTE, AND THAT IS THE WHOLE POINT OF
+// MODE 0. The route here is the one validate.nova itself runs: parse, then
+// the expansion stage through ntasm_macro_splice, then ntir.build on the
+// tree the expansion handed back, then ntir.verify. It is NOT a hand-written
+// buffer of words. The distinction is the whole measurement: an image a gate
+// composed itself would prove only that the inspector can read the shape a
+// gate imagined, and the plan asks for a program compiled the ordinary way
+// to produce an inspectable NTIR. So mode 0 is the only mode that parses,
+// and every other mode reads `words` exactly as mode 0 left it.
+//
+//   mode 0  the production route. report[0]=node_count, [1]=typed_count,
+//           [2]=0, [3]=0. The expansion, build and verify codes come back as
+//           the return value, so a refusal is attributable to a stage rather
+//           than being one undifferentiated nonzero.
+//   mode 1  inspect over the image in `words`: the nine summary words into
+//           report. No parse, no build.
+//   mode 2  the KIND TABLE: every entry, four words each, into report. It
+//           reads no image at all, because the table is not in the image.
+//   mode 4  the kind names. `index` is the table's one-based INDEX when
+//           `which` is 0 and the kind NUMBER when `which` is 1, and the two
+//           refusals that come back are different numbers on purpose. The
+//           bytes land in `text` and the count in text_length[0].
+//   mode 5  the node accessors. `index` is the one-based node id and `which`
+//           selects: 0 inspect_node's sixteen words into report, 1
+//           inspect_typed's five into report, and 2 copy_node_text's span
+//           bytes into text. Anything else is 800 rather than a default, so
+//           a mistyped selector cannot read as a successful call.
+//   mode 6  the EFFECT ATOMS of node `index`: `which` selects the set, 0 the
+//           effects set and 1 the clobbers set. The spans are concatenated
+//           into text, the atom node ids into report, and the byte count into
+//           text_length[0].
+//   mode 7  child_at: the `which`-th one-based child of node `index` into
+//           report[0].
+//
+// A signature written on one line stops parsing when the line gets long and
+// the error lands far from the cause, so this one is split in two.
+export fn main(source:buf<u8>,mode:u64,index:u64,which:u64,words:buf<u64>,
+        word_count:u64,text:buf<u8>,text_length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<24 || len(text_length)<1 { return 800; }
+    if mode==2 { return ntasm_ntir_inspect.kinds(report); }
+    if mode==4 {
+        if which==1 { return ntasm_ntir_inspect.copy_kind_name_of(index,text,text_length); }
+        return ntasm_ntir_inspect.copy_kind_name(index,text,text_length);
+    }
+    if mode>=1 {
+        if len(words)<8 { return 800; }
+        let count:u64=words[3];
+        if count==0 { return 800; }
+        if mode==1 { return ntasm_ntir_inspect.inspect(words,count,report); }
+        if mode==3 { return ntir.verify(words,count,report); }
+        if mode==5 {
+            if which==0 { return ntasm_ntir_inspect.inspect_node(words,count,index,report); }
+            if which==1 { return ntasm_ntir_inspect.inspect_typed(words,count,index,report); }
+            if which==2 { return ntasm_ntir_inspect.copy_node_text(source,words,count,index,text,text_length); }
+            return 800;
+        }
+        if mode==6 { return ntasm_ntir_inspect.effect_atoms(source,words,count,index,which,text,report,text_length); }
+        if mode==7 { return ntasm_ntir_inspect.child_at(words,count,index,which,report); }
+        return 800;
+    }
+    // ---- mode 0: the production route, stage by stage.
+    if word_count<ntir.HEADER_WORDS() { return 800; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree); return 800; }
+    let scratch:buf<u64>=alloc(runtime(),6);
+    let s:ntasm_macro_splice.Splice=ntasm_macro_splice.blank_splice(source,tree);
+    let mut code:u64=ntasm_macro_splice.expand_stage(s,scratch);
+    if code==0 {
+        let unit:ntasm_ast.Tree=ntasm_macro_splice.unit_of(s);
+        let n:u64=unit.node_count;
+        let needed:u64=ntir.HEADER_WORDS()+n*ntir.NODE_WORDS();
+        if n==0 || word_count<needed { code=800; }
+        else {
+            code=ntir.build(s.text,unit,words,word_count);
+            if code==0 { code=ntir.verify(words,words[3],report); }
+        }
+    }
+    ntasm_macro_splice.splice_release(s);
+    rt_free(runtime(),scratch);
+    ntasm_ast.release(tree);
+    if code!=0 { return code; }
+    report[0]=words[3];
+    report[1]=words[7];
+    report[2]=0;
+    report[3]=0;
+    return 0;
+}

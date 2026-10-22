@@ -1,0 +1,1659 @@
+module x64_fixed;
+
+// ===========================================================================
+// THE OWNERSHIP OF THE MNEMONIC LITERALS IN THIS FILE.
+//
+// A string literal in Nova is a FRESH host buffer: `let nop:buf<u8>="nop";`
+// allocates one on every evaluation, and the allocation is the caller's to
+// release. Every mnemonic below was therefore a handle that this module
+// allocated and never released, and a name that is not a mnemonic leaked every
+// one of them: `encode` alone allocated TWENTY-SEVEN of them and released
+// NONE. Measured on the 56-source reconstruction, those leaks were 23700 live
+// handles, and the 65536-handle table was exhausted before the compiler could
+// finish.
+//
+// THE RULE, and it is the same rule everywhere in this file:
+//
+//   a literal is compared ONCE, the answer is kept in a local bool, and the
+//   literal is released IMMEDIATELY, before any other work and before any
+//   return that could be taken.
+//
+// The bools replace the comparisons in the if/else chains, so the ORDER of the
+// comparisons, the chosen branch, the bytes written into `out` and the refusal
+// codes are all EXACTLY what they were. The only thing that changed is that
+// the temporaries no longer outlive the question they were asked. `name` and
+// `out` are the CALLER's buffers and are never released here.
+//
+// The comparisons are pure, so evaluating all of them instead of stopping at
+// the first match changes no answer; it only costs a call that the short
+// chain used to skip.
+// ===========================================================================
+
+fn same(name:buf<u8>,text:buf<u8>)->bool {
+    if len(name)!=len(text) { return false; }
+    let mut i:u64=0;
+    while i<len(text) {
+        if name[i]!=text[i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Encode the fixed zero-operand forms of the x86_64 oracle. Output is
+// transactional: out[0] is length and out[1..3] are instruction bytes only on
+// success. Diagnostics match the native encoder:401 mnemonic,402 operand
+// count,404 features,405 privilege. 800 is an invalid output buffer.
+export fn encode(name:buf<u8>,operand_count:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<4 { return 800; }
+    if cpl>3 { return 405; }
+
+    let mut packed:u64=0;
+    let mut length:u64=0;
+    let mut required:u64=0;
+    let mut maximum_cpl:u64=0;
+
+    let nop:buf<u8>="nop";let is_nop:bool=same(name,nop);rt_free(runtime(),nop);
+    let pause:buf<u8>="pause";let is_pause:bool=same(name,pause);rt_free(runtime(),pause);
+    let ud2:buf<u8>="ud2";let is_ud2:bool=same(name,ud2);rt_free(runtime(),ud2);
+    let cpuid:buf<u8>="cpuid";let is_cpuid:bool=same(name,cpuid);rt_free(runtime(),cpuid);
+    let cbw:buf<u8>="cbw";let is_cbw:bool=same(name,cbw);rt_free(runtime(),cbw);
+    let cwde:buf<u8>="cwde";let is_cwde:bool=same(name,cwde);rt_free(runtime(),cwde);
+    let cdqe:buf<u8>="cdqe";let is_cdqe:bool=same(name,cdqe);rt_free(runtime(),cdqe);
+    let cwd:buf<u8>="cwd";let is_cwd:bool=same(name,cwd);rt_free(runtime(),cwd);
+    let cdq:buf<u8>="cdq";let is_cdq:bool=same(name,cdq);rt_free(runtime(),cdq);
+    let cqo:buf<u8>="cqo";let is_cqo:bool=same(name,cqo);rt_free(runtime(),cqo);
+    let pushfq:buf<u8>="pushfq";let is_pushfq:bool=same(name,pushfq);rt_free(runtime(),pushfq);
+    let popfq:buf<u8>="popfq";let is_popfq:bool=same(name,popfq);rt_free(runtime(),popfq);
+    let rdtsc:buf<u8>="rdtsc";let is_rdtsc:bool=same(name,rdtsc);rt_free(runtime(),rdtsc);
+    let lfence:buf<u8>="lfence";let is_lfence:bool=same(name,lfence);rt_free(runtime(),lfence);
+    let sfence:buf<u8>="sfence";let is_sfence:bool=same(name,sfence);rt_free(runtime(),sfence);
+    let mfence:buf<u8>="mfence";let is_mfence:bool=same(name,mfence);rt_free(runtime(),mfence);
+    let cli:buf<u8>="cli";let is_cli:bool=same(name,cli);rt_free(runtime(),cli);
+    let sti:buf<u8>="sti";let is_sti:bool=same(name,sti);rt_free(runtime(),sti);
+    let hlt:buf<u8>="hlt";let is_hlt:bool=same(name,hlt);rt_free(runtime(),hlt);
+    let swapgs:buf<u8>="swapgs";let is_swapgs:bool=same(name,swapgs);rt_free(runtime(),swapgs);
+    let rdmsr:buf<u8>="rdmsr";let is_rdmsr:bool=same(name,rdmsr);rt_free(runtime(),rdmsr);
+    let wrmsr:buf<u8>="wrmsr";let is_wrmsr:bool=same(name,wrmsr);rt_free(runtime(),wrmsr);
+    let syscall:buf<u8>="syscall";let is_syscall:bool=same(name,syscall);rt_free(runtime(),syscall);
+    let sysretq:buf<u8>="sysretq";let is_sysretq:bool=same(name,sysretq);rt_free(runtime(),sysretq);
+    let iretq:buf<u8>="iretq";let is_iretq:bool=same(name,iretq);rt_free(runtime(),iretq);
+    let ret:buf<u8>="ret";let is_ret:bool=same(name,ret);rt_free(runtime(),ret);
+    let return_:buf<u8>="return";let is_return:bool=same(name,return_);rt_free(runtime(),return_);
+
+    if is_nop { packed=144;length=1;required=1;maximum_cpl=3; }
+    else if is_pause { packed=37107;length=2;required=1;maximum_cpl=3; }
+    else if is_ud2 { packed=2831;length=2;required=1;maximum_cpl=3; }
+    else if is_cpuid { packed=41487;length=2;required=1;maximum_cpl=3; }
+    else if is_cbw { packed=39014;length=2;required=1;maximum_cpl=3; }
+    else if is_cwde { packed=152;length=1;required=1;maximum_cpl=3; }
+    else if is_cdqe { packed=38984;length=2;required=1;maximum_cpl=3; }
+    else if is_cwd { packed=39270;length=2;required=1;maximum_cpl=3; }
+    else if is_cdq { packed=153;length=1;required=1;maximum_cpl=3; }
+    else if is_cqo { packed=39240;length=2;required=1;maximum_cpl=3; }
+    else if is_pushfq { packed=156;length=1;required=1;maximum_cpl=3; }
+    else if is_popfq { packed=157;length=1;required=1;maximum_cpl=0; }
+    else if is_rdtsc { packed=12559;length=2;required=17;maximum_cpl=0; }
+    else if is_lfence { packed=15248911;length=3;required=9;maximum_cpl=3; }
+    else if is_sfence { packed=16297487;length=3;required=9;maximum_cpl=3; }
+    else if is_mfence { packed=15773199;length=3;required=9;maximum_cpl=3; }
+    else if is_cli { packed=250;length=1;required=1;maximum_cpl=0; }
+    else if is_sti { packed=251;length=1;required=1;maximum_cpl=0; }
+    else if is_hlt { packed=244;length=1;required=1;maximum_cpl=0; }
+    else if is_swapgs { packed=16253199;length=3;required=1;maximum_cpl=0; }
+    else if is_rdmsr { packed=12815;length=2;required=3;maximum_cpl=0; }
+    else if is_wrmsr { packed=12303;length=2;required=3;maximum_cpl=0; }
+    else if is_syscall { packed=1295;length=2;required=5;maximum_cpl=3; }
+    else if is_sysretq { packed=462664;length=3;required=5;maximum_cpl=0; }
+    else if is_iretq { packed=53064;length=2;required=1;maximum_cpl=0; }
+    else if is_ret { packed=195;length=1;required=1;maximum_cpl=3; }
+    else if is_return { packed=195;length=1;required=1;maximum_cpl=3; }
+    else { return 401; }
+
+    if operand_count!=0 { return 402; }
+    if (features&required)!=required { return 404; }
+    if cpl>maximum_cpl { return 405; }
+
+    out[0]=u8(length);
+    out[1]=u8(packed&255);
+    out[2]=u8((packed>>8)&255);
+    out[3]=u8((packed>>16)&255);
+    return 0;
+}
+
+// Encode the register-to-register form of mov/add/or/adc/sbb/and/sub/xor/cmp.
+// Register numbers are the architectural GPR families0..15. Both operands use
+// the same explicit width. out[0] is length and out[1..4] are bytes on success.
+export fn encode_rr(name:buf<u8>,operand_count:u64,destination:u64,source:u64,width:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<5 { return 800; }
+    if cpl>3 { return 405; }
+
+    let mov:buf<u8>="mov";let is_mov:bool=same(name,mov);rt_free(runtime(),mov);
+    let add:buf<u8>="add";let is_add:bool=same(name,add);rt_free(runtime(),add);
+    let or_:buf<u8>="or";let is_or:bool=same(name,or_);rt_free(runtime(),or_);
+    let adc:buf<u8>="adc";let is_adc:bool=same(name,adc);rt_free(runtime(),adc);
+    let sbb:buf<u8>="sbb";let is_sbb:bool=same(name,sbb);rt_free(runtime(),sbb);
+    let and_:buf<u8>="and";let is_and:bool=same(name,and_);rt_free(runtime(),and_);
+    let sub:buf<u8>="sub";let is_sub:bool=same(name,sub);rt_free(runtime(),sub);
+    let xor_:buf<u8>="xor";let is_xor:bool=same(name,xor_);rt_free(runtime(),xor_);
+    let cmp:buf<u8>="cmp";let is_cmp:bool=same(name,cmp);rt_free(runtime(),cmp);
+
+    let mut group:u64=9;
+    if is_mov { group=8; }
+    else if is_add { group=0; }
+    else if is_or { group=1; }
+    else if is_adc { group=2; }
+    else if is_sbb { group=3; }
+    else if is_and { group=4; }
+    else if is_sub { group=5; }
+    else if is_xor { group=6; }
+    else if is_cmp { group=7; }
+    else { return 401; }
+
+    if operand_count!=2 { return 402; }
+    if (features&1)!=1 { return 404; }
+    if width!=8&&width!=16&&width!=32&&width!=64 { return 403; }
+    if destination>15||source>15 { return 406; }
+
+    let mut opcode:u64=0;
+    if group==8 {
+        if width==8 { opcode=136; } else { opcode=137; }
+    } else {
+        opcode=group*8;
+        if width!=8 { opcode=opcode+1; }
+    }
+
+    let mut rex:u64=0;
+    if width==64 { rex=rex|8; }
+    if source>=8 { rex=rex|4; }
+    if destination>=8 { rex=rex|1; }
+    if width==8&&(source>=4||destination>=4) { rex=rex|64; }
+
+    let mut length:u64=2;
+    if width==16 { length=length+1; }
+    if rex!=0 { length=length+1; }
+
+    out[0]=u8(length);
+    out[1]=0;out[2]=0;out[3]=0;out[4]=0;
+    let mut at:u64=1;
+    if width==16 { out[at]=102;at=at+1; }
+    if rex!=0 { out[at]=u8(64|rex);at=at+1; }
+    out[at]=u8(opcode);at=at+1;
+    out[at]=u8(192|((source&7)<<3)|(destination&7));
+    return 0;
+}
+
+fn immediate_fits(value:u64,is_signed:u64,width:u64,sign_extended:bool)->bool {
+    if width==64 { return true; }
+    if is_signed==1 {
+        let maximum:u64=(1<<(width-1))-1;
+        let minimum:u64=18446744073709551615-maximum;
+        return value<=maximum||value>=minimum;
+    }
+    let mut maximum:u64=0;
+    if sign_extended { maximum=(1<<(width-1))-1; }
+    else { maximum=(1<<width)-1; }
+    return value<=maximum;
+}
+
+// Encode mov or the eight arithmetic groups with a GPR destination and an
+// immediate source. Immediate signedness carries the full u64 two's-complement
+// convention of the native oracle. Output is transactional and uses out[0] as
+// length followed by up to15 instruction bytes.
+export fn encode_ri(name:buf<u8>,operand_count:u64,destination:u64,width:u64,immediate:u64,immediate_is_signed:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16 { return 800; }
+    if cpl>3 { return 405; }
+
+    let mov:buf<u8>="mov";let is_mov:bool=same(name,mov);rt_free(runtime(),mov);
+    let add:buf<u8>="add";let is_add:bool=same(name,add);rt_free(runtime(),add);
+    let or_:buf<u8>="or";let is_or:bool=same(name,or_);rt_free(runtime(),or_);
+    let adc:buf<u8>="adc";let is_adc:bool=same(name,adc);rt_free(runtime(),adc);
+    let sbb:buf<u8>="sbb";let is_sbb:bool=same(name,sbb);rt_free(runtime(),sbb);
+    let and_:buf<u8>="and";let is_and:bool=same(name,and_);rt_free(runtime(),and_);
+    let sub:buf<u8>="sub";let is_sub:bool=same(name,sub);rt_free(runtime(),sub);
+    let xor_:buf<u8>="xor";let is_xor:bool=same(name,xor_);rt_free(runtime(),xor_);
+    let cmp:buf<u8>="cmp";let is_cmp:bool=same(name,cmp);rt_free(runtime(),cmp);
+
+    let mut group:u64=9;
+    if is_mov { group=8; }
+    else if is_add { group=0; }
+    else if is_or { group=1; }
+    else if is_adc { group=2; }
+    else if is_sbb { group=3; }
+    else if is_and { group=4; }
+    else if is_sub { group=5; }
+    else if is_xor { group=6; }
+    else if is_cmp { group=7; }
+    else { return 401; }
+
+    if operand_count!=2 { return 402; }
+    if (features&1)!=1 { return 404; }
+    if width!=8&&width!=16&&width!=32&&width!=64 { return 403; }
+    if destination>15 { return 406; }
+    if immediate_is_signed>1 { return 412; }
+
+    let mut opcode:u64=0;
+    let mut digit:u64=0;
+    let mut immediate_bytes:u64=0;
+    let mut accumulator:bool=false;
+    let mut compact:bool=false;
+
+    if group==8 {
+        if immediate_fits(immediate,immediate_is_signed,width,false)==false { return 407; }
+        if width==8 { opcode=176; } else { opcode=184; }
+        opcode=opcode+(destination&7);
+        immediate_bytes=width/8;
+    } else {
+        if width==64 {
+            if immediate_fits(immediate,immediate_is_signed,32,true)==false { return 407; }
+        } else if immediate_fits(immediate,immediate_is_signed,width,false)==false { return 407; }
+        compact=immediate_fits(immediate,immediate_is_signed,8,true);
+        accumulator=destination==0&&(width==8||compact==false);
+        if accumulator {
+            opcode=group*8;
+            if width==8 { opcode=opcode+4;immediate_bytes=1; }
+            else {
+                opcode=opcode+5;
+                if width==16 { immediate_bytes=2; } else { immediate_bytes=4; }
+            }
+        } else {
+            if width==8 { opcode=128;immediate_bytes=1; }
+            else if compact { opcode=131;immediate_bytes=1; }
+            else {
+                opcode=129;
+                if width==16 { immediate_bytes=2; } else { immediate_bytes=4; }
+            }
+            digit=group;
+        }
+    }
+
+    let mut rex:u64=0;
+    if width==64 { rex=rex|8; }
+    if destination>=8 { rex=rex|1; }
+    if width==8&&destination>=4 { rex=rex|64; }
+    if accumulator { rex=0;if width==64 { rex=8; } }
+
+    let mut length:u64=1+immediate_bytes;
+    if accumulator==false&&group!=8 { length=length+1; }
+    if width==16 { length=length+1; }
+    if rex!=0 { length=length+1; }
+
+    out[0]=u8(length);
+    let mut clear:u64=1;
+    while clear<16 { out[clear]=0;clear=clear+1; }
+    let mut at:u64=1;
+    if width==16 { out[at]=102;at=at+1; }
+    if rex!=0 { out[at]=u8(64|rex);at=at+1; }
+    out[at]=u8(opcode);at=at+1;
+    if accumulator==false&&group!=8 {
+        out[at]=u8(192|((digit&7)<<3)|(destination&7));at=at+1;
+    }
+    let mut i:u64=0;
+    while i<immediate_bytes {
+        out[at+i]=u8((immediate>>(i*8))&255);
+        i=i+1;
+    }
+    return 0;
+}
+
+// Encode inc/dec/not/neg, and the multiply and divide group, with one GPR
+// operand. mul, div and idiv share the F6/F7 frame with not and neg and differ
+// only in the ModRM.reg digit -- 4, 6 and 7 against not's 2 and neg's 3 -- so
+// they belong to these two exports and not to new ones. The digit test below is
+// `digit<2`, which is what separates the FE/FF frame from the F6/F7 one, and
+// 4, 6 and 7 all fall on the F6/F7 side.
+export fn encode_unary(name:buf<u8>,operand_count:u64,destination:u64,width:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<5 { return 800; }
+    if cpl>3 { return 405; }
+    let inc:buf<u8>="inc";let is_inc:bool=same(name,inc);rt_free(runtime(),inc);
+    let dec:buf<u8>="dec";let is_dec:bool=same(name,dec);rt_free(runtime(),dec);
+    let not_:buf<u8>="not";let is_not:bool=same(name,not_);rt_free(runtime(),not_);
+    let neg:buf<u8>="neg";let is_neg:bool=same(name,neg);rt_free(runtime(),neg);
+    let mul:buf<u8>="mul";let is_mul:bool=same(name,mul);rt_free(runtime(),mul);
+    let div_:buf<u8>="div";let is_div:bool=same(name,div_);rt_free(runtime(),div_);
+    let idiv:buf<u8>="idiv";let is_idiv:bool=same(name,idiv);rt_free(runtime(),idiv);
+    let mut digit:u64=4;
+    if is_inc{digit=0;}else if is_dec{digit=1;}
+    else if is_not{digit=2;}else if is_neg{digit=3;}
+    else if is_mul{digit=4;}else if is_div{digit=6;}
+    else if is_idiv{digit=7;}
+    else{return 401;}
+    if operand_count!=1{return 402;}
+    if (features&1)!=1{return 404;}
+    if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+    if destination>15{return 406;}
+    let mut opcode:u64=0;
+    if digit<2{if width==8{opcode=254;}else{opcode=255;}}
+    else{if width==8{opcode=246;}else{opcode=247;}}
+    let mut rex:u64=0;if width==64{rex=8;}if destination>=8{rex=rex|1;}
+    if width==8&&destination>=4{rex=rex|64;}
+    let mut length:u64=2;if width==16{length=length+1;}if rex!=0{length=length+1;}
+    out[0]=u8(length);out[1]=0;out[2]=0;out[3]=0;out[4]=0;
+    let mut at:u64=1;if width==16{out[at]=102;at=at+1;}
+    if rex!=0{out[at]=u8(64|rex);at=at+1;}
+    out[at]=u8(opcode);at=at+1;
+    out[at]=u8(192|((digit&7)<<3)|(destination&7));return 0;
+}
+
+// Encode the immediate-count forms of rol/ror/shl/shr/sar for one GPR.
+export fn encode_shift_imm(name:buf<u8>,operand_count:u64,destination:u64,width:u64,amount:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<6{return 800;}if cpl>3{return 405;}
+    let rol:buf<u8>="rol";let is_rol:bool=same(name,rol);rt_free(runtime(),rol);
+    let ror:buf<u8>="ror";let is_ror:bool=same(name,ror);rt_free(runtime(),ror);
+    let shl:buf<u8>="shl";let is_shl:bool=same(name,shl);rt_free(runtime(),shl);
+    let shr:buf<u8>="shr";let is_shr:bool=same(name,shr);rt_free(runtime(),shr);
+    let sar:buf<u8>="sar";let is_sar:bool=same(name,sar);rt_free(runtime(),sar);
+    let mut digit:u64=8;
+    if is_rol{digit=0;}else if is_ror{digit=1;}
+    else if is_shl{digit=4;}else if is_shr{digit=5;}
+    else if is_sar{digit=7;}else{return 401;}
+    if operand_count!=2{return 402;}if (features&1)!=1{return 404;}
+    if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+    if destination>15{return 406;}if amount>255{return 407;}
+    let single:bool=amount==1;let mut opcode:u64=0;
+    if width==8{if single{opcode=208;}else{opcode=192;}}
+    else{if single{opcode=209;}else{opcode=193;}}
+    let mut rex:u64=0;if width==64{rex=8;}if destination>=8{rex=rex|1;}
+    if width==8&&destination>=4{rex=rex|64;}
+    let mut length:u64=2;if single==false{length=length+1;}
+    if width==16{length=length+1;}if rex!=0{length=length+1;}
+    out[0]=u8(length);out[1]=0;out[2]=0;out[3]=0;out[4]=0;out[5]=0;
+    let mut at:u64=1;if width==16{out[at]=102;at=at+1;}
+    if rex!=0{out[at]=u8(64|rex);at=at+1;}
+    out[at]=u8(opcode);at=at+1;out[at]=u8(192|((digit&7)<<3)|(destination&7));at=at+1;
+    if single==false{out[at]=u8(amount);}return 0;
+}
+
+// Encode call/jmp with REL32(kind4) or indirect GPR64(kind1).
+export fn encode_control(name:buf<u8>,operand_count:u64,kind:u64,width:u64,value:u64,is_signed:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<6{return 800;}if cpl>3{return 405;}
+    let call:buf<u8>="call";let is_call:bool=same(name,call);rt_free(runtime(),call);
+    let jmp:buf<u8>="jmp";let is_jmp:bool=same(name,jmp);rt_free(runtime(),jmp);
+    let mut call_:bool=false;
+    if is_call{call_=true;}else if is_jmp{call_=false;}else{return 401;}
+    if operand_count!=1{return 402;}if (features&1)!=1{return 404;}
+    if kind==4 {
+        if is_signed>1{return 412;}
+        if width!=0&&width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+        if width!=0&&immediate_fits(value,is_signed,width,false)==false{return 407;}
+        if immediate_fits(value,is_signed,32,true)==false{return 407;}
+        out[0]=5;if call_{out[1]=232;}else{out[1]=233;}
+        out[2]=u8(value&255);out[3]=u8((value>>8)&255);
+        out[4]=u8((value>>16)&255);out[5]=u8((value>>24)&255);return 0;
+    }
+    if kind==1 {
+        if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+        if value>15{return 406;}if width!=64{return 403;}
+        let mut at:u64=1;let mut length:u64=2;
+        if value>=8{out[at]=65;at=at+1;length=3;}
+        out[0]=u8(length);out[at]=255;at=at+1;
+        let mut digit:u64=4;if call_{digit=2;}
+        out[at]=u8(192|(digit<<3)|(value&7));
+        let mut clear:u64=at+1;while clear<6{out[clear]=0;clear=clear+1;}return 0;
+    }
+    return 409;
+}
+
+// Encode push/pop for GPR64(kind1), plus push immediate(kind2).
+export fn encode_stack(name:buf<u8>,operand_count:u64,kind:u64,width:u64,value:u64,is_signed:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<6{return 800;}if cpl>3{return 405;}
+    let push:buf<u8>="push";let is_push:bool=same(name,push);rt_free(runtime(),push);
+    let pop:buf<u8>="pop";let is_pop:bool=same(name,pop);rt_free(runtime(),pop);
+    let mut pushing:bool=false;
+    if is_push{pushing=true;}else if is_pop{pushing=false;}else{return 401;}
+    if operand_count!=1{return 402;}if (features&1)!=1{return 404;}
+    if kind==1 {
+        if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+        if value>15{return 406;}if width!=64{return 403;}
+        let mut at:u64=1;let mut length:u64=1;
+        if value>=8{out[at]=65;at=at+1;length=2;}
+        out[0]=u8(length);
+        if pushing{out[at]=u8(80+(value&7));}else{out[at]=u8(88+(value&7));}
+        let mut clear:u64=at+1;while clear<6{out[clear]=0;clear=clear+1;}return 0;
+    }
+    if kind==2 {
+        if is_signed>1{return 412;}
+        if width!=0&&width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+        if width!=0&&immediate_fits(value,is_signed,width,false)==false{return 407;}
+        if pushing==false{return 409;}
+        if immediate_fits(value,is_signed,8,true){out[0]=2;out[1]=106;out[2]=u8(value);out[3]=0;out[4]=0;out[5]=0;return 0;}
+        if immediate_fits(value,is_signed,32,true)==false{return 407;}
+        out[0]=5;out[1]=104;out[2]=u8(value&255);out[3]=u8((value>>8)&255);
+        out[4]=u8((value>>16)&255);out[5]=u8((value>>24)&255);return 0;
+    }
+    return 409;
+}
+
+// Encode the sixteen conditional near branches with a REL32 operand(kind4).
+export fn encode_jcc(name:buf<u8>,operand_count:u64,kind:u64,width:u64,displacement:u64,is_signed:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<7{return 800;}if cpl>3{return 405;}
+    let jo:buf<u8>="jo";let is_jo:bool=same(name,jo);rt_free(runtime(),jo);
+    let jno:buf<u8>="jno";let is_jno:bool=same(name,jno);rt_free(runtime(),jno);
+    let jb:buf<u8>="jb";let is_jb:bool=same(name,jb);rt_free(runtime(),jb);
+    let jae:buf<u8>="jae";let is_jae:bool=same(name,jae);rt_free(runtime(),jae);
+    let je:buf<u8>="je";let is_je:bool=same(name,je);rt_free(runtime(),je);
+    let jne:buf<u8>="jne";let is_jne:bool=same(name,jne);rt_free(runtime(),jne);
+    let jbe:buf<u8>="jbe";let is_jbe:bool=same(name,jbe);rt_free(runtime(),jbe);
+    let ja:buf<u8>="ja";let is_ja:bool=same(name,ja);rt_free(runtime(),ja);
+    let js:buf<u8>="js";let is_js:bool=same(name,js);rt_free(runtime(),js);
+    let jns:buf<u8>="jns";let is_jns:bool=same(name,jns);rt_free(runtime(),jns);
+    let jp:buf<u8>="jp";let is_jp:bool=same(name,jp);rt_free(runtime(),jp);
+    let jnp:buf<u8>="jnp";let is_jnp:bool=same(name,jnp);rt_free(runtime(),jnp);
+    let jl:buf<u8>="jl";let is_jl:bool=same(name,jl);rt_free(runtime(),jl);
+    let jge:buf<u8>="jge";let is_jge:bool=same(name,jge);rt_free(runtime(),jge);
+    let jle:buf<u8>="jle";let is_jle:bool=same(name,jle);rt_free(runtime(),jle);
+    let jg:buf<u8>="jg";let is_jg:bool=same(name,jg);rt_free(runtime(),jg);
+    let mut condition:u64=16;
+    if is_jo{condition=0;}else if is_jno{condition=1;}
+    else if is_jb{condition=2;}else if is_jae{condition=3;}
+    else if is_je{condition=4;}else if is_jne{condition=5;}
+    else if is_jbe{condition=6;}else if is_ja{condition=7;}
+    else if is_js{condition=8;}else if is_jns{condition=9;}
+    else if is_jp{condition=10;}else if is_jnp{condition=11;}
+    else if is_jl{condition=12;}else if is_jge{condition=13;}
+    else if is_jle{condition=14;}else if is_jg{condition=15;}
+    else{return 401;}
+    if operand_count!=1{return 402;}if (features&1)!=1{return 404;}
+    if kind==4 {
+        if is_signed>1{return 412;}
+        if width!=0&&width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+        if width!=0&&immediate_fits(displacement,is_signed,width,false)==false{return 407;}
+        if immediate_fits(displacement,is_signed,32,true)==false{return 407;}
+    } else if kind==1 {
+        if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+        if displacement>15{return 406;}return 409;
+    } else{return 409;}
+    out[0]=6;out[1]=15;out[2]=u8(128+condition);out[3]=u8(displacement&255);
+    out[4]=u8((displacement>>8)&255);out[5]=u8((displacement>>16)&255);
+    out[6]=u8((displacement>>24)&255);return 0;
+}
+
+// Private: ModRM/SIB/displacement frame of one memory operand, shared by
+// encode_mov_memory and encode_lea. base16 means no base,17 RIP; index16 means
+// none. register is the ModRM.reg field. at is the destination offset and the
+// result is the offset just past the frame, so the instruction length is
+// result-1 whenever at started at 1.
+fn emit_memory_address(out:buf<u8>,at:u64,register:u64,base:u64,index:u64,scale:u64,displacement:u64)->u64 {
+    if base==17 {
+        out[at]=u8(((register&7)<<3)|5);
+        let mut rip:u64=0;
+        while rip<4 { out[at+1+rip]=u8((displacement>>(rip*8))&255); rip=rip+1; }
+        return at+5;
+    }
+    let mut mod:u64=0;let mut displacement_bytes:u64=0;
+    if base==16 { displacement_bytes=4; }
+    else if displacement==0&&(base&7)!=5 { mod=0; }
+    else if displacement<=127||displacement>=18446744073709551488 { mod=1;displacement_bytes=1; }
+    else { mod=2;displacement_bytes=4; }
+    let sib:bool=index!=16||base==16||(base&7)==4;
+    let mut field:u64=base&7;
+    if sib { field=4; }
+    let mut cursor:u64=at;
+    out[cursor]=u8((mod<<6)|((register&7)<<3)|field);
+    cursor=cursor+1;
+    if sib {
+        let mut scale_bits:u64=0;if scale==2{scale_bits=1;}else if scale==4{scale_bits=2;}else if scale==8{scale_bits=3;}
+        let mut index_bits:u64=index&7;if index==16{index_bits=4;}
+        let mut base_bits:u64=base&7;if base==16{base_bits=5;}
+        out[cursor]=u8((scale_bits<<6)|(index_bits<<3)|base_bits);
+        cursor=cursor+1;
+    }
+    let mut i:u64=0;
+    while i<displacement_bytes { out[cursor+i]=u8((displacement>>(i*8))&255); i=i+1; }
+    return cursor+displacement_bytes;
+}
+
+// Encode mov register<->memory. direction0 loads into register, direction1
+// stores the register. base16 means no base,17 RIP; index16 means none.
+export fn encode_mov_memory(direction:u64,register:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    if direction>1{return 412;}if (features&1)!=1{return 404;}
+    if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+    if register>15{return 406;}
+    if base>17||index>16||index==4{return 411;}
+    if scale!=1&&scale!=2&&scale!=4&&scale!=8{return 411;}
+    if index==16&&scale!=1{return 411;}
+    if base==17&&index!=16{return 411;}
+    if displacement>2147483647&&displacement<18446744071562067968{return 411;}
+    if segment>2{return 410;}
+
+    let mut rex:u64=0;if width==64{rex=8;}if register>=8{rex=rex|4;}
+    if base>=8&&base<=15{rex=rex|1;}if index>=8&&index<=15{rex=rex|2;}
+    if width==8&&register>=4{rex=rex|64;}
+    let mut opcode:u64=137;if width==8{opcode=136;}
+    if direction==0{if width==8{opcode=138;}else{opcode=139;}}
+
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let mut at:u64=1;if segment==1{out[at]=100;at=at+1;}else if segment==2{out[at]=101;at=at+1;}
+    if width==16{out[at]=102;at=at+1;}if rex!=0{out[at]=u8(64|rex);at=at+1;}
+    out[at]=u8(opcode);at=at+1;
+    let end:u64=emit_memory_address(out,at,register,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode lea of a memory address into one GPR (I04). base16 means no base,
+// 17 RIP; index16 means none. Output is transactional: out[0] is the length
+// and out[1..] the instruction bytes, both untouched on every diagnostic.
+//
+// It used to be the only memory export that took no `segment`, and it was
+// behind nt_x64_encode there while being ahead of it on width. The segment half
+// is closed; the width half is open and is a specification decision, not an
+// encoder decision. Both are measured, not asserted.
+//
+//   segment. Closed. This export used to take no segment and answered
+//   48 8d 43 08 for an fs address where the oracle answers 64 48 8d 03, so a
+//   caller forwarding a segmented address got wrong bytes rather than a
+//   diagnostic, and the only guard was the lowerer refusing at
+//   x64_lower_fixed.nova:451. It now takes the segment like the other eleven
+//   memory exports, validates it (410 above 2, the same order as
+//   encode_mov_memory) and emits it through emit_prefix_frame, so the prefix
+//   lands in the native order: segment, 0x66, REX. The two former gap cases at
+//   tests_ntasm_x64_lower_lea.c are parity rows now, and
+//   tests_ntasm_x64_lea.c sweeps both segments over five descriptors plus RIP
+//   and SIB. The parameter is declared per export in the surface manifest of
+//   that gate, so adding or dropping it there is a failure, not a silence.
+//
+//   width. Closed, and closed on a decision rather than on taste. This export
+//   used to accept destination widths 16 and 32 and emit the architectural
+//   0x66 and REX-without-W variants, which nt_x64_encode refuses with
+//   NT_X64_WIDTH at x64.c:176, so it was wider than the oracle and no NTASM
+//   source could reach the difference: x64_lower_fixed.nova refuses a non-64
+//   destination before this export is asked. An encoder capability no program
+//   can write and no oracle confirms is a defect below the language, not a
+//   feature of it, which is exactly why no end-to-end gate could see it. v0
+//   `lea` is width 64 only, normative in spec/ntasm/ntasm.md §6, and this export now
+//   refuses exactly what the oracle refuses. The gate lost its architectural
+//   reimplementation with it: tests_ntasm_x64_lea.c compares bytes where the
+//   oracle encodes and the code and the untouched buffer where it refuses, and
+//   has no second opinion left in it.
+export fn encode_lea(source_register:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    if (features&1)!=1{return 404;}
+    if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+    if source_register>15{return 406;}
+    if base>17||index>16||index==4{return 411;}
+    if scale!=1&&scale!=2&&scale!=4&&scale!=8{return 411;}
+    if index==16&&scale!=1{return 411;}
+    if base==17&&index!=16{return 411;}
+    if displacement>2147483647&&displacement<18446744071562067968{return 411;}
+    if segment>2{return 410;}
+    // The oracle validates the memory operand before rejecting a non-64 operand
+    // size, so width 8 answers 411/410 before 403 and only a well formed
+    // address reaches this check. NT_X64_WIDTH at x64.c:176 then refuses every
+    // destination that is not 64 bits, so this export refuses them too rather
+    // than emitting an architectural variant the oracle never produces.
+    if width!=64{return 403;}
+
+    let mut rex:u64=0;if width==64{rex=8;}if source_register>=8{rex=rex|4;}
+    if base>=8&&base<=15{rex=rex|1;}if index>=8&&index<=15{rex=rex|2;}
+
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    // The private the other six memory exports use, so the segment lands in
+    // the same place in the same order: segment, then 0x66, then REX, which is
+    // the order of the native prefix() at x64.c:88.
+    let mut at:u64=emit_prefix_frame(out,1,width,rex,segment);
+    out[at]=141;at=at+1;
+    let end:u64=emit_memory_address(out,at,source_register,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Private: REX contribution of one width-8 register operand. high8 selects
+// ah/ch/dh/bh, which only exist without any REX prefix; every other width-8
+// register from spl upwards needs the forced 0x40 bit, so a form that must
+// carry any REX next to a high8 operand is 408 (NT_X64_HIGH8_REX).
+fn width8_rex(register:u64,high8:u64)->u64 {
+    if high8==1{return 0;}
+    if register>=4{return 64;}
+    return 0;
+}
+
+// Encode rol/ror/shl/shr/sar with cl as the count (I12 R_CL). Only cl is a
+// legal count register, exactly as in the native oracle. high8 selects
+// ah/ch/dh/bh as the shifted operand and forbids any REX prefix. Output is
+// transactional: out[0] is the length, out[1..] the instruction bytes.
+export fn encode_shift_cl(name:buf<u8>,operand_count:u64,destination:u64,width:u64,count_register:u64,high8:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<6{return 800;}if cpl>3{return 405;}
+    let rol:buf<u8>="rol";let is_rol:bool=same(name,rol);rt_free(runtime(),rol);
+    let ror:buf<u8>="ror";let is_ror:bool=same(name,ror);rt_free(runtime(),ror);
+    let shl:buf<u8>="shl";let is_shl:bool=same(name,shl);rt_free(runtime(),shl);
+    let shr:buf<u8>="shr";let is_shr:bool=same(name,shr);rt_free(runtime(),shr);
+    let sar:buf<u8>="sar";let is_sar:bool=same(name,sar);rt_free(runtime(),sar);
+    let mut digit:u64=8;
+    if is_rol{digit=0;}else if is_ror{digit=1;}
+    else if is_shl{digit=4;}else if is_shr{digit=5;}
+    else if is_sar{digit=7;}else{return 401;}
+    if operand_count!=2{return 402;}if (features&1)!=1{return 404;}
+    if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+    if destination>15{return 406;}
+    if high8>1{return 406;}
+    if high8==1&&(width!=8||destination>3){return 406;}
+    if count_register!=1{return 406;}
+
+    let mut rex:u64=0;if width==64{rex=8;}if destination>=8{rex=rex|1;}
+    if width==8{rex=rex|width8_rex(destination,high8);}
+    // Invariant guard for the high8 rule. The operand checks above already make
+    // a high8 operand REX-free, so this never fires here; a form with a second
+    // register operand (xchg, cmov, bsf) is the first that can reach 408.
+    if rex!=0&&high8==1{return 408;}
+
+    let mut opcode:u64=211;if width==8{opcode=210;}
+    let regcode:u64=(destination+high8*4)&7;
+    let mut length:u64=2;
+    if width==16{length=length+1;}
+    if rex!=0{length=length+1;}
+    out[0]=u8(length);out[1]=0;out[2]=0;out[3]=0;out[4]=0;out[5]=0;
+    let mut at:u64=1;
+    if width==16{out[at]=102;at=at+1;}
+    if rex!=0{out[at]=u8(64|rex);at=at+1;}
+    out[at]=u8(opcode);at=at+1;
+    out[at]=u8(192|((digit&7)<<3)|regcode);
+    return 0;
+}
+
+// Private: the exact NtX64Operand validity rule of the native encoder for one
+// register or memory operand, so no family of the two-register lot re-derives
+// it. kind1 is a register and kind3 is memory, the native enum numbering; the
+// memory fields are read only for kind3. base16 means no base, 17 RIP; index16
+// means none. Returns 0 or the native 403/406/410/411 in the native order.
+fn operand_valid(kind:u64,width:u64,reg:u64,high8:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64)->u64 {
+    if kind==1 {
+        if width!=8&&width!=16&&width!=32&&width!=64 { return 403; }
+        if reg>15 { return 406; }
+        if high8>1 { return 406; }
+        if high8==1&&(width!=8||reg>3) { return 406; }
+        return 0;
+    }
+    if kind==3 {
+        if width!=0&&width!=8&&width!=16&&width!=32&&width!=64&&width!=80 { return 403; }
+        if base>17 { return 411; }
+        if index>16 { return 411; }
+        if index==4 { return 411; }
+        if scale!=1&&scale!=2&&scale!=4&&scale!=8 { return 411; }
+        if index==16&&scale!=1 { return 411; }
+        if base==17&&index!=16 { return 411; }
+        if displacement>2147483647&&displacement<18446744071562067968 { return 411; }
+        if segment>2 { return 410; }
+        return 0;
+    }
+    return 409;
+}
+
+// Private: both operand descriptors of a two-register form, validated in the
+// native order. The memory descriptor belongs to whichever operand is a memory
+// and is ignored by the other, exactly as in the native struct. Returns 0 or
+// the first diagnostic, so every caller stays transactional by checking this
+// before it writes a single byte of out.
+fn validate_pair(a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64)->u64 {
+    let bad0:u64=operand_valid(a0_kind,a0_width,a0_reg,a0_high8,base,index,scale,displacement,segment);
+    if bad0!=0 { return bad0; }
+    return operand_valid(a1_kind,a1_width,a1_reg,a1_high8,base,index,scale,displacement,segment);
+}
+
+// Private: the REX bits the native modrm() derives for one register plus
+// register-or-memory pair. width is the operand-size prefix, reg/reg_high8 the
+// ModRM.reg operand and rm_kind1 or 3 the ModRM.rm operand. reg_width and
+// rm_width are the operand widths because a width-conversion form is wider in
+// reg than in rm. The width-8 REX bit is reused from width8_rex.
+fn pair_rex(width:u64,reg:u64,reg_high8:u64,reg_width:u64,rm_kind:u64,rm_reg:u64,rm_high8:u64,rm_width:u64,base:u64,index:u64)->u64 {
+    let mut rex:u64=0;
+    if width==64 { rex=8; }
+    if reg>=8 { rex=rex|4; }
+    if rm_kind==1 {
+        if rm_reg>=8 { rex=rex|1; }
+        if rm_width==8 { rex=rex|width8_rex(rm_reg,rm_high8); }
+        if reg_width==8 { rex=rex|width8_rex(reg,reg_high8); }
+        return rex;
+    }
+    if base>=8&&base<=15 { rex=rex|1; }
+    if index>=8&&index<=15 { rex=rex|2; }
+    if reg_width==8 { rex=rex|width8_rex(reg,reg_high8); }
+    return rex;
+}
+
+// Private: the high8 selector the native prefix() receives for the same pair.
+// A memory rm carries only the reg high8; a register rm forbids REX as soon as
+// either operand is high8.
+fn pair_high8(reg_high8:u64,rm_kind:u64,rm_high8:u64)->u64 {
+    if rm_kind==1 { return rm_high8+reg_high8; }
+    return reg_high8;
+}
+
+// Private: the native prefix() refusal. A REX byte next to a high8 register
+// operand is 408, the condition no single-register-operand export can reach
+// because nothing else forces REX 0x40 beside the high8 operand.
+fn high8_rex_conflict(rex:u64,high8:u64)->bool {
+    if rex!=0&&high8!=0 { return true; }
+    return false;
+}
+
+// Private: the native prefix() bytes, segment then 0x66 then REX. The caller
+// has already answered every diagnostic, so nothing here can refuse.
+fn emit_prefix_frame(out:buf<u8>,at:u64,width:u64,rex:u64,segment:u64)->u64 {
+    let mut cursor:u64=at;
+    if segment==1 { out[cursor]=100;cursor=cursor+1; }
+    else if segment==2 { out[cursor]=101;cursor=cursor+1; }
+    if width==16 { out[cursor]=102;cursor=cursor+1; }
+    if rex!=0 { out[cursor]=u8(64|rex);cursor=cursor+1; }
+    return cursor;
+}
+
+// Private: the two-operand ModRM frame of the native modrm() call sites, with a
+// register in ModRM.reg and either a register (rm_kind1) or a memory (rm_kind3)
+// in ModRM.rm. reg_code and rm_code are the regcode() values already reduced to
+// three bits; rm_segment is the memory segment and 0 for a register rm. Returns
+// the offset just past the frame, so with at starting at 1 the instruction
+// length is the result minus one.
+fn emit_pair(out:buf<u8>,at:u64,width:u64,rex:u64,rm_segment:u64,opcode:u64,opcode_bytes:u64,reg_code:u64,rm_kind:u64,rm_code:u64,base:u64,index:u64,scale:u64,displacement:u64)->u64 {
+    let mut frame:u64=emit_prefix_frame(out,at,width,rex,rm_segment);
+    let mut i:u64=0;
+    while i<opcode_bytes { out[frame+i]=u8((opcode>>(i*8))&255);i=i+1; }
+    frame=frame+opcode_bytes;
+    if rm_kind==1 { out[frame]=u8(192|((reg_code&7)<<3)|(rm_code&7));return frame+1; }
+    return emit_memory_address(out,frame,reg_code,base,index,scale,displacement);
+}
+
+// Encode xchg of a register with a register or a memory operand (I26). a0 and a1
+// are the native operand order: a0 is always a register and a1 a register or a
+// memory. The native encoder has no 0x90+reg shortening, so a same-register
+// xchg is the plain 0x86/0x87 ModRM form and this export reproduces that form
+// rather than the architectural shorthand. Output is transactional: out[0] is
+// the length and out[1..] the bytes, both untouched on every diagnostic.
+export fn encode_xchg(name:buf<u8>,operand_count:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let mnemonic:buf<u8>="xchg";let is_xchg:bool=same(name,mnemonic);rt_free(runtime(),mnemonic);
+    if is_xchg==false{return 401;}
+    if operand_count!=2{return 402;}
+    if (features&1)!=1{return 404;}
+    let bad:u64=validate_pair(a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if a0_kind!=1{return 409;}
+    if a1_kind!=1&&a1_kind!=3{return 409;}
+    if a0_width!=a1_width{return 403;}
+
+    // The native call puts a register second operand in ModRM.reg and keeps
+    // operand 0 in ModRM.rm; a memory second operand reverses that.
+    let mut reg:u64=a1_reg;let mut reg_high8:u64=a1_high8;let mut reg_width:u64=a1_width;
+    let mut rm_kind:u64=1;let mut rm_reg:u64=a0_reg;let mut rm_high8:u64=a0_high8;let mut rm_width:u64=a0_width;
+    if a1_kind==3{reg=a0_reg;reg_high8=a0_high8;reg_width=a0_width;rm_kind=3;rm_reg=0;rm_high8=0;rm_width=a1_width;}
+    let mut rm_segment:u64=0;if rm_kind==3{rm_segment=segment;}
+    let rex:u64=pair_rex(a0_width,reg,reg_high8,reg_width,rm_kind,rm_reg,rm_high8,rm_width,base,index);
+    let high8:u64=pair_high8(reg_high8,rm_kind,rm_high8);
+    if high8_rex_conflict(rex,high8){return 408;}
+
+    let mut opcode:u64=134;if a0_width!=8{opcode=135;}
+    let reg_code:u64=(reg+reg_high8*4)&7;
+    let rm_code:u64=(rm_reg+rm_high8*4)&7;
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,a0_width,rex,rm_segment,opcode,1,reg_code,rm_kind,rm_code,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode the sixteen cmov conditions over a register destination and a register
+// or memory source (I22). The native encoder requires a register destination,
+// so the memory-destination spelling is 409 and no width-8 form exists, which
+// also means no high8 operand and no 408. Output is transactional.
+export fn encode_cmov(name:buf<u8>,operand_count:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let cmove:buf<u8>="cmove";let is_cmove:bool=same(name,cmove);rt_free(runtime(),cmove);
+    let cmovne:buf<u8>="cmovne";let is_cmovne:bool=same(name,cmovne);rt_free(runtime(),cmovne);
+    let cmovb:buf<u8>="cmovb";let is_cmovb:bool=same(name,cmovb);rt_free(runtime(),cmovb);
+    let cmovae:buf<u8>="cmovae";let is_cmovae:bool=same(name,cmovae);rt_free(runtime(),cmovae);
+    let cmovbe:buf<u8>="cmovbe";let is_cmovbe:bool=same(name,cmovbe);rt_free(runtime(),cmovbe);
+    let cmova:buf<u8>="cmova";let is_cmova:bool=same(name,cmova);rt_free(runtime(),cmova);
+    let cmovs:buf<u8>="cmovs";let is_cmovs:bool=same(name,cmovs);rt_free(runtime(),cmovs);
+    let cmovns:buf<u8>="cmovns";let is_cmovns:bool=same(name,cmovns);rt_free(runtime(),cmovns);
+    let cmovp:buf<u8>="cmovp";let is_cmovp:bool=same(name,cmovp);rt_free(runtime(),cmovp);
+    let cmovnp:buf<u8>="cmovnp";let is_cmovnp:bool=same(name,cmovnp);rt_free(runtime(),cmovnp);
+    let cmovl:buf<u8>="cmovl";let is_cmovl:bool=same(name,cmovl);rt_free(runtime(),cmovl);
+    let cmovge:buf<u8>="cmovge";let is_cmovge:bool=same(name,cmovge);rt_free(runtime(),cmovge);
+    let cmovle:buf<u8>="cmovle";let is_cmovle:bool=same(name,cmovle);rt_free(runtime(),cmovle);
+    let cmovg:buf<u8>="cmovg";let is_cmovg:bool=same(name,cmovg);rt_free(runtime(),cmovg);
+    let cmovo:buf<u8>="cmovo";let is_cmovo:bool=same(name,cmovo);rt_free(runtime(),cmovo);
+    let cmovno:buf<u8>="cmovno";let is_cmovno:bool=same(name,cmovno);rt_free(runtime(),cmovno);
+    let mut cc:u64=16;
+    if is_cmove{cc=4;}else if is_cmovne{cc=5;}else if is_cmovb{cc=2;}else if is_cmovae{cc=3;}
+    else if is_cmovbe{cc=6;}else if is_cmova{cc=7;}else if is_cmovs{cc=8;}else if is_cmovns{cc=9;}
+    else if is_cmovp{cc=10;}else if is_cmovnp{cc=11;}else if is_cmovl{cc=12;}else if is_cmovge{cc=13;}
+    else if is_cmovle{cc=14;}else if is_cmovg{cc=15;}else if is_cmovo{cc=0;}else if is_cmovno{cc=1;}
+    else{return 401;}
+    if operand_count!=2{return 402;}
+    if (features&1)!=1{return 404;}
+    let bad:u64=validate_pair(a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if a0_kind!=1{return 409;}
+    if a1_kind!=1&&a1_kind!=3{return 409;}
+    if a0_width==8{return 403;}
+    if a0_width!=a1_width{return 403;}
+
+    let opcode:u64=16384+(cc*256)+15;
+    let rex:u64=pair_rex(a0_width,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index);
+    let high8:u64=pair_high8(a0_high8,a1_kind,a1_high8);
+    if high8_rex_conflict(rex,high8){return 408;}
+    let reg_code:u64=(a0_reg+a0_high8*4)&7;
+    let rm_code:u64=(a1_reg+a1_high8*4)&7;
+    let mut rm_segment:u64=0;if a1_kind==3{rm_segment=segment;}
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,a0_width,rex,rm_segment,opcode,2,reg_code,a1_kind,rm_code,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode bsf and bsr from a register destination and a register or memory source
+// (I25). The native encoder has no width-8 form, hence no high8 operand and no
+// 408, and requires a register destination so the memory-destination spelling
+// is 409. Output is transactional.
+export fn encode_bit_scan(name:buf<u8>,operand_count:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let bsf:buf<u8>="bsf";let is_bsf:bool=same(name,bsf);rt_free(runtime(),bsf);
+    let bsr:buf<u8>="bsr";let is_bsr:bool=same(name,bsr);rt_free(runtime(),bsr);
+    let mut opcode:u64=0;
+    if is_bsf{opcode=48143;}else if is_bsr{opcode=48399;}else{return 401;}
+    if operand_count!=2{return 402;}
+    if (features&1)!=1{return 404;}
+    let bad:u64=validate_pair(a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if a0_kind!=1{return 409;}
+    if a1_kind!=1&&a1_kind!=3{return 409;}
+    if a0_width==8{return 403;}
+    if a0_width!=a1_width{return 403;}
+
+    let rex:u64=pair_rex(a0_width,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index);
+    let high8:u64=pair_high8(a0_high8,a1_kind,a1_high8);
+    if high8_rex_conflict(rex,high8){return 408;}
+    let reg_code:u64=(a0_reg+a0_high8*4)&7;
+    let rm_code:u64=(a1_reg+a1_high8*4)&7;
+    let mut rm_segment:u64=0;if a1_kind==3{rm_segment=segment;}
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,a0_width,rex,rm_segment,opcode,2,reg_code,a1_kind,rm_code,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode bt, bts, btr and btc over a bit string and a bit index, in BOTH of the
+// shapes the native encoder admits and they are not the same shape.
+//
+// REGISTER INDEX: 0F A3/AB/B3/BB /r, and the roles are INVERTED against every
+// other two-register family here -- the BIT INDEX is the ModRM.reg operand and
+// the bit STRING is the ModRM.rm one. cmov and bsf put the destination in reg;
+// reading this export as if it did that would emit a valid instruction of a
+// different instruction, which is the bswap failure mode again.
+//
+// IMMEDIATE OFFSET: 0F BA /4..7 ib, where the operand is an immediate rather
+// than a register, the ModRM.reg field carries the opcode digit, and one
+// trailing byte carries the offset.
+//
+// Diagnostic order is the native order at x64.c:585-607: mnemonic, count,
+// feature, BOTH operands in order, then the bit-string kind rule, then the
+// bit-string width rule, and only then the index kind. Two of those are unusual
+// and are stated here because they are easy to get wrong: a width-8 bit string
+// is 409 FORM and not 403 WIDTH, and an index that is neither a register nor an
+// immediate is 409 rather than a width complaint.
+//
+// There is no high8 operand anywhere, so 408 is not reachable: a high8 index
+// would need width 8, and a width-8 index cannot equal a bit string's width
+// because the bit string refuses width 8 first.
+export fn encode_bit_test(name:buf<u8>,operand_count:u64,immediate:u64,immediate_is_signed:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let bt:buf<u8>="bt";let is_bt:bool=same(name,bt);rt_free(runtime(),bt);
+    let bts:buf<u8>="bts";let is_bts:bool=same(name,bts);rt_free(runtime(),bts);
+    let btr:buf<u8>="btr";let is_btr:bool=same(name,btr);rt_free(runtime(),btr);
+    let btc:buf<u8>="btc";let is_btc:bool=same(name,btc);rt_free(runtime(),btc);
+    let mut op:u64=4;
+    if is_bt{op=0;}else if is_bts{op=1;}
+    else if is_btr{op=2;}else if is_btc{op=3;}
+    else{return 401;}
+    if operand_count!=2{return 402;}
+    if (features&1)!=1{return 404;}
+    let bad0:u64=operand_valid(a0_kind,a0_width,a0_reg,a0_high8,base,index,scale,displacement,segment);
+    if bad0!=0{return bad0;}
+    if a1_kind==2 {
+        // The native IMM operand carries its own validity rule, which is not the
+        // register or memory one, so it is stated here rather than borrowed.
+        if immediate_is_signed>1{return 412;}
+        if a1_width!=0&&a1_width!=8&&a1_width!=16&&a1_width!=32&&a1_width!=64{return 403;}
+        if a1_width!=0&&immediate_fits(immediate,immediate_is_signed,a1_width,false)==false{return 407;}
+    } else {
+        let bad1:u64=operand_valid(a1_kind,a1_width,a1_reg,a1_high8,base,index,scale,displacement,segment);
+        if bad1!=0{return bad1;}
+    }
+    if a0_kind!=1&&a0_kind!=3{return 409;}
+    if a0_width==8{return 409;}
+
+    let mut opcode:u64=0;let mut opcode_bytes:u64=2;let mut trailing:u64=0;
+    let mut reg_code:u64=0;let mut rm_code:u64=0;let mut rex:u64=0;
+    let mut rm_kind:u64=a0_kind;let mut rm_segment:u64=0;
+    if a1_kind==1 {
+        if a1_width!=a0_width{return 403;}
+        // reg_opcodes is {0xa3,0xab,0xb3,0xbb}, so the byte is 163+op*8, and the
+        // native packs it as 0x0f + (byte << 8): little-endian, 0F first.
+        opcode=15+(163+op*8)*256;
+        rex=pair_rex(a0_width,a1_reg,a1_high8,a1_width,a0_kind,a0_reg,a0_high8,a0_width,base,index);
+        reg_code=(a1_reg+a1_high8*4)&7;
+    } else if a1_kind==2 {
+        if immediate>255{return 407;}
+        opcode=47631;
+        reg_code=4+op;
+        rex=pair_rex(a0_width,0,0,0,a0_kind,a0_reg,a0_high8,a0_width,base,index);
+        trailing=1;
+    } else { return 409; }
+    rm_code=(a0_reg+a0_high8*4)&7;
+    if rm_kind==3{rm_segment=segment;}
+
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let mut end:u64=emit_pair(out,1,a0_width,rex,rm_segment,opcode,opcode_bytes,reg_code,rm_kind,rm_code,base,index,scale,displacement);
+    if trailing!=0{out[end]=u8(immediate);end=end+1;}
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode ltr and invlpg, the two remaining one-operand SYSTEM instructions.
+//
+// They sit beside the descriptor group rather than inside it and that is a
+// naming decision with a reason: `0F 01` /0..3 is a descriptor table, `0F 01` /7
+// is a page-table invalidation, and `0F 00` /3 is a task register load. Calling
+// the last two "descriptors" would be a name that says the wrong thing about
+// them, which is the same defect class as folding bswap into the group-2 frame.
+//
+// What they DO share, and why this export exists rather than three names inside
+// an existing one: each is one operand, each passes reg = NULL to modrm() and
+// hands it width 32 so that prefix() emits neither 0x66 nor REX.W, each refuses
+// above cpl 0 with 405 BEFORE validating the operand, and each has its own width
+// rule -- 16 for ltr, 0 for invlpg, 80 for the four descriptors. That width is a
+// PER-NAME rule here, so the rule is carried beside the name rather than
+// inferred from the frame.
+export fn encode_system_one(name:buf<u8>,operand_count:u64,kind:u64,register:u64,high8:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let ltr:buf<u8>="ltr";let is_ltr:bool=same(name,ltr);rt_free(runtime(),ltr);
+    let invlpg:buf<u8>="invlpg";let is_invlpg:bool=same(name,invlpg);rt_free(runtime(),invlpg);
+    let mut digit:u64=4;let mut opcode:u64=0;let mut want_width:u64=0;let mut memory_only:bool=false;
+    if is_ltr{digit=3;opcode=15;want_width=16;memory_only=false;}
+    else if is_invlpg{digit=7;opcode=271;want_width=0;memory_only=true;}
+    else{return 401;}
+    if operand_count!=1{return 402;}
+    if (features&1)!=1{return 404;}
+    // Both are cpl 0 only, and the native refuses them above ring zero BEFORE it
+    // looks at the operand. A caller that validated the address first would
+    // answer 411 or 409 where the oracle answers 405.
+    if cpl!=0{return 405;}
+    let bad:u64=operand_valid(kind,width,register,high8,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if memory_only{if kind!=3{return 409;}}
+    else if kind!=1&&kind!=3{return 409;}
+    if width!=want_width{return 403;}
+    // reg is NULL in both native calls, so rex carries only the base and index
+    // bits and never the width-8 bit.
+    let rex:u64=pair_rex(32,0,0,0,kind,register,high8,width,base,index);
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,32,rex,segment,opcode,2,digit,kind,(register+high8*4)&7,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode the four descriptor instructions: sgdt, sidt, lgdt and lidt, all of
+// them 0F 01 /0..3 over ONE memory operand whose access width is exactly 80.
+//
+// It needs its own export for two reasons that are properties of the shape and
+// not of taste. The memory operand is the ONLY operand, so the F6/F7 and FE/FF
+// frames of encode_unary cannot hold it. And the width 80 is a DESCRIPTOR
+// width, which no machine scalar states: the native modrm() is handed width 32
+// so that prefix() emits neither 0x66 nor REX.W, while the operand check that
+// precedes it demands 80. Those two numbers are different on purpose, and an
+// export that took one width for both would encode a wrong frame on every row.
+//
+// Privilege is half the family and is stated here rather than left to the
+// caller: digit >= 2 is lgdt and lidt, and the native refuses them above cpl 0
+// with 405 BEFORE it validates the operand. A lowerer that checked the address
+// first would answer 411 where the oracle answers 405.
+export fn encode_descriptor(name:buf<u8>,operand_count:u64,kind:u64,register:u64,high8:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let sgdt:buf<u8>="sgdt";let is_sgdt:bool=same(name,sgdt);rt_free(runtime(),sgdt);
+    let sidt:buf<u8>="sidt";let is_sidt:bool=same(name,sidt);rt_free(runtime(),sidt);
+    let lgdt:buf<u8>="lgdt";let is_lgdt:bool=same(name,lgdt);rt_free(runtime(),lgdt);
+    let lidt:buf<u8>="lidt";let is_lidt:bool=same(name,lidt);rt_free(runtime(),lidt);
+    let mut digit:u64=4;
+    if is_sgdt{digit=0;}else if is_sidt{digit=1;}
+    else if is_lgdt{digit=2;}else if is_lidt{digit=3;}
+    else{return 401;}
+    if operand_count!=1{return 402;}
+    if (features&1)!=1{return 404;}
+    // Privilege before the operand, in the native order. digit>=2 is the two
+    // ring-zero names and this is the ONLY place the family is privileged.
+    if cpl!=0&&digit>=2{return 405;}
+    let bad:u64=operand_valid(kind,width,register,high8,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if kind!=3{return 409;}
+    if width!=80{return 403;}
+
+    // rex carries only the base and index bits: the native passes reg = NULL to
+    // modrm(), so there is no ModRM.reg operand to extend and no width-8 bit.
+    let rex:u64=pair_rex(32,0,0,0,3,0,0,width,base,index);
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    // 0x010f packed little-endian: emit_pair writes from the low byte up, so
+    // 0F comes first and 01 second.
+    let end:u64=emit_pair(out,1,32,rex,segment,271,2,digit,3,0,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode the width-conversion moves of I05/I06/I07: movzx and movsx from an 8 or
+// 16 bit register or memory source into a wider register, and movsxd from 32 to
+// 64. The native encoder requires a register destination, so a memory
+// destination is 409. The destination is never 8 bits, but a width-8 source may
+// be ah..bh, so 408 stays reachable through movzx and movsx. Output is
+// transactional.
+export fn encode_move_convert(name:buf<u8>,operand_count:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let movzx:buf<u8>="movzx";let is_movzx:bool=same(name,movzx);rt_free(runtime(),movzx);
+    let movsx:buf<u8>="movsx";let is_movsx:bool=same(name,movsx);rt_free(runtime(),movsx);
+    let movsxd:buf<u8>="movsxd";let is_movsxd:bool=same(name,movsxd);rt_free(runtime(),movsxd);
+    let mut sign_extend:u64=0;let mut is_movsxd_form:bool=false;
+    if is_movzx{sign_extend=0;is_movsxd_form=false;}
+    else if is_movsx{sign_extend=1;is_movsxd_form=false;}
+    else if is_movsxd{sign_extend=0;is_movsxd_form=true;}
+    else{return 401;}
+    if operand_count!=2{return 402;}
+    if (features&1)!=1{return 404;}
+    let bad:u64=validate_pair(a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if a0_kind!=1{return 409;}
+    if a1_kind!=1&&a1_kind!=3{return 409;}
+
+    // The destination drives the operand-size prefix, the source only the
+    // opcode choice, so the two widths stay independent through emit_pair.
+    let mut opcode:u64=0;let mut opcode_bytes:u64=2;
+    if is_movsxd_form {
+        if a1_width!=32{return 403;}
+        if a0_width!=64{return 403;}
+        opcode=99;opcode_bytes=1;
+    } else {
+        if a1_width!=8&&a1_width!=16{return 403;}
+        if a0_width<=a1_width{return 403;}
+        if a0_width!=16&&a0_width!=32&&a0_width!=64{return 403;}
+        if a1_width==8 {
+            if sign_extend==0{opcode=46607;}else{opcode=48655;}
+        } else {
+            if sign_extend==0{opcode=46863;}else{opcode=48911;}
+        }
+    }
+
+    let rm_kind:u64=a1_kind;
+    let rex:u64=pair_rex(a0_width,a0_reg,a0_high8,a0_width,rm_kind,a1_reg,a1_high8,a1_width,base,index);
+    let high8:u64=pair_high8(a0_high8,rm_kind,a1_high8);
+    if high8_rex_conflict(rex,high8){return 408;}
+    let reg_code:u64=(a0_reg+a0_high8*4)&7;
+    let rm_code:u64=(a1_reg+a1_high8*4)&7;
+    let mut rm_segment:u64=0;if rm_kind==3{rm_segment=segment;}
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,a0_width,rex,rm_segment,opcode,opcode_bytes,reg_code,rm_kind,rm_code,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode test of a register or memory first operand against a register second
+// operand (I09 R_R and M_R). The native encoder reaches the immediate forms only
+// through a different operand kind, so a memory second operand, a memory-memory
+// pair and the register-memory spelling are all 409. Because a width-8 first
+// operand may be ah..bh, 408 stays reachable in both the register and the
+// memory direction. Output is transactional.
+export fn encode_test_two(name:buf<u8>,operand_count:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let mnemonic:buf<u8>="test";let is_test:bool=same(name,mnemonic);rt_free(runtime(),mnemonic);
+    if is_test==false{return 401;}
+    if operand_count!=2{return 402;}
+    if (features&1)!=1{return 404;}
+    let bad:u64=validate_pair(a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if a0_kind!=1&&a0_kind!=3{return 409;}
+    if a1_kind!=1{return 409;}
+    if a1_width!=a0_width{return 403;}
+
+    // The native call always takes the register second operand as ModRM.reg and
+    // the first operand, register or memory, as ModRM.rm.
+    let rm_kind:u64=a0_kind;
+    let rex:u64=pair_rex(a0_width,a1_reg,a1_high8,a1_width,rm_kind,a0_reg,a0_high8,a0_width,base,index);
+    let high8:u64=pair_high8(a1_high8,rm_kind,a0_high8);
+    if high8_rex_conflict(rex,high8){return 408;}
+    let reg_code:u64=(a1_reg+a1_high8*4)&7;
+    let rm_code:u64=(a0_reg+a0_high8*4)&7;
+    let mut opcode:u64=132;if a0_width!=8{opcode=133;}
+    let mut rm_segment:u64=0;if rm_kind==3{rm_segment=segment;}
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,a0_width,rex,rm_segment,opcode,1,reg_code,rm_kind,rm_code,base,index,scale,displacement);
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode imul of a register destination by a register or memory source, with or
+// without a third immediate operand. The two-operand form is the native 0F AF
+// /r; the three-operand form picks 6B when the immediate fits a signed byte and
+// 69 otherwise, and both are the native modrm() call with a0 in ModRM.reg.
+//
+// Diagnostic order is the native order at x64.c:353-374, not a house order:
+// mnemonic, then operand count (2 or 3, and nothing else), then the feature
+// gate, then EVERY operand including the immediate, then the operand-kind rule,
+// then the width rule, then the immediate kind, range and compactness. The
+// immediate is validated with the others because the native loop walks all of
+// them before the first structural test.
+//
+// There is no width-8 form, so no high8 operand can reach this export and 408 is
+// not a reachable answer: the width rule below refuses width 8 outright, and
+// operand_valid already refuses a high8 operand whose width is not 8. That is
+// the same shape as encode_cmov, which states the same absence and therefore
+// does not ask high8_rex_conflict either.
+//
+// The immediate is stated with its width, because the native IMM operand
+// carries one and operand_valid answers on it: is_signed above one is 412, a
+// width that is neither zero nor a machine scalar is 403, and a non-zero width
+// the value does not fit is 407. The three refusals are all taken in that
+// order and before the structural rules, because the native loop walks every
+// operand before its first kind test. An NTASM literal states width 0, which is
+// the form the native goldens of tests_x64.c carry, and the parameter exists so
+// the other form is reachable rather than approximated.
+export fn encode_imul(name:buf<u8>,operand_count:u64,immediate:u64,immediate_is_signed:u64,immediate_width:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let mnemonic:buf<u8>="imul";let is_imul:bool=same(name,mnemonic);rt_free(runtime(),mnemonic);
+    if is_imul==false{return 401;}
+    if operand_count!=2&&operand_count!=3{return 402;}
+    if (features&1)!=1{return 404;}
+    let bad:u64=validate_pair(a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if operand_count==3 {
+        if immediate_is_signed>1{return 412;}
+        if immediate_width!=0&&immediate_width!=8&&immediate_width!=16&&immediate_width!=32&&immediate_width!=64{return 403;}
+        if immediate_width!=0&&immediate_fits(immediate,immediate_is_signed,immediate_width,false)==false{return 407;}
+    }
+    if a0_kind!=1{return 409;}
+    if a1_kind!=1&&a1_kind!=3{return 409;}
+    if a0_width==8{return 403;}
+    if a0_width!=a1_width{return 403;}
+
+    // 0x0FAF packed little-endian, because emit_pair writes the opcode bytes
+    // from the low byte up: 0xAF would come first and the escape byte second.
+    let mut opcode:u64=44815;let mut opcode_bytes:u64=2;let mut immediate_bytes:u64=0;
+    if operand_count==3 {
+        if immediate_fits(immediate,immediate_is_signed,32,true)==false{return 407;}
+        if immediate_fits(immediate,immediate_is_signed,8,true){opcode=107;immediate_bytes=1;}
+        else {opcode=105;immediate_bytes=4;}
+        opcode_bytes=1;
+    }
+
+    let rex:u64=pair_rex(a0_width,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index);
+    let reg_code:u64=(a0_reg+a0_high8*4)&7;
+    let rm_code:u64=(a1_reg+a1_high8*4)&7;
+    let mut rm_segment:u64=0;if a1_kind==3{rm_segment=segment;}
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let mut end:u64=emit_pair(out,1,a0_width,rex,rm_segment,opcode,opcode_bytes,reg_code,a1_kind,rm_code,base,index,scale,displacement);
+    let mut i:u64=0;
+    while i<immediate_bytes { out[end+i]=u8((immediate>>(i*8))&255); i=i+1; }
+    end=end+immediate_bytes;
+    out[0]=u8(end-1);
+    return 0;
+}
+
+// Encode the sixteen setcc forms to one low8 GPR.
+export fn encode_setcc(name:buf<u8>,operand_count:u64,destination:u64,width:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<5{return 800;}if cpl>3{return 405;}
+    let sete:buf<u8>="sete";let is_sete:bool=same(name,sete);rt_free(runtime(),sete);
+    let setne:buf<u8>="setne";let is_setne:bool=same(name,setne);rt_free(runtime(),setne);
+    let setb:buf<u8>="setb";let is_setb:bool=same(name,setb);rt_free(runtime(),setb);
+    let setae:buf<u8>="setae";let is_setae:bool=same(name,setae);rt_free(runtime(),setae);
+    let setbe:buf<u8>="setbe";let is_setbe:bool=same(name,setbe);rt_free(runtime(),setbe);
+    let seta:buf<u8>="seta";let is_seta:bool=same(name,seta);rt_free(runtime(),seta);
+    let sets:buf<u8>="sets";let is_sets:bool=same(name,sets);rt_free(runtime(),sets);
+    let setns:buf<u8>="setns";let is_setns:bool=same(name,setns);rt_free(runtime(),setns);
+    let setp:buf<u8>="setp";let is_setp:bool=same(name,setp);rt_free(runtime(),setp);
+    let setnp:buf<u8>="setnp";let is_setnp:bool=same(name,setnp);rt_free(runtime(),setnp);
+    let setl:buf<u8>="setl";let is_setl:bool=same(name,setl);rt_free(runtime(),setl);
+    let setge:buf<u8>="setge";let is_setge:bool=same(name,setge);rt_free(runtime(),setge);
+    let setle:buf<u8>="setle";let is_setle:bool=same(name,setle);rt_free(runtime(),setle);
+    let setg:buf<u8>="setg";let is_setg:bool=same(name,setg);rt_free(runtime(),setg);
+    let seto:buf<u8>="seto";let is_seto:bool=same(name,seto);rt_free(runtime(),seto);
+    let setno:buf<u8>="setno";let is_setno:bool=same(name,setno);rt_free(runtime(),setno);
+    let mut cc:u64=16;
+    if is_sete{cc=4;}else if is_setne{cc=5;}else if is_setb{cc=2;}else if is_setae{cc=3;}
+    else if is_setbe{cc=6;}else if is_seta{cc=7;}else if is_sets{cc=8;}else if is_setns{cc=9;}
+    else if is_setp{cc=10;}else if is_setnp{cc=11;}else if is_setl{cc=12;}else if is_setge{cc=13;}
+    else if is_setle{cc=14;}else if is_setg{cc=15;}else if is_seto{cc=0;}else if is_setno{cc=1;}
+    else{return 401;}
+    if operand_count!=1{return 402;}if (features&1)!=1{return 404;}
+    if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+    if destination>15{return 406;}if width!=8{return 403;}
+    let mut rex:u64=0;if destination>=8{rex=1;}if destination>=4{rex=rex|64;}
+    let mut at:u64=1;let mut length:u64=3;if rex!=0{out[at]=u8(64|rex);at=at+1;length=4;}
+    out[0]=u8(length);out[at]=15;out[at+1]=u8(144+cc);out[at+2]=u8(192|(destination&7));
+    let mut clear:u64=at+3;while clear<5{out[clear]=0;clear=clear+1;}return 0;
+}
+
+// Encode bswap of one GPR (0F C8+rd). This is the smallest mnemonique the
+// oracle knows and the Nova encoder did not: one register, no memory, no
+// immediate, no ModRM at all.
+//
+// It gets its OWN export rather than a fifth name inside encode_unary, because
+// encode_unary and encode_unary_operand both build the group-2 ModRM frame
+// (FE /0..3) and bswap has no ModRM byte to put a digit into. Adding the name
+// there would have produced a syntactically valid instruction of a different
+// instruction, which is worse than an absence.
+//
+// Diagnostic order is the native order: mnemonic, operand count, feature, then
+// the operand validity rule, then the form check, then the width rule. The
+// operand check comes before the form check, so a register above 15 is 406 and
+// a width that is not a machine scalar is 403 even though neither can encode.
+// There is no width-8 form and no high8 operand, so 408 is not reachable: a
+// high8 register would need width 8, and width 8 is refused below.
+export fn encode_bswap(name:buf<u8>,operand_count:u64,destination:u64,width:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    // 16, not 5, and the whole of the buffer is cleared below, because that is
+    // the convention encode_ri and encode_imul already follow: the caller reads
+    // out[1..] past the instruction, and a buffer that keeps whatever it held
+    // there makes two encodings of the same instruction differ in bytes nobody
+    // intended to compare. The gate caught it: bswap r32 was refused on every
+    // row because bytes past the instruction still held the caller's guard.
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let mnemonic:buf<u8>="bswap";let is_bswap:bool=same(name,mnemonic);rt_free(runtime(),mnemonic);
+    if is_bswap==false{return 401;}
+    if operand_count!=1{return 402;}
+    if (features&1)!=1{return 404;}
+    if width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+    if destination>15{return 406;}
+    if width!=32&&width!=64{return 403;}
+    // REX.W for a 64-bit operand and REX.B for the register, and nothing else:
+    // width 32 carries no 0x66 and width 8 does not exist, so the native prefix
+    // frame can only ever be 0x48 or 0x49 or nothing.
+    let mut rex:u64=0;if width==64{rex=8;}if destination>=8{rex=rex|1;}
+    let mut at:u64=1;let mut length:u64=2;
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    if rex!=0{out[at]=u8(64|rex);at=at+1;length=length+1;}
+    out[at]=15;at=at+1;
+    out[at]=u8(200+(destination&7));
+    out[0]=u8(length);
+    return 0;
+}
+
+// Encode inc/dec/not/neg over the one operand the native encoder accepts: a
+// register, which may be the high8 alias ah/ch/dh/bh, or a memory. kind1 is a
+// register and kind3 is memory, the native numbering, and the memory descriptor
+// is read only for kind3 because a native memory operand carries no high8 flag.
+// The high8 ModRM.rm regcode is register+4 and width8_rex keeps the forced 0x40
+// bit off that alias, so a high8 frame is REX-free by construction and 408 stays
+// unreachable. The native modrm call takes the opcode digit as ModRM.reg, so a
+// memory rm never sees the width-8 REX bit either. Output is transactional:
+// out[0] is the length and out[1..] the bytes, both untouched on every
+// diagnostic.
+export fn encode_unary_operand(name:buf<u8>,operand_count:u64,kind:u64,register:u64,high8:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let inc:buf<u8>="inc";let is_inc:bool=same(name,inc);rt_free(runtime(),inc);
+    let dec:buf<u8>="dec";let is_dec:bool=same(name,dec);rt_free(runtime(),dec);
+    let not_:buf<u8>="not";let is_not:bool=same(name,not_);rt_free(runtime(),not_);
+    let neg:buf<u8>="neg";let is_neg:bool=same(name,neg);rt_free(runtime(),neg);
+    let mul:buf<u8>="mul";let is_mul:bool=same(name,mul);rt_free(runtime(),mul);
+    let div_:buf<u8>="div";let is_div:bool=same(name,div_);rt_free(runtime(),div_);
+    let idiv:buf<u8>="idiv";let is_idiv:bool=same(name,idiv);rt_free(runtime(),idiv);
+    let mut digit:u64=4;
+    if is_inc{digit=0;}else if is_dec{digit=1;}
+    else if is_not{digit=2;}else if is_neg{digit=3;}
+    else if is_mul{digit=4;}else if is_div{digit=6;}
+    else if is_idiv{digit=7;}
+    else{return 401;}
+    if operand_count!=1{return 402;}
+    if (features&1)!=1{return 404;}
+    // The native operand_valid rule runs before the native form check, so a
+    // malformed register answers 403/406 and a malformed address 411/410 first.
+    let bad:u64=operand_valid(kind,width,register,high8,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if kind!=1&&kind!=3{return 409;}
+    let mut alias:u64=0;if kind==1{alias=high8;}
+
+    // The native unary opcode keys off the operand width, and a memory operand
+    // of the descriptor width 0 or 80 is legal here, so no scalar-width check
+    // belongs between the validity rule and this choice.
+    let mut opcode:u64=0;
+    if digit<2{if width==8{opcode=254;}else{opcode=255;}}
+    else{if width==8{opcode=246;}else{opcode=247;}}
+
+    let mut rex:u64=0;if width==64{rex=8;}
+    let mut rm_code:u64=0;let mut rm_segment:u64=0;
+    if kind==1{
+        rm_code=(register+alias*4)&7;
+        if register>=8{rex=rex|1;}
+        if width==8{rex=rex|width8_rex(register,alias);}
+    } else {
+        if base>=8&&base<=15{rex=rex|1;}
+        if index>=8&&index<=15{rex=rex|2;}
+        rm_segment=segment;
+    }
+    // Invariant guard for the high8 rule: the checks above already make a high8
+    // register REX-free, so this never fires here.
+    if high8_rex_conflict(rex,alias){return 408;}
+
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,width,rex,rm_segment,opcode,1,digit,kind,rm_code,base,index,scale,displacement);
+    out[0]=u8(end-1);return 0;
+}
+
+// Encode the sixteen setcc conditions over a register, which may be the high8
+// alias ah/ch/dh/bh, or over a memory. The native encoder states width 8 to
+// modrm whatever the operand is and refuses every other width with 403, so a
+// memory frame carries neither 0x66 nor REX.W. kind1 is a register and kind3 is
+// memory, the native numbering, and the memory descriptor is read only for
+// kind3. Output is transactional.
+export fn encode_setcc_operand(name:buf<u8>,operand_count:u64,kind:u64,register:u64,high8:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let sete:buf<u8>="sete";let is_sete:bool=same(name,sete);rt_free(runtime(),sete);
+    let setne:buf<u8>="setne";let is_setne:bool=same(name,setne);rt_free(runtime(),setne);
+    let setb:buf<u8>="setb";let is_setb:bool=same(name,setb);rt_free(runtime(),setb);
+    let setae:buf<u8>="setae";let is_setae:bool=same(name,setae);rt_free(runtime(),setae);
+    let setbe:buf<u8>="setbe";let is_setbe:bool=same(name,setbe);rt_free(runtime(),setbe);
+    let seta:buf<u8>="seta";let is_seta:bool=same(name,seta);rt_free(runtime(),seta);
+    let sets:buf<u8>="sets";let is_sets:bool=same(name,sets);rt_free(runtime(),sets);
+    let setns:buf<u8>="setns";let is_setns:bool=same(name,setns);rt_free(runtime(),setns);
+    let setp:buf<u8>="setp";let is_setp:bool=same(name,setp);rt_free(runtime(),setp);
+    let setnp:buf<u8>="setnp";let is_setnp:bool=same(name,setnp);rt_free(runtime(),setnp);
+    let setl:buf<u8>="setl";let is_setl:bool=same(name,setl);rt_free(runtime(),setl);
+    let setge:buf<u8>="setge";let is_setge:bool=same(name,setge);rt_free(runtime(),setge);
+    let setle:buf<u8>="setle";let is_setle:bool=same(name,setle);rt_free(runtime(),setle);
+    let setg:buf<u8>="setg";let is_setg:bool=same(name,setg);rt_free(runtime(),setg);
+    let seto:buf<u8>="seto";let is_seto:bool=same(name,seto);rt_free(runtime(),seto);
+    let setno:buf<u8>="setno";let is_setno:bool=same(name,setno);rt_free(runtime(),setno);
+    let mut cc:u64=16;
+    if is_sete{cc=4;}else if is_setne{cc=5;}else if is_setb{cc=2;}else if is_setae{cc=3;}
+    else if is_setbe{cc=6;}else if is_seta{cc=7;}else if is_sets{cc=8;}else if is_setns{cc=9;}
+    else if is_setp{cc=10;}else if is_setnp{cc=11;}else if is_setl{cc=12;}else if is_setge{cc=13;}
+    else if is_setle{cc=14;}else if is_setg{cc=15;}else if is_seto{cc=0;}else if is_setno{cc=1;}
+    else{return 401;}
+    if operand_count!=1{return 402;}
+    if (features&1)!=1{return 404;}
+    let bad:u64=operand_valid(kind,width,register,high8,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if kind!=1&&kind!=3{return 409;}
+    if width!=8{return 403;}
+    let mut alias:u64=0;if kind==1{alias=high8;}
+
+    let mut rex:u64=0;let mut rm_code:u64=0;let mut rm_segment:u64=0;
+    if kind==1{
+        rm_code=(register+alias*4)&7;
+        if register>=8{rex=rex|1;}
+        rex=rex|width8_rex(register,alias);
+    } else {
+        if base>=8&&base<=15{rex=rex|1;}
+        if index>=8&&index<=15{rex=rex|2;}
+        rm_segment=segment;
+    }
+    if high8_rex_conflict(rex,alias){return 408;}
+
+    // The native opcode is 0x0f then 0x90+condition, little endian, and
+    // ModRM.reg is the zero digit the native call passes for a NULL register.
+    // 36879 is 0x900f, the little endian form of 0x0f90.
+    let opcode:u64=36879+(cc*256);
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,8,rex,rm_segment,opcode,2,0,kind,rm_code,base,index,scale,displacement);
+    out[0]=u8(end-1);return 0;
+}
+
+// Encode the push and pop memory direction. The native encoder states width 32
+// to modrm for this direction and not 64, a measured quirk of the oracle that
+// this export reproduces rather than repairs: `push [rbx+8]` is ff 73 08 and
+// never 48 ff 73 08. A native memory width other than 64 is 403, checked after
+// the address, and the register and immediate directions stay with
+// encode_stack, so this export has no register or immediate word at all. Output
+// is transactional.
+export fn encode_stack_memory(name:buf<u8>,operand_count:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let push:buf<u8>="push";let is_push:bool=same(name,push);rt_free(runtime(),push);
+    let pop:buf<u8>="pop";let is_pop:bool=same(name,pop);rt_free(runtime(),pop);
+    let mut pushing:bool=false;
+    if is_push{pushing=true;}else if is_pop{pushing=false;}else{return 401;}
+    if operand_count!=1{return 402;}
+    if (features&1)!=1{return 404;}
+    // A native memory operand: the address and the segment are validated before
+    // the 64 bit access width, so a bad address of a narrow memory is 411 and
+    // not 403.
+    let bad:u64=operand_valid(3,width,0,0,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if width!=64{return 403;}
+
+    // The native modrm call is handed width 32 for this direction and not 64, so
+    // the REX.W bit is deliberately never derived from the access width: only a
+    // base or an index of 8 and above sets a REX bit here, and the forced 0x40
+    // bit is never set either. Adding a `width==64` term the way every other
+    // export has one is the regression this export exists to refuse.
+    let mut rex:u64=0;
+    if base>=8&&base<=15{rex=rex|1;}
+    if index>=8&&index<=15{rex=rex|2;}
+    let mut opcode:u64=143;let mut digit:u64=0;
+    if pushing{opcode=255;digit=6;}
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    // The 32 below is the native operand-size word of this call, not a bug: it is
+    // what keeps 0x66 and REX.W out of a push/pop memory frame.
+    let end:u64=emit_pair(out,1,32,rex,segment,opcode,1,digit,3,0,base,index,scale,displacement);
+    out[0]=u8(end-1);return 0;
+}
+
+// Encode rol/ror/shl/shr/sar over a register (including high8) or memory.
+// count_kind is the native kind: REG1 for cl and IMM2 for a literal.
+// The caller validates the count register's width/high8 and the literal's
+// declared width/signedness, which this historical API does not carry.
+// base16 means no base, 17 RIP; index16 means none. Output is transactional.
+export fn encode_shift_memory(name:buf<u8>,operand_count:u64,kind:u64,register:u64,high8:u64,width:u64,count_kind:u64,count_register:u64,amount:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let rol:buf<u8>="rol";let is_rol:bool=same(name,rol);rt_free(runtime(),rol);
+    let ror:buf<u8>="ror";let is_ror:bool=same(name,ror);rt_free(runtime(),ror);
+    let shl:buf<u8>="shl";let is_shl:bool=same(name,shl);rt_free(runtime(),shl);
+    let shr:buf<u8>="shr";let is_shr:bool=same(name,shr);rt_free(runtime(),shr);
+    let sar:buf<u8>="sar";let is_sar:bool=same(name,sar);rt_free(runtime(),sar);
+    let mut digit:u64=8;
+    if is_rol{digit=0;}else if is_ror{digit=1;}
+    else if is_shl{digit=4;}else if is_shr{digit=5;}
+    else if is_sar{digit=7;}else{return 401;}
+    if operand_count!=2{return 402;}if (features&1)!=1{return 404;}
+    // The native rule validates the destination operand before it ever looks at
+    // the count, so a malformed address over a well formed count is 411 and not
+    // a count diagnostic.
+    let bad:u64=operand_valid(kind,width,register,high8,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    // Both native ModRM.rm forms are available. Memory ignores register aliases.
+    if kind!=1&&kind!=3{return 409;}
+
+    // The native count is cl or a literal and nothing else: any other register
+    // is 406, a count that is neither a register nor an immediate is 409, and
+    // the literal is range-checked against 255 alone, never against a declared
+    // count width, exactly as encode_shift_imm does.
+    let mut opcode:u64=0;let mut immediate_bytes:u64=0;
+    if count_kind==1 {
+        if count_register!=1{return 406;}
+        if width==8{opcode=210;}else{opcode=211;}
+    } else if count_kind==2 {
+        if amount>255{return 407;}
+        if amount==1 { if width==8{opcode=208;}else{opcode=209;} }
+        else { if width==8{opcode=192;}else{opcode=193;} immediate_bytes=1; }
+    } else { return 409; }
+
+    // ModRM.reg is an opcode digit, so only the rm operand contributes REX.
+    let rex:u64=pair_rex(width,0,0,0,kind,register,high8,width,base,index);
+    let mut alias:u64=0;let mut rm_segment:u64=0;
+    if kind==1{alias=high8;}else{rm_segment=segment;}
+    if high8_rex_conflict(rex,alias){return 408;}
+
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let mut end:u64=emit_pair(out,1,width,rex,rm_segment,opcode,1,digit,kind,(register+alias*4)&7,base,index,scale,displacement);
+    if immediate_bytes==1{out[end]=u8(amount);end=end+1;}
+    out[0]=u8(end-1);return 0;
+}
+
+// Encode call and jmp through a memory operand, the last form of catalogue row
+// I19 that the relative and register directions of encode_control leave out. The
+// native modrm call is handed width 32 for this direction and not 64, a measured
+// quirk of the oracle that this export reproduces rather than repairs:
+// `call [rbx+8]` is ff 53 08 and never 48 ff 53 08. A native memory width other
+// than 64 is 403, checked after the address, and the register word of a memory
+// descriptor does not exist, so this export has none. base16 means no base, 17
+// RIP; index16 means none. Output is transactional.
+export fn encode_control_memory(name:buf<u8>,operand_count:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}if cpl>3{return 405;}
+    let call:buf<u8>="call";let is_call:bool=same(name,call);rt_free(runtime(),call);
+    let jmp:buf<u8>="jmp";let is_jmp:bool=same(name,jmp);rt_free(runtime(),jmp);
+    let mut digit:u64=4;let mut known:bool=false;
+    if is_call{digit=2;known=true;}else if is_jmp{digit=4;known=true;}
+    if known==false{return 401;}
+    if operand_count!=1{return 402;}if (features&1)!=1{return 404;}
+    // A native memory operand: the address and the segment are validated before
+    // the 64 bit access width, so a bad address of a narrow memory is 411 and
+    // not 403.
+    let bad:u64=operand_valid(3,width,0,0,base,index,scale,displacement,segment);
+    if bad!=0{return bad;}
+    if width!=64{return 403;}
+    // The 32 below is the native operand-size word of this call, not a bug: it is
+    // what keeps 0x66 and REX.W out of a call/jmp memory frame, so the REX bits
+    // come from the address alone and the width-8 forced 0x40 never appears.
+    let mut rex:u64=0;
+    if base>=8&&base<=15{rex=rex|1;}
+    if index>=8&&index<=15{rex=rex|2;}
+    let high8:u64=pair_high8(0,3,0);
+    if high8_rex_conflict(rex,high8){return 408;}
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let end:u64=emit_pair(out,1,32,rex,segment,255,1,digit,3,0,base,index,scale,displacement);
+    out[0]=u8(end-1);return 0;
+}
+
+// Native operand kinds, including literals and control registers. The same
+// immediate belongs to whichever operand has kind IMM/REL (not its position).
+fn binary_operand_valid(kind:u64,reg:u64,high8:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,immediate:u64,is_signed:u64)->u64 {
+    if kind==2||kind==4 {
+        if is_signed>1{return 412;}
+        if width!=0&&width!=8&&width!=16&&width!=32&&width!=64{return 403;}
+        if width!=0{if immediate_fits(immediate,is_signed,width,false)==false{return 407;}}
+        return 0;
+    }
+    if kind==5 {
+        if width!=64{return 403;}
+        if reg!=0&&reg!=2&&reg!=3&&reg!=4&&reg!=8{return 406;}
+        if high8!=0{return 406;}
+        return 0;
+    }
+    return operand_valid(kind,width,reg,high8,base,index,scale,displacement,segment);
+}
+
+// Complete native binary group1, move, test, control-register and I/O forms.
+// Validation precedes every output write, matching nt_x64_encode's transaction.
+export fn encode_binary(name:buf<u8>,operand_count:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,immediate:u64,immediate_is_signed:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}
+    if operand_count>3{return 402;}if cpl>3{return 405;}
+    let mov:buf<u8>="mov";let is_mov:bool=same(name,mov);rt_free(runtime(),mov);
+    let load:buf<u8>="load";let is_load:bool=same(name,load);rt_free(runtime(),load);
+    let store:buf<u8>="store";let is_store:bool=same(name,store);rt_free(runtime(),store);
+    let test_:buf<u8>="test";let is_test:bool=same(name,test_);rt_free(runtime(),test_);
+    let read_cr:buf<u8>="read_cr";let is_read_cr:bool=same(name,read_cr);rt_free(runtime(),read_cr);
+    let write_cr:buf<u8>="write_cr";let is_write_cr:bool=same(name,write_cr);rt_free(runtime(),write_cr);
+    let in_:buf<u8>="in";let is_in:bool=same(name,in_);rt_free(runtime(),in_);
+    let out_:buf<u8>="out";let is_out:bool=same(name,out_);rt_free(runtime(),out_);
+    let add:buf<u8>="add";let is_add:bool=same(name,add);rt_free(runtime(),add);
+    let or_:buf<u8>="or";let is_or:bool=same(name,or_);rt_free(runtime(),or_);
+    let adc:buf<u8>="adc";let is_adc:bool=same(name,adc);rt_free(runtime(),adc);
+    let sbb:buf<u8>="sbb";let is_sbb:bool=same(name,sbb);rt_free(runtime(),sbb);
+    let and_:buf<u8>="and";let is_and:bool=same(name,and_);rt_free(runtime(),and_);
+    let sub:buf<u8>="sub";let is_sub:bool=same(name,sub);rt_free(runtime(),sub);
+    let xor:buf<u8>="xor";let is_xor:bool=same(name,xor);rt_free(runtime(),xor);
+    let cmp:buf<u8>="cmp";let is_cmp:bool=same(name,cmp);rt_free(runtime(),cmp);
+    let mut group:u64=8;
+    if is_add{group=0;}else if is_or{group=1;}else if is_adc{group=2;}
+    else if is_sbb{group=3;}else if is_and{group=4;}else if is_sub{group=5;}
+    else if is_xor{group=6;}else if is_cmp{group=7;}
+    let moving:bool=is_mov||is_load||is_store;
+    let testing:bool=is_test;
+    let control:bool=is_read_cr||is_write_cr;
+    let io:bool=is_in||is_out;
+    if group==8&&moving==false&&testing==false&&control==false&&io==false{return 401;}
+    if operand_count!=2{return 402;}if (features&1)!=1{return 404;}
+    if control||io{if cpl!=0{return 405;}}
+    let bad0:u64=binary_operand_valid(a0_kind,a0_reg,a0_high8,a0_width,base,index,scale,displacement,segment,immediate,immediate_is_signed);
+    if bad0!=0{return bad0;}
+    let bad1:u64=binary_operand_valid(a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment,immediate,immediate_is_signed);
+    if bad1!=0{return bad1;}
+    if control {
+        let mut gkind:u64=a0_kind;let mut greg:u64=a0_reg;let mut crkind:u64=a1_kind;let mut crreg:u64=a1_reg;
+        let mut opcode:u64=32;
+        if is_write_cr{gkind=a1_kind;greg=a1_reg;crkind=a0_kind;crreg=a0_reg;opcode=34;}
+        if gkind!=1||crkind!=5{return 409;}
+        let mut rex:u64=0;if greg>=8{rex=1;}if crreg==8{rex=rex|4;}
+        let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+        let mut at:u64=1;if rex!=0{out[at]=u8(64|rex);at=at+1;}
+        out[at]=15;out[at+1]=u8(opcode);out[at+2]=u8(192|((crreg&7)<<3)|(greg&7));out[0]=u8(at+2);return 0;
+    }
+    if io {
+        let mut acc_kind:u64=a0_kind;let mut acc_reg:u64=a0_reg;let mut acc_high8:u64=a0_high8;let mut width:u64=a0_width;
+        let mut port_kind:u64=a1_kind;let mut port_reg:u64=a1_reg;let mut port_high8:u64=a1_high8;let mut port_width:u64=a1_width;
+        let mut opcode:u64=228;
+        if is_out{acc_kind=a1_kind;acc_reg=a1_reg;acc_high8=a1_high8;width=a1_width;port_kind=a0_kind;port_reg=a0_reg;port_high8=a0_high8;port_width=a0_width;opcode=230;}
+        if acc_kind!=1||acc_reg!=0||acc_high8!=0{return 406;}
+        if width!=8&&width!=16&&width!=32{return 406;}
+        if port_kind==2{if immediate>255{return 407;}}
+        else{if port_kind!=1||port_reg!=2||port_width!=16||port_high8!=0{return 406;}opcode=opcode+8;}
+        if width!=8{opcode=opcode+1;}
+        let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+        let mut at:u64=1;if width==16{out[at]=102;at=at+1;}
+        out[at]=u8(opcode);at=at+1;if port_kind==2{out[at]=u8(immediate);at=at+1;}out[0]=u8(at-1);return 0;
+    }
+    if moving {
+        if is_load{if a0_kind!=1||a1_kind!=3{return 409;}}
+        if is_store{if a0_kind!=3{return 409;}}
+    }
+    if a0_kind!=1&&a0_kind!=3{return 409;}
+    let width:u64=a0_width;
+    if testing==false{if width!=8&&width!=16&&width!=32&&width!=64{return 403;}}
+    let mut rm_kind:u64=a0_kind;let mut rm_reg:u64=a0_reg;let mut rm_high8:u64=0;let mut rm_width:u64=a0_width;
+    if a0_kind==1{rm_high8=a0_high8;}
+    let mut reg:u64=0;let mut reg_high8:u64=0;let mut reg_width:u64=0;
+    let mut digit:u64=0;let mut opcode:u64=0;let mut immediate_bytes:u64=0;
+    let mut accumulator:bool=false;let mut mov_literal:bool=false;
+    if a1_kind==1 {
+        if width!=a1_width{return 403;}
+        reg=a1_reg;reg_high8=a1_high8;reg_width=a1_width;
+        if moving{opcode=136;if width!=8{opcode=137;}}
+        else if testing{opcode=132;if width!=8{opcode=133;}}
+        else{opcode=group*8;if width!=8{opcode=opcode+1;}}
+    } else if a1_kind==3 {
+        if testing{return 409;}if a0_kind!=1{return 409;}if width!=a1_width{return 403;}
+        rm_kind=3;rm_reg=a1_reg;rm_high8=0;rm_width=a1_width;
+        reg=a0_reg;reg_high8=a0_high8;reg_width=a0_width;
+        if moving{opcode=138;if width!=8{opcode=139;}}
+        else{opcode=group*8+2;if width!=8{opcode=opcode+1;}}
+    } else if a1_kind==2 {
+        if moving&&a0_kind==1 {
+            if immediate_fits(immediate,immediate_is_signed,width,false)==false{return 407;}
+            mov_literal=true;immediate_bytes=width/8;opcode=184;if width==8{opcode=176;}
+        } else {
+            let mut bits:u64=width;let mut sign_extend:bool=false;if width==64{bits=32;sign_extend=true;}
+            if immediate_fits(immediate,immediate_is_signed,bits,sign_extend)==false{return 407;}
+            immediate_bytes=4;if width==8{immediate_bytes=1;}else if width==16{immediate_bytes=2;}
+            if moving{opcode=199;if width==8{opcode=198;}}
+            else if testing{
+                opcode=247;if width==8{opcode=246;}
+                if a0_kind==1&&a0_reg==0&&a0_high8==0{accumulator=true;opcode=169;if width==8{opcode=168;}}
+            } else {
+                digit=group;
+                let compact:bool=immediate_fits(immediate,immediate_is_signed,8,true);
+                opcode=129;if compact{opcode=131;immediate_bytes=1;}if width==8{opcode=128;immediate_bytes=1;}
+                if a0_kind==1&&a0_reg==0&&a0_high8==0 {
+                    if width==8||compact==false{accumulator=true;opcode=group*8+5;if width==8{opcode=group*8+4;}}
+                }
+            }
+        }
+    } else {return 409;}
+    let mut rex:u64=pair_rex(width,reg,reg_high8,reg_width,rm_kind,rm_reg,rm_high8,rm_width,base,index);
+    let aliases:u64=pair_high8(reg_high8,rm_kind,rm_high8);
+    if high8_rex_conflict(rex,aliases){return 408;}
+    let mut rm_segment:u64=0;if rm_kind==3{rm_segment=segment;}
+    let mut clear:u64=1;while clear<16{out[clear]=0;clear=clear+1;}
+    let mut end:u64=1;
+    if mov_literal||accumulator {
+        if accumulator{rex=0;if width==64{rex=8;}}
+        end=emit_prefix_frame(out,1,width,rex,0);
+        if mov_literal{opcode=opcode+((a0_reg+a0_high8*4)&7);}
+        out[end]=u8(opcode);end=end+1;
+    } else {
+        let mut reg_code:u64=digit;if reg_width!=0{reg_code=(reg+reg_high8*4)&7;}
+        end=emit_pair(out,1,width,rex,rm_segment,opcode,1,reg_code,rm_kind,(rm_reg+rm_high8*4)&7,base,index,scale,displacement);
+    }
+    let mut i:u64=0;while i<immediate_bytes{out[end+i]=u8((immediate>>(i*8))&255);i=i+1;}end=end+immediate_bytes;
+    out[0]=u8(end-1);return 0;
+}

@@ -1,0 +1,1409 @@
+module control_flow;
+import ntasm_ast;
+import register_widths;
+import abi;
+fn same(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool{if start>end||end>len(source)||(end-start)!=len(text){return false;}let mut i:u64=0;while i<len(text){if source[start+i]!=text[i]{return false;}i=i+1;}return true;}
+fn same_span(source:buf<u8>,a:ntasm_ast.Node,b:ntasm_ast.Node)->bool{if a.start>a.end||b.start>b.end||a.end>len(source)||b.end>len(source)||(a.end-a.start)!=(b.end-b.start){return false;}let mut i:u64=0;while i<(a.end-a.start){if source[a.start+i]!=source[b.start+i]{return false;}i=i+1;}return true;}
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64{if parent==0||parent>tree.node_count{return 0;}let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);let mut id:u64=p.first_child;let mut index:u64=0;while id!=0&&index<ordinal{if id>tree.node_count{return 0;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);id=n.next_sibling;index=index+1;}if id>tree.node_count{return 0;}return id;}
+fn decl_name_id(tree:ntasm_ast.Tree,id:u64)->u64{let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if n.kind==18{return child(tree,id,0);}if n.kind==9{return child(tree,id,1);}return 0;}
+fn returns_never(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool{let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);let mut child_id:u64=declaration.first_child;while child_id!=0{if child_id>tree.node_count{return false;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);if n.kind==36{if n.first_child==0||n.first_child>tree.node_count{return false;}let name:ntasm_ast.Node=ntasm_ast.node_at(tree,n.first_child);let word:buf<u8>="never";return same(source,name.start,name.end,word);}child_id=n.next_sibling;}return false;}
+fn call_is_never(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool{let call:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if call.kind!=28{return false;}let qid:u64=child(tree,id,0);if qid==0{return false;}let q:ntasm_ast.Node=ntasm_ast.node_at(tree,qid);if q.kind!=91||q.last_child==0||q.last_child>tree.node_count{return false;}let called:ntasm_ast.Node=ntasm_ast.node_at(tree,q.last_child);let mut decl_id:u64=1;while decl_id<=tree.node_count{let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);if declaration.kind==18||declaration.kind==9{let name_id:u64=decl_name_id(tree,decl_id);if name_id!=0{let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);if same_span(source,name,called){return returns_never(source,tree,decl_id);}}}decl_id=decl_id+1;}return false;}
+// aux 1 marks a label definition, which shares kind 32 but is a branch target,
+// not an instruction: a label named ud2/sysretq/iretq does not terminate.
+fn terminal_instruction(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool{let instruction:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if instruction.kind!=32||instruction.aux!=0||instruction.first_child==0||instruction.first_child>tree.node_count{return false;}let name:ntasm_ast.Node=ntasm_ast.node_at(tree,instruction.first_child);let a:buf<u8>="ud2";if same(source,name.start,name.end,a){return true;}let b:buf<u8>="sysretq";if same(source,name.start,name.end,b){return true;}let c:buf<u8>="iretq";return same(source,name.start,name.end,c);}
+// Control cannot fall through a node when it is a block whose last statement is
+// terminal, or the terminal statement itself: return, ud2, sysretq, iretq, a
+// call to a never function, or an if/else whose two branches are terminal.
+fn block_terminal(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool{
+  if id==0||id>tree.node_count{return false;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  let mut last_id:u64=id;
+  if n.kind==25{
+    if n.last_child==0||n.last_child>tree.node_count{return false;}
+    last_id=n.last_child;
+  }
+  let mut last:ntasm_ast.Node=ntasm_ast.node_at(tree,last_id);
+  let mut seen:u64=0;
+  while last.kind==25&&seen<tree.node_count {
+    if last.last_child==0||last.last_child>tree.node_count{return false;}
+    last_id=last.last_child;last=ntasm_ast.node_at(tree,last_id);seen=seen+1;
+  }
+  if last.kind==25{return false;}
+  if last.kind==29{return true;}if terminal_instruction(source,tree,last_id){return true;}
+  if call_is_never(source,tree,last_id){return true;}
+  if last.kind==30{let mut child_id:u64=last.first_child;let mut first:u64=0;let mut second:u64=0;while child_id!=0{if child_id>tree.node_count{return false;}let child:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);if child.kind==25{if first==0{first=child_id;}else if second==0{second=child_id;}else{return false;}}child_id=child.next_sibling;}if first==0||second==0{return false;}return block_terminal(source,tree,first)&&block_terminal(source,tree,second);}
+  return false;
+}
+// Mnemonic of a control transfer: the unconditional jmp, or one of the sixteen
+// conditional Jcc forms. The span compared here is the name child of the
+// instruction node, never a slice of source text, the same AST field
+// x64_lower_control reads to tell jmp from a Jcc.
+fn branch_mnemonic(source:buf<u8>,start:u64,end:u64)->bool{
+  let a:buf<u8>="jmp";if same(source,start,end,a){return true;}
+  let b:buf<u8>="jo";if same(source,start,end,b){return true;}
+  let c:buf<u8>="jno";if same(source,start,end,c){return true;}
+  let d:buf<u8>="jb";if same(source,start,end,d){return true;}
+  let e:buf<u8>="jae";if same(source,start,end,e){return true;}
+  let f:buf<u8>="je";if same(source,start,end,f){return true;}
+  let g:buf<u8>="jne";if same(source,start,end,g){return true;}
+  let h:buf<u8>="jbe";if same(source,start,end,h){return true;}
+  let i:buf<u8>="ja";if same(source,start,end,i){return true;}
+  let j:buf<u8>="js";if same(source,start,end,j){return true;}
+  let k:buf<u8>="jns";if same(source,start,end,k){return true;}
+  let l:buf<u8>="jp";if same(source,start,end,l){return true;}
+  let m:buf<u8>="jnp";if same(source,start,end,m){return true;}
+  let n:buf<u8>="jl";if same(source,start,end,n){return true;}
+  let o:buf<u8>="jge";if same(source,start,end,o){return true;}
+  let p:buf<u8>="jle";if same(source,start,end,p){return true;}
+  let q:buf<u8>="jg";return same(source,start,end,q);
+}
+// Control cannot fall through an unconditional jmp: the block is left for good
+// and the statements that follow it are the jump target region, entered by
+// branch rather than by walking down the block. A Jcc is not a terminator here,
+// so a statement after a conditional branch stays reachable by fallthrough.
+fn falls_through(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool{
+  let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  if n.kind!=32||n.aux!=0||n.first_child==0||n.first_child>tree.node_count{return true;}
+  let name:ntasm_ast.Node=ntasm_ast.node_at(tree,n.first_child);let jmp:buf<u8>="jmp";
+  return same(source,name.start,name.end,jmp)==false;
+}
+// Node id of the plain name the jmp or Jcc statement at id names, or 0 when id
+// is not a direct branch on a label.
+fn branch_target(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->u64{
+  let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  if n.kind!=32||n.aux!=0||n.first_child==0||n.first_child>tree.node_count{return 0;}
+  let head:ntasm_ast.Node=ntasm_ast.node_at(tree,n.first_child);
+  if branch_mnemonic(source,head.start,head.end)==false{return 0;}
+  let operand_id:u64=head.next_sibling;
+  if operand_id==0||operand_id>tree.node_count{return 0;}
+  let operand:ntasm_ast.Node=ntasm_ast.node_at(tree,operand_id);
+  if operand.kind!=35||operand.aux!=0||operand.first_child==0||operand.first_child!=operand.last_child{return 0;}
+  let qualified:ntasm_ast.Node=ntasm_ast.node_at(tree,operand.first_child);
+  if qualified.kind!=91||qualified.first_child==0||qualified.first_child!=qualified.last_child{return 0;}
+  return qualified.first_child;
+}
+// True when some jmp or Jcc inside the function spanning [fn_start,fn_end) names
+// the label definition at label_id. A label resumes fallthrough only when
+// control can really arrive by branch, so the branch is resolved instead of
+// trusting the name: a label nothing branches to leaves the pending dead state
+// in place and the statement after it stays reported.
+fn label_is_target(source:buf<u8>,tree:ntasm_ast.Tree,label_id:u64,fn_start:u64,fn_end:u64)->bool{
+  let label:ntasm_ast.Node=ntasm_ast.node_at(tree,label_id);
+  if label.kind!=32||label.aux!=1||label.first_child==0||label.first_child>tree.node_count{return false;}
+  let name:ntasm_ast.Node=ntasm_ast.node_at(tree,label.first_child);
+  let mut id:u64=1;
+  while id<=tree.node_count{
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if n.start>=fn_start&&n.end<=fn_end{
+      let target:u64=branch_target(source,tree,id);
+      if target!=0{let named:ntasm_ast.Node=ntasm_ast.node_at(tree,target);if same_span(source,named,name){return true;}}
+    }
+    id=id+1;
+  }
+  return false;
+}
+// Report the first statement of a block that fallthrough cannot reach. out
+// receives line, column and reason, 1 after a terminal statement or an
+// unconditional jmp and 2 after a call to a never function. A label definition
+// is a branch target rather than a statement: it is never reported, and when
+// some jmp or Jcc in the same function names it, it resumes fallthrough for
+// the region it heads. That resumption is what makes a jump target legal. The
+// transfer gap opened by the jmp is closed by the label the jmp names, and
+// the target region is scanned again from there, so dead code after a return
+// inside a target region is still reported.
+fn block_dead(source:buf<u8>,tree:ntasm_ast.Tree,block_id:u64,fn_start:u64,fn_end:u64,out:buf<u64>)->u64{
+  if block_id==0||block_id>tree.node_count||len(out)<3{return 800;}
+  let block:ntasm_ast.Node=ntasm_ast.node_at(tree,block_id);if block.kind!=25{return 800;}
+  let mut id:u64=block.first_child;let mut reason:u64=0;
+  while id!=0{
+    if id>tree.node_count{return 800;}
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if n.kind==32&&n.aux==1{if label_is_target(source,tree,id,fn_start,fn_end){reason=0;}id=n.next_sibling;continue;}
+    if reason!=0{out[0]=n.line;out[1]=n.column;out[2]=reason;return 340;}
+    // A branch is scanned on its own block, so dead code inside it is reported
+    // before the statements that follow the whole if/else.
+    if n.kind==30{
+      let mut child_id:u64=n.first_child;
+      while child_id!=0{
+        if child_id>tree.node_count{return 800;}
+        let child:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+        if child.kind==25{let nested:u64=block_dead(source,tree,child_id,fn_start,fn_end,out);if nested!=0{return nested;}}
+        child_id=child.next_sibling;
+      }
+    }
+    if falls_through(source,tree,id)==false{reason=1;}
+    else if block_terminal(source,tree,id){
+      if n.kind==28&&call_is_never(source,tree,id){reason=2;}else{reason=1;}
+    }
+    id=n.next_sibling;
+  }
+  return 0;
+}
+fn function_shape(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,out:buf<u64>)->u64{
+ let fn_:ntasm_ast.Node=ntasm_ast.node_at(tree,id);let mut child_id:u64=fn_.first_child;let mut return_type:u64=0;let mut body:u64=0;
+ while child_id!=0{if child_id>tree.node_count{return 800;}let child:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);if child.kind==36&&return_type==0{return_type=child_id;}if child.kind==25{body=child_id;}child_id=child.next_sibling;}
+ if return_type==0||body==0{return 800;}let type_:ntasm_ast.Node=ntasm_ast.node_at(tree,return_type);if type_.first_child==0||type_.first_child>tree.node_count{return 800;}let name:ntasm_ast.Node=ntasm_ast.node_at(tree,type_.first_child);let word:buf<u8>="never";out[0]=body;if same(source,name.start,name.end,word){out[1]=1;}else{out[1]=0;}return 0;
+}
+// ---- align_stack, spec/ntasm/ntasm.md 10 ----
+//
+// align_stack N is node kind 45 with one integer literal child, whose aux
+// carries N. The obligations of section 10 are decided over that node and the
+// body state it produces, in the order the section lists them.
+//
+// 1. N is a positive power of two, read from the literal child.
+// 2. N is permitted by the target ABI. There is no ABI table in the parser, so
+//    the permission is the guarantee the frozen tree already states and gates:
+//    8.3 and 17.3 give the ABI guarantee of stack_aligned(n) as a power of two
+//    at most 16, and call_contracts reads it in its family 4 branch. Nothing
+//    here widens that set, so 32 is refused although it is a power of two.
+// 3. rsp is typed as a stack in the current space. The space comes from the
+//    only construct that types a stack pointer, a load whose operand carries a
+//    ptr<space,T> annotation from the closed catalogue of section 7. Two
+//    disagreeing spaces, or any other way of writing rsp, leave the space
+//    unknown, and an unknown space is a refusal and never a pass.
+// 4. the fact stack_aligned(N) is produced in the body state, and a call
+//    discharges a callee requires {stack_aligned(M)} from that state.
+// 5. the fact dies at the next write of rsp, which is the observable part of
+//    the offset invalidation of section 10: no offset is nameable in the
+//    current AST, 17.5 recording that the frame and its size have no code and
+//    no gate, so a displaced offset can only be reported, never tracked. It
+//    dies equally at any instruction that displaces rsp WITHOUT putting the
+//    entry pointer back, which is a second question and not the compensation
+//    of item 6: displaces_stack states it, and a form can answer both ways at
+//    once, pop rsp being a compensation that still kills the fact. The one
+//    form that displaces rsp and does not kill it is call, argued from the ABI
+//    on the comment of that function.
+// 6. the displacement is compensated before a normal return and before a
+//    terminal transfer, unless the transfer itself replaces the stack, which
+//    17.4 gives to iretq. That single rule is also the section 10 exception
+//    for a never function, so no never specific test is needed here.
+// 7. what counts as the compensation is read from the frozen footprint table
+//    and nothing else, so the witness stays syntactic. The table does decide
+//    more than the previous lot gave it credit for, and the two refinements
+//    need no frame model: a form that writes the stack family through an
+//    operand naming the stack pointer restores it, and a form that writes the
+//    family without naming the pointer does not, which is what separates pop
+//    rsp from pop rbx and separates push, that never names it, from both.
+//    What a frame model would still buy, and what this pass therefore cannot
+//    claim, is the value: mov rsp,rbx compensates whether rbx holds the entry
+//    pointer, and nothing in the current AST can tell. A body that is wrong
+//    that way is accepted, and the conservatism kept here is the 364 refusal,
+//    never an invented proof.
+// 8. the ceiling of that ABI guarantee is abi_ceiling, defined once in this
+//    module and read at both places that need it, here and at the entry fact
+//    the body starts from. call_contracts family 4 carries its own copy
+//    because this module cannot be imported by it, so the two numbers are bound
+//    by a gate case instead of by a shared name.
+//
+// Only a body that holds an align_stack is walked. The state above is the
+// proof obligation section 10 creates, and a body without one keeps the
+// verdicts of the frozen rules, including the unguarded ABI branch of 17.3
+// whose owner is call_contracts and not this pass.
+
+// The one definition of the ABI stack alignment ceiling. spec/ntasm/ntasm.md 8.3 and
+// 17.3 credit stack_aligned(n) of the ABI guarantee when n is a power of two at
+// most 16, and there is no ABI table in the parser, so 16 is a number this
+// module and call_contracts both have to carry. It was carried twice here, once
+// as the ceiling of item 2 and once as the fact every body starts from, and one
+// more time in call_contracts family 4. Both places in this module now read
+// this one, and the control_flow gate puts the ceiling of this module and the
+// ceiling of call_contracts side by side, so changing one without the other
+// fails there instead of quietly widening or narrowing an accepted set.
+export fn abi_ceiling()->u64 { return 16; }
+
+// THE MIRROR OF THE STACK FAMILY IS GONE, and its reason was MEASURABLY false.
+//
+// This function used to answer `is_stack_pointer` from its own bytes, with
+// the justification « mirrored here because this module cannot import it:
+// tests_ntasm_return_types.c compiles control_flow.nova without
+// register_widths.nova in the image ». That image does not exist: measured on
+// the tree of this run, **every** live image that compiles `control_flow.nova`
+// already compiles `register_widths.nova` — the six loaders are
+// `ntasm_pipeline_parity.h`, `tests_ntasm_control_flow.c`,
+// `tests_ntasm_diagnostics.c`, `tests_ntasm_initializer_types.c`,
+// `tests_ntasm_return_types.c` and `tests_ntasm_splice.c`, and the seventh,
+// `tests_ntasm_call_contracts.c`, carries it twice. So the mirror was a second
+// copy of a rule kept alive by a sentence about a file that had changed, which
+// is the shape a second convention takes when nobody decides to keep it.
+//
+// AND THE TWO ARE THE SAME SET, which is what makes the deletion a refactor and
+// not a behaviour change: `register_widths.family` answers 5 at exactly three
+// places — `sp` at length two, `rsp`/`esp` and `spl` at length three — and
+// those four spellings are precisely the four the mirror tested. So
+// `is_stack_pointer(a,b)` and `register_widths.family(source,a,b)==5` are the
+// same predicate on the same bytes, and every call site below now says so
+// through the source of the rule rather than through a copy of it.
+// The register an operand names, or false when it names none: a memory
+// operand, a qualified name and any computed expression all answer false, so
+// no memory form can pass for a stack write.
+fn operand_is_stack(source:buf<u8>,tree:ntasm_ast.Tree,operand_id:u64)->bool {
+  if operand_id==0||operand_id>tree.node_count{return false;}
+  let operand:ntasm_ast.Node=ntasm_ast.node_at(tree,operand_id);
+  if operand.kind!=35||operand.aux!=0||operand.first_child==0||operand.first_child!=operand.last_child||operand.first_child>tree.node_count{return false;}
+  let q:ntasm_ast.Node=ntasm_ast.node_at(tree,operand.first_child);
+  if q.kind!=91||q.first_child==0||q.first_child!=q.last_child||q.first_child>tree.node_count{return false;}
+  let name:ntasm_ast.Node=ntasm_ast.node_at(tree,q.first_child);
+  return register_widths.family(source,name.start,name.end)==5;
+}
+// THE FACT LAYOUT, IN THREE REGIONS AND NO TABLE. `state` carries, after its
+// five stack words, the number of localisation slots n, then n words of FAMILY
+// (1..16, zero for a slot that names no register), then n words of LIVENESS (1
+// while the fact still holds at this point of the body, 0 once a write spent
+// it). The vector is `6 + 2n` wide and those three regions are read and
+// written by the four functions below and by nothing else: a second reader of
+// these offsets would be the second convention this file has just stopped
+// having, one function higher up.
+fn fact_slots(state:buf<u64>,width:u64)->u64 {
+  if len(state)<6{return 0;}
+  let n:u64=state[5];
+  if 6+n+n>width{return 0;}
+  if 6+n+n>len(state){return 0;}
+  return n;
+}
+// The family slot k names, 0 when k is out of range or the slot is empty.
+fn fact_family(state:buf<u64>,k:u64)->u64 {
+  if 6+k>=len(state){return 0;}
+  return state[6+k];
+}
+// Liveness slot k, 0 when k is out of range. A slot out of range is NOT live,
+// and that is the direction that cannot invent a fact.
+fn fact_live(state:buf<u64>,k:u64)->u64 {
+  if 6+k>=len(state){return 0;}
+  let n:u64=state[5];
+  if k>=n{return 0;}
+  if 6+n+k>=len(state){return 0;}
+  return state[6+n+k];
+}
+fn spend_fact(state:buf<u64>,k:u64)->u64 {
+  if len(state)<6{return 0;}
+  let n:u64=state[5];
+  if k>=n{return 0;}
+  if 6+n+k>=len(state){return 0;}
+  state[6+n+k]=0;
+  return 0;
+}
+// THE PHYSICAL FAMILY AN INSTRUCTION WRITES, OR 0 WHEN IT WRITES NONE WE CAN
+// CLASSIFY. The same two shapes `writes_parameter` counts in abi.nova -- `mov`
+// and `store`, destination the first operand -- and the two must agree: a rule
+// that classified differently from the existence rule would spend a fact on a
+// form the other calls a read, and the file would be answering two different
+// questions about one instruction. A form it cannot classify spends NOTHING,
+// and that limit is the one written down in abi.nova beside the rule it is
+// shared with; it is a stated gap, not a direction.
+fn written_family(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->u64 {
+  if id==0||id>tree.node_count{return 0;}
+  let name_id:u64=child(tree,id,0);
+  if name_id==0||name_id>tree.node_count{return 0;}
+  let mnemonic:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+  let dest_id:u64=child(tree,id,1);
+  if dest_id==0||dest_id>tree.node_count{return 0;}
+  let mov:buf<u8>="mov";let store:buf<u8>="store";
+  if same(source,mnemonic.start,mnemonic.end,mov)==false
+     && same(source,mnemonic.start,mnemonic.end,store)==false{return 0;}
+  let operand:ntasm_ast.Node=ntasm_ast.node_at(tree,dest_id);
+  if operand.kind==35&&operand.aux==0&&operand.first_child!=0&&operand.first_child==operand.last_child&&operand.first_child<=tree.node_count{
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,operand.first_child);
+    if q.kind==91&&q.first_child!=0&&q.first_child==q.last_child&&q.first_child<=tree.node_count{
+      let name:ntasm_ast.Node=ntasm_ast.node_at(tree,q.first_child);
+      return register_widths.family(source,name.start,name.end);
+    }
+  }
+  return 0;
+}
+// SPEND EVERY FACT THIS INSTRUCTION KILLS. One loop over the slots, and the
+// comparison is on the PHYSICAL FAMILY: the fact is about the CONTENT OF A
+// REGISTER at a point of the body, and the parameter is only the index the
+// machine uses to name that point. Under an ABI whose argument registers are
+// fixed by position, the callee's `@rcx` and the caller's `@rcx` are the same
+// register and one write spends both -- which is the whole reason this
+// compares families and not parameter ordinals, and the reason a rule written
+// on ordinals would be right only because this ABI happens to be ours.
+fn spend_facts(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,state:buf<u64>,width:u64)->u64 {
+  let n:u64=fact_slots(state,width);
+  if n==0{return 0;}
+  let family:u64=written_family(source,tree,id);
+  if family==0{return 0;}
+  let mut k:u64=0;
+  while k<n{
+    if fact_family(state,k)==family{spend_fact(state,k);}
+    k=k+1;
+  }
+  return 0;
+}
+// Child of an instruction by ordinal: 0 the mnemonic, 1 and 2 its operands.
+fn instruction_part(tree:ntasm_ast.Tree,id:u64,ordinal:u64)->u64 {
+  if id==0||id>tree.node_count{return 0;}
+  let instruction:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  let mut at:u64=instruction.first_child;let mut index:u64=0;
+  while at!=0&&index<ordinal{
+    if at>tree.node_count{return 0;}
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,at);
+    at=n.next_sibling;index=index+1;
+  }
+  if at>tree.node_count{return 0;}
+  return at;
+}
+// The 17.4 write footprint of one instruction, and the single table this module
+// reads it from. Shapes 0 to 4 are the numbers body_clobbers.form froze, so the
+// two tables can be compared shape by shape; 5 and 6 are two dispositions
+// body_clobbers has no use for, which is why they are numbered past it.
+// 0 the form writes no GPR of the stack family, so no part of it can ever stand
+//   for a compensation: cmp, test, and any mnemonic outside the frozen set;
+// 1 the form writes the family of its first operand, the writes_first row;
+// 2 xchg adds the family of its second operand to its first;
+// 3 pop writes its first operand on top of the fixed stack family;
+// 4 leave has no anchorable footprint, because the encoder has no leave, so the
+//   project rule is an explicit refusal rather than a no-op;
+// 5 the form moves the stack pointer itself, names no register operand, and
+//   gives no value back: the four fixed stack movers of the oracle member
+//   push|pushfq|popfq|ret, which x64.c:942-948 all charge registers_written
+//   1<<4, the rsp family, over. push and pushfq go down by their size, popfq
+//   and ret go up by eight, and none of the four writes the popped value into
+//   a register of the sixteen families, which is why shape 5 is a
+//   displacement and never a compensation;
+// 6 iretq is the one fixed form whose clobber is the stack itself, and the stack
+//   it pops is the stack it puts back.
+// The rows are the frozen table, in the order spec/ntasm/ntasm.md 17.4 lists them and
+// then the two dispositions the 27 September 2026 addition brought: a row here
+// that body_clobbers does not have, or the other way round, is what the parity
+// cases of this gate fail on.
+fn footprint(source:buf<u8>,name:ntasm_ast.Node)->u64 {
+  let a:buf<u8>="mov";if same(source,name.start,name.end,a){return 1;}
+  let b:buf<u8>="load";if same(source,name.start,name.end,b){return 1;}
+  let c:buf<u8>="movzx";if same(source,name.start,name.end,c){return 1;}
+  let d:buf<u8>="movsx";if same(source,name.start,name.end,d){return 1;}
+  let e:buf<u8>="movsxd";if same(source,name.start,name.end,e){return 1;}
+  let f:buf<u8>="lea";if same(source,name.start,name.end,f){return 1;}
+  let g:buf<u8>="add";if same(source,name.start,name.end,g){return 1;}
+  let h:buf<u8>="adc";if same(source,name.start,name.end,h){return 1;}
+  let i:buf<u8>="sub";if same(source,name.start,name.end,i){return 1;}
+  let j:buf<u8>="sbb";if same(source,name.start,name.end,j){return 1;}
+  let k:buf<u8>="and";if same(source,name.start,name.end,k){return 1;}
+  let l:buf<u8>="or";if same(source,name.start,name.end,l){return 1;}
+  let m:buf<u8>="xor";if same(source,name.start,name.end,m){return 1;}
+  let n:buf<u8>="inc";if same(source,name.start,name.end,n){return 1;}
+  let o:buf<u8>="dec";if same(source,name.start,name.end,o){return 1;}
+  let p:buf<u8>="neg";if same(source,name.start,name.end,p){return 1;}
+  let q:buf<u8>="not";if same(source,name.start,name.end,q){return 1;}
+  let r:buf<u8>="shl";if same(source,name.start,name.end,r){return 1;}
+  let s:buf<u8>="shr";if same(source,name.start,name.end,s){return 1;}
+  let t:buf<u8>="sar";if same(source,name.start,name.end,t){return 1;}
+  let u:buf<u8>="rol";if same(source,name.start,name.end,u){return 1;}
+  let v:buf<u8>="ror";if same(source,name.start,name.end,v){return 1;}
+  let w:buf<u8>="imul";if same(source,name.start,name.end,w){return 1;}
+  let x:buf<u8>="bswap";if same(source,name.start,name.end,x){return 1;}
+  let y:buf<u8>="bts";if same(source,name.start,name.end,y){return 1;}
+  let z:buf<u8>="btr";if same(source,name.start,name.end,z){return 1;}
+  let aa:buf<u8>="btc";if same(source,name.start,name.end,aa){return 1;}
+  let ab:buf<u8>="bsf";if same(source,name.start,name.end,ab){return 1;}
+  let ac:buf<u8>="bsr";if same(source,name.start,name.end,ac){return 1;}
+  let ad:buf<u8>="xchg";if same(source,name.start,name.end,ad){return 2;}
+  let ae:buf<u8>="read_cr";if same(source,name.start,name.end,ae){return 1;}
+  let af:buf<u8>="in";if same(source,name.start,name.end,af){return 1;}
+  let ag:buf<u8>="pop";if same(source,name.start,name.end,ag){return 3;}
+  let ah:buf<u8>="leave";if same(source,name.start,name.end,ah){return 4;}
+  let ai:buf<u8>="push";if same(source,name.start,name.end,ai){return 5;}
+  // The three forms the frozen table had no row for, read out of the oracle
+  // member itself. x64.c:943-944 gives pushfq, popfq and ret the same
+  // registers_written 1<<4 as push and pop, and none of the three writes a
+  // register of the sixteen families, so all three are shape 5 and none is
+  // shape 3. The gate sweeps the whole member against nt_x64_effects, so these
+  // three rows and the fixed_mask row of body_clobbers cannot drift apart.
+  let ak:buf<u8>="pushfq";if same(source,name.start,name.end,ak){return 5;}
+  let al:buf<u8>="popfq";if same(source,name.start,name.end,al){return 5;}
+  let am:buf<u8>="ret";if same(source,name.start,name.end,am){return 5;}
+  let aj:buf<u8>="iretq";if same(source,name.start,name.end,aj){return 6;}
+  return 0;
+}
+// The one question spec/ntasm/ntasm.md 17.4 puts to this module and to body_clobbers
+// alike: does the frozen footprint of the instruction at id include the stack
+// family, family 5, bit 16. body_clobbers answers it from its own table, and
+// control_flow cannot read that table: tests_ntasm_return_types.c compiles
+// control_flow.nova without body_clobbers.nova in the image, so importing it
+// here would break a gate this lot does not own. The answer is therefore
+// exported, and the control_flow gate puts both to a one instruction body and
+// fails when they disagree. The coupling is a stated risk with a gate on it,
+// and never a third copy nobody compares.
+export fn writes_stack(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+  let instruction:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  if instruction.kind!=32||instruction.aux!=0{return false;}
+  let name_id:u64=instruction_part(tree,id,0);
+  if name_id==0||name_id>tree.node_count{return false;}
+  let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+  let shape:u64=footprint(source,name);
+  if shape==0||shape==4{return false;}
+  // pop, push, pushfq, popfq, ret and iretq are charged the fixed stack family
+  // whatever their operands name, which is exactly what the conformance oracle
+  // reports for them: x64.c:943-944 gives the whole push|pushfq|pop|popfq|ret|
+  // return|call member registers_written 1<<4, and x64.c:1039 gives iretq the
+  // same write from its own branch. The gate sweeps that whole member against
+  // nt_x64_effects, so a row added here without its twin in body_clobbers, or
+  // the other way round, fails the parity probe instead of quietly widening
+  // what is free.
+  if shape==3||shape==5||shape==6{return true;}
+  if operand_is_stack(source,tree,instruction_part(tree,id,1)){return true;}
+  if shape==2{return operand_is_stack(source,tree,instruction_part(tree,id,2));}
+  return false;
+}
+// True when the instruction at id gives the entry stack pointer back, the only
+// compensation this pass can witness. It is strictly narrower than
+// writes_stack, and the two must stay so: a form that writes the stack family
+// without naming the pointer in an operand has not restored anything. push,
+// pushfq, popfq and ret name no operand at all and none of them puts the entry
+// pointer back, so all four answer true to writes_stack and false here, exactly
+// as push rbx and pop rbx already did. The two fixed dispositions are the
+// exceptions the table states: iretq replaces the stack outright, and the
+// refused form is never a compensation. A form outside the frozen set writes
+// nothing, so cmp, test and any unknown mnemonic can never stand for one. It is
+// exported so the control_flow gate can put it beside the two other questions
+// about the same instruction, displaces_stack and writes_stack, and assert the
+// three rows of the table together: the gate on a coupling is only as good as
+// the three answers it compares.
+export fn replaces_stack(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+  if id==0||id>tree.node_count{return false;}
+  let instruction:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  if instruction.kind!=32||instruction.aux!=0{return false;}
+  let name_id:u64=instruction_part(tree,id,0);
+  if name_id==0||name_id>tree.node_count{return false;}
+  let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+  let shape:u64=footprint(source,name);
+  if shape==0||shape==4||shape==5{return false;}
+  if shape==6{return true;}
+  if operand_is_stack(source,tree,instruction_part(tree,id,1)){return true;}
+  if shape==2{return operand_is_stack(source,tree,instruction_part(tree,id,2));}
+  return false;
+}
+// Does this instruction displace rsp at all? The second of the two questions
+// section 10 asks, the one the compensation witness above cannot answer, and a
+// question the 17.4 footprint table cannot answer either. The x86_64
+// conformance oracle (compiler/c/ntasm/backend/x64.c, nt_x64_effects, member
+// push|pushfq|pop|popfq|ret|return|call at :942-948) writes the rsp family in
+// registers_written for every form of that member and sets stack_write for
+// push, pushfq and call, while iretq publishes the same write from its own
+// branch at :1039. Every form of that member the grammar can spell as a kind 32
+// instruction is a row of the footprint table now, so writes_stack answers the
+// same as the oracle for all of them and this function no longer needs a row of
+// its own for any of them.
+//
+// The two questions stay separate anyway, and the gate asks all three about one
+// instruction at once. writes_stack asks whether the footprint includes the
+// stack family; this one asks whether rsp moved; replaces_stack above asks
+// whether the entry pointer came back. The three answers differ, and they have
+// to: pop rsp writes the stack family, displaces rsp and is a compensation, and
+// push rbx writes the same family, displaces rsp and is not one at all, because
+// it moves the pointer down and reads its operand instead of writing it. That
+// was the reason this function existed while the footprint table had no row for
+// pushfq, popfq and ret, and it is still the reason: the footprint question is
+// narrower than the displacement question, and deriving this one from that one
+// would discharge align_stack 16 ; push rbx ; call g with a callee requiring
+// stack_aligned(16) while rsp stood at 8 (mod 16). The rows, all read from the
+// same instruction node and never from source text:
+//
+//   form                            displaces   restores   why
+//   writes_first or xchg on rsp     yes         yes        a fresh value, so
+//                                                    the old alignment is gone
+//                                                    and the entry pointer may
+//                                                    be back
+//   pop rsp                         yes         yes        the popped value is
+//                                                    arbitrary, so the fact
+//                                                    dies although the entry
+//                                                    pointer is paid for
+//   pop rbx / pop r12               yes         no         up by the operand
+//                                                    size, another register
+//                                                    written
+//   push rbx / push 1 / push rsp    yes         no         down by the operand
+//                                                    size, no operand written
+//   pushfq                          yes         no         down by eight, the
+//                                                    oracle member with push
+//   popfq                           yes         no         up by eight, the
+//                                                    oracle member with pop
+//   ret                             yes         no         up by eight, or by
+//                                                    eight plus its immediate
+//   sysretq                         yes         no         rewinds the whole
+//                                                    return frame
+//   iretq                           yes         yes        pops the frame and
+//                                                    puts another stack there
+//   call g                          yes         yes        see below
+//   leave                           refused     refused    336 comes first
+//   anything else                   no          no         outside the frozen
+//                                                    set, so it moves nothing
+//
+// call is the one form that displaces rsp and does not kill the fact, and the
+// ABI is the whole reason. call writes the shadow area eight bytes below the
+// caller rsp and puts the return address there, but the ret that comes back
+// pops that same eight bytes, and a callee is obliged to hand rsp back the
+// value it was given: that is the one register the calling convention does not
+// let a callee move. So the value of rsp on the path out of a call is the
+// value it had on the way in and the alignment true at the call site is still
+// true after it. A callee that returns through a different amount has left the
+// ABI, and that is caught where it can be seen: callee_moves_stack reads the
+// callee declaration and, since this lot, its body, and either answer of "may
+// have moved" ends the fact together with the pending displacement. That body
+// half over-approximates in the safe direction, a callee that pushes and pops
+// around its own work being read as maybe-moving, which is the trade 8.3
+// already froze for call_contracts. So the rule is: the fact dies at every
+// displacement this function reports, and call is the single row where the
+// displacement is balanced by the callee that made it.
+export fn displaces_stack(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+  if id==0||id>tree.node_count{return false;}
+  let instruction:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  if instruction.kind!=32||instruction.aux!=0{return false;}
+  let name_id:u64=instruction_part(tree,id,0);
+  if name_id==0||name_id>tree.node_count{return false;}
+  let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+  // sysretq is the one form of the oracle catalogue that displaces rsp and has
+  // no footprint row, and that is correct rather than an omission: x64.c:1032
+  // publishes registers_read = (1<<1)|(1<<11) and writes no general purpose
+  // register, so shape 0 is exactly what the oracle says for the sixteen
+  // families this table numbers. It is not true that it writes no register at
+  // all, and this comment used to say so: x64.c:1036 sets flags_written and the
+  // tail of the function at x64.c:1069 to :1074 then sets registers_written
+  // bit 17, so nt_x64_effects answers 0x020000 and only its low sixteen bits
+  // are zero. Bit 17 is RFLAGS, outside every family register_widths numbers,
+  // and charging it is body_intrinsics' question and not this one's. It
+  // rewinds the whole return frame, so it displaces, and it is the only literal
+  // left here.
+  // return and call, the other two forms of the x64.c:942 member, are
+  // statements and not kind 32 instructions, so this predicate is never the
+  // question asked of them. The statement table below answers all three
+  // questions for those two node kinds, on the shapes the parser really
+  // produces, and stack_block reads it. This predicate and that table are
+  // two readings of one oracle member and are gated side by side.
+  let a:buf<u8>="sysretq";if same(source,name.start,name.end,a){return true;}
+  let shape:u64=footprint(source,name);
+  // leave is the refused form and is answered 336 before this question is
+  // asked, and a form outside the frozen set writes no family at all.
+  if shape==0||shape==4{return false;}
+  // push, pushfq, popfq, ret and iretq move the pointer themselves and name no
+  // operand, and pop always moves it by the operand size whether or not that
+  // operand names the pointer: pop rbx leaves rsp where the push that made the
+  // room for rbx left it, which is displaced and not the value any compensation
+  // can name. Only the remaining shapes narrow on the operand.
+  if shape==3||shape==5||shape==6{return true;}
+  if operand_is_stack(source,tree,instruction_part(tree,id,1)){return true;}
+  if shape==2{return operand_is_stack(source,tree,instruction_part(tree,id,2));}
+  return false;
+}
+// The 17.4 footprint of a body STATEMENT, on the two node kinds a NAME
+// statement can never carry. The parser reads return as keyword 34 and
+// builds node kind 29 (parser.nova:370-374), and call as keyword 33 and
+// node kind 28 (parser.nova:362-368), so no kind 32 node ever holds either
+// of them and the table above is structurally never asked about them. Both
+// are members of the same oracle branch as the four fixed stack movers, and
+// x64.c:942-944 gives every form of that member the same registers_written
+// 1<<4, so both statements carry the stack family, 16, family 5.
+//
+// This is the answer the frozen table could not give, and giving it is what
+// closes the last two forms of the section 17.4 reserve. What it does NOT do
+// is turn the charge into a clobber declaration, and the reason is 8.2
+// itself: a write belongs to clobbers only when the entry value is not
+// restored at the boundary, and these two statements are the pair that
+// restores it. A call pushes the return address and the callee's return pops
+// that same eight bytes; a return pops the eight bytes this function's own
+// caller pushed. The boundary value of rsp is the value the caller left, for
+// every function, so the write is discharged by the ABI pair rather than by
+// a declaration, and charging 1<<4 here would refuse every body in the
+// language over a write nothing has to pay. That asymmetry is the answer,
+// and it is why these two rows are not rows of form.
+//
+// The two are numbered past 6 for the reason 5 and 6 are: they are
+// dispositions body_clobbers has no use for, and they are dispositions of a
+// different thing than an instruction footprint, read off a statement node
+// and never off a mnemonic.
+// 7 return: writes 1<<4, displaces rsp by the eight bytes of the return
+//   address, and gives nothing back. It is the point where section 10
+//   discharges the displacement, so nothing is consulted after it;
+// 8 call: writes 1<<4, displaces rsp by the eight bytes of the return
+//   address it pushes, and the ABI gives those eight bytes back, which is
+//   the whole argument for call not displacing the alignment fact.
+fn statement_footprint(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->u64 {
+  if id==0||id>tree.node_count{return 0;}
+  let statement:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  if statement.kind==29{return 7;}
+  if statement.kind==28{return 8;}
+  return 0;}
+// The 17.4 footprint question, asked of a statement instead of of a kind 32
+// instruction. It is the question writes_stack asks and it has the same
+// answer for every form the oracle member charges, so the two rows above are
+// what makes return and call rows of the table rather than forms no row
+// names. Exported beside writes_stack for the same reason that one is:
+// control_flow cannot read the body_clobbers table, so the coupling is bound
+// by a gate instead of by a shared name.
+export fn statement_writes_stack(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+  if statement_footprint(source,tree,id)==0{return false;}
+  return true;}
+// The section 10 displacement question, asked of a statement. This is the
+// RAW question displaces_stack never got to ask about these two forms,
+// because that predicate begins on kind 32: does the form move the stack
+// pointer at all. Both answers are yes, and the two rows differ in what the
+// walk does with the answer, not in the answer, which is exactly why the
+// footprint question above is not derivable from this one: pushfq and popfq
+// are the identical pair, write the family and displace, and the table still
+// needs a row each to say a return pays no debt and a call does not kill the
+// fact.
+export fn statement_displaces_stack(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+  if statement_footprint(source,tree,id)==0{return false;}
+  return true;}
+// The third of the three questions, asked of a statement: does the
+// displacement come back. It is replaces_stack for a kind 32 instruction,
+// and it is the predicate that makes the two rows differ in what the walk
+// does rather than only in what the table says. A return restores nothing,
+// so a displacement still pending at one is a debt section 10 reports with
+// 364; a call restores the eight bytes through the callee, so the alignment
+// fact survives it. Deriving either from the other is what the two
+// pushfq/popfq cases of this gate refuse, and these two rows are the same
+// pair seen from the statement side: both displace, and only one restores.
+export fn statement_restores_stack(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+  let shape:u64=statement_footprint(source,tree,id);
+  if shape==8{return true;}
+  return false;}
+// A form the frozen table refuses. body_clobbers reports it as 336 at the
+// mnemonic, whatever the clobbers set declares, because it is the diagnostic
+// that pass already gives for a destination which is no register and leave
+// names no register at all. This pass must reach the same verdict about the
+// same instruction rather than a different one: 364 would blame an alignment
+// the mnemonic cannot even perform, and would name the return instead of the
+// pseudo-op. Only a shape 4 form is refused, and only an instruction: a label
+// definition shares node kind 32 but carries aux 1 and names a branch target.
+fn refused_footprint(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,out:buf<u64>)->u64 {
+  if id==0||id>tree.node_count{return 800;}
+  let instruction:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  if instruction.kind!=32||instruction.aux!=0{return 0;}
+  let name_id:u64=instruction_part(tree,id,0);
+  if name_id==0||name_id>tree.node_count{return 800;}
+  let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+  if footprint(source,name)==4{out[0]=name.line;out[1]=name.column;out[2]=0;out[3]=0;return 336;}
+  return 0;
+}
+// The space bit of the closed section 7 catalogue, the six names and bits
+// pointer_spaces and body_effects read.
+fn space_bit(source:buf<u8>,node:ntasm_ast.Node)->u64 {
+  let a:buf<u8>="user";if same(source,node.start,node.end,a){return 1;}
+  let b:buf<u8>="kernel";if same(source,node.start,node.end,b){return 2;}
+  let c:buf<u8>="physical";if same(source,node.start,node.end,c){return 4;}
+  let d:buf<u8>="mmio";if same(source,node.start,node.end,d){return 8;}
+  let e:buf<u8>="device";if same(source,node.start,node.end,e){return 16;}
+  let f:buf<u8>="firmware";if same(source,node.start,node.end,f){return 32;}
+  return 0;
+}
+// The space a stack writing instruction installs, or 0 when it installs none.
+// Only a load from a ptr<space,T> annotated operand types the new stack
+// pointer; a register, an immediate or a computed value leaves it unknown.
+fn written_space(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->u64 {
+  let name_id:u64=instruction_part(tree,id,0);
+  if name_id==0||name_id>tree.node_count{return 0;}
+  let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+  let load:buf<u8>="load";if same(source,name.start,name.end,load)==false{return 0;}
+  let mut at:u64=instruction_part(tree,id,1);
+  while at!=0&&at<=tree.node_count{
+    let operand:ntasm_ast.Node=ntasm_ast.node_at(tree,at);
+    if operand.kind==34{
+      let type_id:u64=operand.last_child;
+      if type_id==0||type_id>tree.node_count{return 0;}
+      let type_:ntasm_ast.Node=ntasm_ast.node_at(tree,type_id);
+      if type_.kind!=36||type_.aux!=1||type_.first_child==0||type_.first_child>tree.node_count{return 0;}
+      let space:ntasm_ast.Node=ntasm_ast.node_at(tree,type_.first_child);
+      if space.kind!=90||space.start>space.end||space.end>len(source){return 0;}
+      return space_bit(source,space);
+    }
+    at=operand.next_sibling;
+  }
+  return 0;
+}
+// Two spaces that disagree leave the current space unknown, and unknown is
+// sticky: a later load proves where rsp points on the path that reaches it,
+// not on the path that skipped it.
+fn merge_space(current:u64,found:u64)->u64 {
+  if found==0||current==0{return 0;}
+  if found==current{return current;}
+  return 0;
+}
+// Alignment merges to the weaker of the two guarantees, and an unknown on
+// either side poisons the merge.
+fn merge_align(current:u64,found:u64)->u64 {
+  if found==0||current==0{return 0;}
+  if found<current{return found;}
+  return current;
+}
+// The requires predicate set of a declaration, or 0 when it has none. The
+// parser wraps the set in a keyword node holding one child of the same kind,
+// so the set is that child. Same reading as call_contracts.
+fn requires_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+  let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  let mut child_id:u64=declaration.first_child;
+  while child_id!=0{
+    if child_id>tree.node_count{return 0;}
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+    if n.kind==22{
+      if n.first_child==0||n.first_child!=n.last_child||n.first_child>tree.node_count{return 0;}
+      let body:ntasm_ast.Node=ntasm_ast.node_at(tree,n.first_child);
+      if body.kind!=22{return 0;}
+      return n.first_child;
+    }
+    child_id=n.next_sibling;
+  }
+  return 0;
+}
+fn predicate_name_id(tree:ntasm_ast.Tree,pred_id:u64)->u64 {
+  let predicate:ntasm_ast.Node=ntasm_ast.node_at(tree,pred_id);
+  if predicate.kind!=33||predicate.first_child==0||predicate.first_child>tree.node_count{return 0;}
+  let q:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate.first_child);
+  if q.kind!=91||q.first_child==0||q.first_child!=q.last_child||q.first_child>tree.node_count{return 0;}
+  return q.first_child;
+}
+fn predicate_arg_id(tree:ntasm_ast.Tree,pred_id:u64,ordinal:u64)->u64 {
+  let predicate:ntasm_ast.Node=ntasm_ast.node_at(tree,pred_id);
+  if predicate.first_child==0||predicate.first_child>tree.node_count{return 0;}
+  let q:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate.first_child);
+  let mut at:u64=q.next_sibling;let mut index:u64=0;
+  while at!=0&&index<ordinal{
+    if at>tree.node_count{return 0;}
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,at);
+    at=n.next_sibling;index=index+1;
+  }
+  if at>tree.node_count{return 0;}
+  return at;
+}
+// The name a call names, or 0 when the call does not carry a usable one.
+fn call_name_id(tree:ntasm_ast.Tree,call_id:u64)->u64 {
+  let qid:u64=child(tree,call_id,0);
+  if qid==0{return 0;}
+  let q:ntasm_ast.Node=ntasm_ast.node_at(tree,qid);
+  if q.kind!=91||q.last_child==0||q.last_child>tree.node_count{return 0;}
+  return q.last_child;
+}
+// The declaration a call names, or 0 when the name resolves to none. An
+// unresolved name belongs to calls.check, so this pass reports nothing for it
+// rather than a diagnostic it cannot ground.
+fn callee_id(source:buf<u8>,tree:ntasm_ast.Tree,call_id:u64)->u64 {
+  let name_id:u64=call_name_id(tree,call_id);
+  if name_id==0{return 0;}
+  let called:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+  let mut decl_id:u64=1;
+  while decl_id<=tree.node_count{
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    if declaration.kind==18||declaration.kind==9{
+      let other:u64=decl_name_id(tree,decl_id);
+      if other!=0{
+        let name:ntasm_ast.Node=ntasm_ast.node_at(tree,other);
+        if same_span(source,name,called){return decl_id;}
+      }
+    }
+    decl_id=decl_id+1;
+  }
+  return 0;
+}
+// The clobbers set of a declaration, or 0 when it has none.
+fn clobber_set_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+  let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  let mut child_id:u64=declaration.first_child;
+  while child_id!=0{
+    if child_id>tree.node_count{return 0;}
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+    if n.kind==21{return child_id;}
+    child_id=n.next_sibling;
+  }
+  return 0;
+}
+// The body block of a declaration, or 0 when it has none. An import alias is
+// kind 9 and carries no body, so an imported callee is decided by its
+// declaration half alone, which is the safe direction: an import whose clobbers
+// set cannot be read answers "may have moved".
+fn body_block(tree:ntasm_ast.Tree,id:u64)->u64 {
+  let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  let mut child_id:u64=declaration.first_child;
+  while child_id!=0{
+    if child_id>tree.node_count{return 0;}
+    let child:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+    if child.kind==25{return child_id;}
+    child_id=child.next_sibling;
+  }
+  return 0;
+}
+// Any instruction inside the block subtree that displaces rsp. This is the body
+// half callee_moves_stack needs so the ABI argument behind call not displacing
+// the fact is checked rather than assumed, and it is deliberately the same
+// over-approximation 8.3 froze for call_contracts: a callee that pushes and
+// pops around its own work has not moved rsp when it returns and is still read
+// as maybe having, because deciding the other way is the frame model 17.5
+// records as having no code and no gate.
+fn block_moves_stack(source:buf<u8>,tree:ntasm_ast.Tree,block_id:u64)->bool {
+  if block_id==0||block_id>tree.node_count{return false;}
+  if ntasm_ast.node_at(tree,block_id).kind!=25{return false;}
+  let mut id:u64=ntasm_ast.node_at(tree,block_id).first_child;
+  while id!=0{
+    if id>tree.node_count{return false;}
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if n.kind==32&&n.aux==0&&displaces_stack(source,tree,id){return true;}
+    if n.kind==25&&block_moves_stack(source,tree,id){return true;}
+    if n.kind==30{
+      let mut branch:u64=n.first_child;
+      while branch!=0&&branch<=tree.node_count{
+        let b:ntasm_ast.Node=ntasm_ast.node_at(tree,branch);
+        if b.kind==25&&block_moves_stack(source,tree,branch){return true;}
+        branch=b.next_sibling;
+      }
+    }
+    id=n.next_sibling;
+  }
+  return false;
+}
+// A callee whose clobbers names the stack family, whose set cannot be read, or
+// whose body displaces rsp, may have replaced the caller stack. This is the rule
+// call_contracts applies to the same node kinds in moves_stack, read here
+// without importing it: a missing, unreadable or non register set reads as "may
+// have moved", never as a pass, and the body half is the same conjunction of
+// declaration and body that 8.3 froze, so a callee that pushes and returns
+// without declaring it cannot keep the caller fact alive.
+fn callee_moves_stack(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+  let set_id:u64=clobber_set_id(tree,id);
+  if set_id==0{return true;}
+  let set:ntasm_ast.Node=ntasm_ast.node_at(tree,set_id);
+  if set.kind!=21{return true;}
+  let mut child_id:u64=set.first_child;
+  while child_id!=0{
+    if child_id>tree.node_count{return true;}
+    let entry:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+    if entry.kind!=91||entry.first_child==0||entry.first_child!=entry.last_child||entry.first_child>tree.node_count{return true;}
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,entry.first_child);
+    if name.kind!=90||name.start>name.end||name.end>len(source){return true;}
+    if register_widths.family(source,name.start,name.end)==5{return true;}
+    child_id=entry.next_sibling;
+  }
+  if block_moves_stack(source,tree,body_block(tree,id)){return true;}
+  return false;
+}
+// Does the caller already carry stack_aligned(n) about the very same bytes?
+// 8.3 keeps that branch beside the ABI guarantee, so a pass that adds the
+// align_stack guard must not drop it: the fact may come from the caller own
+// entry contract instead of from its body.
+fn caller_carries(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,wanted:ntasm_ast.Node)->bool {
+  let set_id:u64=requires_id(tree,caller_id);
+  if set_id==0{return false;}
+  let set:ntasm_ast.Node=ntasm_ast.node_at(tree,set_id);
+  let mut pred_id:u64=set.first_child;
+  while pred_id!=0&&pred_id<=tree.node_count{
+    let predicate:ntasm_ast.Node=ntasm_ast.node_at(tree,pred_id);
+    let name_id:u64=predicate_name_id(tree,pred_id);
+    if name_id!=0{
+      let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+      let word:buf<u8>="stack_aligned";
+      if same(source,name.start,name.end,word){
+        let arg:u64=predicate_arg_id(tree,pred_id,0);
+        if arg!=0&&arg<=tree.node_count&&predicate_arg_id(tree,pred_id,1)==0{
+          let held:ntasm_ast.Node=ntasm_ast.node_at(tree,arg);
+          if same_span(source,held,wanted){return true;}
+        }
+      }
+    }
+    pred_id=predicate.next_sibling;
+  }
+  return false;
+}
+// One call site. 326 writes the callee name position, family 4 and the
+// predicate ordinal, the shape 8.3 and 17.3 froze for an unproved requires, and
+// only for the stack_aligned family: every other family belongs to
+// call_contracts. The ABI guarantee of 17.3 is the branch align_stack takes
+// over, so the state the body built replaces it here while the caller own fact
+// still stands. A callee that may have moved the stack ends the fact, and with
+// it the pending displacement: the frame it displaced is no longer active.
+fn call_statement(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,call_id:u64,state:buf<u64>,out:buf<u64>)->u64 {
+  let name_id:u64=call_name_id(tree,call_id);
+  let callee:u64=callee_id(source,tree,call_id);
+  let mut code:u64=0;
+  // THE OBSERVATION POINT, and the reader that gives `fact_live` its first
+  // caller. A fact walk stops caring about the callee's `requires` entirely --
+  // discharging it is the alignment walk's business and would answer a
+  // question this state does not carry -- and publishes what it knows about
+  // every localisation AT THIS CALL, which is the only moment a fact is ever
+  // true or false. The liveness lands at out[2+k], the family at out[1+k] and
+  // the slot count at out[0], so one row is one localisation and a caller can
+  // read the whole vector without a second convention about where it lives.
+  let mut slots:u64=0;
+  if len(state)>=6{slots=state[5];}
+  if slots!=0{
+    if len(out)<2+slots{return 800;}
+    let mut k:u64=0;
+    while k<slots{
+      let fam_at:u64=1+k;
+      let live_at:u64=2+k;
+      if fam_at>=len(out)||live_at>=len(out){return 800;}
+      if 6+k<len(state){out[fam_at]=fact_family(state,k);}
+      out[live_at]=fact_live(state,k);
+      k=k+1;
+    }
+    return 0;
+  }
+  if callee!=0{
+    let set_id:u64=requires_id(tree,callee);
+    if set_id!=0{
+      let set:ntasm_ast.Node=ntasm_ast.node_at(tree,set_id);
+      let mut pred_id:u64=set.first_child;let mut ordinal:u64=0;
+      while pred_id!=0&&pred_id<=tree.node_count{
+        let predicate:ntasm_ast.Node=ntasm_ast.node_at(tree,pred_id);
+        let pred_name_id:u64=predicate_name_id(tree,pred_id);
+        if pred_name_id!=0{
+          let pred_name:ntasm_ast.Node=ntasm_ast.node_at(tree,pred_name_id);
+          let word:buf<u8>="stack_aligned";
+          if same(source,pred_name.start,pred_name.end,word){
+            let arg:u64=predicate_arg_id(tree,pred_id,0);
+            if arg!=0&&arg<=tree.node_count&&predicate_arg_id(tree,pred_id,1)==0{
+              let literal:ntasm_ast.Node=ntasm_ast.node_at(tree,arg);
+              if literal.kind==94{
+                let amount:u64=literal.aux;
+                let proved:bool=state[1]!=0&&amount!=0&&(amount&(amount-1))==0&&amount<=state[1];
+                if proved==false&&caller_carries(source,tree,caller_id,literal)==false{
+                  if name_id==0{return 800;}
+                  let called:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                  out[0]=called.line;out[1]=called.column;out[2]=4;out[3]=ordinal;return 326;
+                }
+              }
+            }
+          }
+        }
+        pred_id=predicate.next_sibling;ordinal=ordinal+1;
+      }
+    }
+    if callee_moves_stack(source,tree,callee){state[0]=0;state[1]=0;state[2]=0;state[3]=0;state[4]=1;}
+  }
+  // A call to a never callee is a terminal transfer that replaces no stack, so
+  // a displacement still pending there leaves the function for good. iretq
+  // replaces it on its own, and a callee that clobbers the stack has already
+  // replaced it, both above.
+  if state[2]!=0&&name_id!=0&&call_is_never(source,tree,call_id){
+    let called:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+    out[0]=called.line;out[1]=called.column;out[2]=5;out[3]=state[3];code=364;
+  }
+  return code;
+}
+// One align_stack statement and the state it produces. 364 reason 1 is a value
+// that is not a positive power of two, reason 2 a power of two the target ABI
+// does not permit, read from abi_ceiling, and reason 3 an rsp no load types as a
+// stack in the current space.
+//
+// A repeated align_stack is NOT a no-op, and this comment used to say the
+// opposite, on the algebraic identity alone: on powers of two
+// align_down(align_down(x,N1),N2) is align_down(x,max(N1,N2)), so the second
+// fact can be neither stronger nor weaker than the first. That identity is true
+// and it settles the FACT, nothing else. The two lines below do two more
+// things, and both are needed:
+//
+// state[2]=1 opens a fresh pending displacement, because align_stack adjusts
+// downward every time it runs. Two align_stack statements displace the stack
+// twice, and only the return of the ENTRY pointer pays for both, so the
+// obligation 364 reports is one displacement and the N it names is the
+// strongest of the two that was asked for;
+// state[3]=max keeps that N, so a body that asked for 4 and then for 16 is
+// reported as 16.
+//
+// So the model was right and the claim of redundancy was wrong, and the identity
+// does not rescue it in either direction. A second align_stack cannot weaken the
+// fact, true. But it is not redundant either: after a form that displaces rsp
+// the fact is gone, and the second align_stack rebuilds it from nothing, at its
+// own N and not at the first one. align_stack 16 ; push rbx ; align_stack 4
+// therefore holds 4, which discharges no callee that requires 16, while
+// align_stack 16 ; push rbx ; align_stack 16 holds 16 and does. Both are gated.
+fn align_statement(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,state:buf<u64>,out:buf<u64>)->u64 {
+  let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+  if node.kind!=45||node.first_child==0||node.first_child!=node.last_child||node.first_child>tree.node_count{return 800;}
+  let literal:ntasm_ast.Node=ntasm_ast.node_at(tree,node.first_child);
+  if literal.kind!=94{return 800;}
+  let amount:u64=literal.aux;
+  if amount==0||(amount&(amount-1))!=0{out[0]=node.line;out[1]=node.column;out[2]=1;out[3]=amount;return 364;}
+  if amount>abi_ceiling(){out[0]=node.line;out[1]=node.column;out[2]=2;out[3]=amount;return 364;}
+  if state[0]==0{out[0]=node.line;out[1]=node.column;out[2]=3;out[3]=amount;return 364;}
+  if state[1]==0||amount>state[1]{state[1]=amount;}
+  state[2]=1;
+  if amount>state[3]{state[3]=amount;}
+  return 0;
+}
+// Every call inside one expression, in source order. The grammar nests a call
+// under any operator, inside an operand, an argument, a condition and an
+// initialiser, so a call site is not always a direct child of its statement
+// and a call left out here would keep the frozen unguarded branch of 8.3.
+fn stack_expression(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,expr_id:u64,state:buf<u64>,out:buf<u64>)->u64 {
+  if expr_id==0||expr_id>tree.node_count{return 0;}
+  let node:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);
+  let mut code:u64=0;
+  if node.kind==28||(node.kind==35&&node.aux==1){code=call_statement(source,tree,caller_id,expr_id,state,out);}
+  if code==0{
+    let mut child_id:u64=node.first_child;
+    while child_id!=0&&code==0{
+      if child_id>tree.node_count{code=800;}
+      else{
+        let child:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+        code=stack_expression(source,tree,caller_id,child_id,state,out);
+        child_id=child.next_sibling;
+      }
+    }
+  }
+  return code;
+}
+// THE STATE VECTOR IS NO LONGER FIVE WORDS, and this is the only place that
+// used to say so by hand. Five literal assignments were a WIDTH, written out,
+// in a function whose name promises a copy; the moment a sixth word means
+// something the copy silently drops it, and a branch merge then restores a
+// fact that one arm had already spent. The width now arrives as an argument,
+// and the copy is a loop, so a word that exists is a word that is copied.
+//
+// `width` is the WHOLE vector, not the number of extra words: 5 for the stack
+// question alone, 5 plus the number of localisations for the fact question.
+// Passing the whole width is what lets one walk serve both without a parameter
+// that changes meaning depending on the caller.
+fn copy_state(from:buf<u64>,to:buf<u64>,width:u64)->u64 {
+  let mut k:u64=0;
+  while k<width{
+    if k>=len(from)||k>=len(to){return 800;}
+    to[k]=from[k];
+    k=k+1;
+  }
+  return 0;
+}
+// The two branches of an if are walked from the same incoming state and then
+// merged, so a compensation one branch performs never clears the pending
+// displacement of the other. Alignment keeps the weaker guarantee, the space
+// must agree between the branches that write it, and a missing else is the
+// empty branch holding the incoming state. A third block child cannot be built
+// by the grammar and is refused rather than skipped.
+fn stack_branches(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,caller_id:u64,state:buf<u64>,out:buf<u64>,seen:buf<u64>,width:u64)->u64 {
+  let then_id:u64=child(tree,id,1);
+  let else_id:u64=child(tree,id,2);
+  let mut code:u64=0;
+  if then_id==0||then_id>tree.node_count{code=800;}
+  else if ntasm_ast.node_at(tree,then_id).kind!=25{code=800;}
+  if code==0{
+    // The two arm buffers are the WHOLE vector and not the five stack words:
+    // an arm that copied only those five would come back to the merge holding
+    // whatever the stack question said and NOTHING about the facts, and the
+    // merge would then read a dead fact as a live one. That is the stale
+    // credit again, one level up and wearing a different hat.
+    if width<5{code=800;}
+    let then_state:buf<u64>=alloc(runtime(),width);
+    let else_state:buf<u64>=alloc(runtime(),width);
+    copy_state(state,then_state,width);
+    code=stack_block(source,tree,then_id,caller_id,then_state,out,seen,width);
+    if code==0{
+      if else_id==0{copy_state(state,else_state,width);}
+      else if else_id>tree.node_count||ntasm_ast.node_at(tree,else_id).kind!=25{code=800;}
+      else{
+        let extra:ntasm_ast.Node=ntasm_ast.node_at(tree,else_id);
+        if extra.next_sibling!=0{code=800;}
+        else{copy_state(state,else_state,width);
+          code=stack_block(source,tree,else_id,caller_id,else_state,out,seen,width);}
+      }
+    }
+    if code==0{
+      state[1]=merge_align(then_state[1],else_state[1]);
+      if then_state[4]==0{state[0]=else_state[0];}
+      else if else_state[4]==0{state[0]=then_state[0];}
+      else{state[0]=merge_space(then_state[0],else_state[0]);}
+      if then_state[4]!=0||else_state[4]!=0{state[4]=1;}else{state[4]=0;}
+      // The weakest path decides: a displacement still pending on either
+      // branch stays pending after the merge, because the merge describes what
+      // the paths may reach, not what all of them reach.
+      if then_state[2]!=0||else_state[2]!=0{
+        state[2]=1;
+        if else_state[3]>then_state[3]{state[3]=else_state[3];}
+        else{state[3]=then_state[3];}
+      }else{state[2]=0;state[3]=0;}
+      // THE MEET, POINT BY POINT, AND IT IS `merge_align` UNCHANGED. A
+      // localisation's liveness is a 0 or a 1, and `merge_align` on two such
+      // words answers 1 only when both are 1 -- which is exactly the weakest-
+      // path rule the alignment already obeys, applied to one word instead of
+      // to a scalar. **No new law and no new demonstration.** The reason it has
+      // to be written at all is the line above it: the two arms are COPIED at
+      // full width and were MERGED at five, so a fact spent on one arm used to
+      // be back at full strength after the join. That is the stale credit one
+      // level up, and it was latent only because nothing seeded a slot.
+      let slots:u64=fact_slots(state,width);
+      let mut fk:u64=0;
+      while fk<slots{
+        let base:u64=6+slots+fk;
+        if base<len(state)&&base<len(then_state)&&base<len(else_state){
+          state[base]=merge_align(then_state[base],else_state[base]);
+        }
+        fk=fk+1;
+      }
+    }
+    rt_free(runtime(),then_state);rt_free(runtime(),else_state);
+  }
+  return code;
+}
+// One block, with the stack state of its function threaded through it. state is
+// [space,align,displaced,pending,typed] and is updated in place: typed says a
+// write of rsp has happened, so that the first write can establish a space
+// while a later disagreement cannot. out receives the first refusal as
+// line,column,reason,value. seen counts the align_stack statements the walk
+// reached, which is how check proves that no kind 45 node sits outside a
+// function body.
+fn stack_block(source:buf<u8>,tree:ntasm_ast.Tree,block_id:u64,caller_id:u64,state:buf<u64>,out:buf<u64>,seen:buf<u64>,width:u64)->u64 {
+  if block_id==0||block_id>tree.node_count||len(out)<4{return 800;}
+  // THE TWO WALKS, ONE STATE, ONE DISCRIMINATOR, AND THE DISCRIMINATOR IS THE
+  // PRESENCE OF THE FACTS. `stack_body` seeds no slot, so `fact_slots` answers
+  // 0 and this walk reports the alignment question. `facts_body` seeds one slot
+  // per parameter, so it answers the fact question and must NOT also render an
+  // alignment verdict: a body that has facts and no alignment obligation would
+  // otherwise stop at the first `align_stack` with a 364 that answers a question
+  // it was never asked, and the walk would end before the instructions that
+  // spend the fact. One test, no new parameter, and the two questions cannot
+  // answer for one another.
+  let answering_facts:bool=fact_slots(state,width)!=0;
+  let block:ntasm_ast.Node=ntasm_ast.node_at(tree,block_id);
+  if block.kind!=25{return 800;}
+  let mut id:u64=block.first_child;let mut code:u64=0;
+  while id!=0&&code==0{
+    if id>tree.node_count{return 800;}
+    let statement:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if statement.kind==45{
+      if answering_facts==false{
+        seen[0]=seen[0]+1;
+        code=align_statement(source,tree,id,state,out);
+      }
+    }else if statement.kind==29{
+      // A return statement is row 7 of the statement table: it displaces rsp
+      // by the eight bytes of the return address and gives nothing back, so a
+      // displacement still pending when control leaves is a debt section 10
+      // reports with reason 4. The verdict is stated over the table rather
+      // than over the node kind because the table is now reachable for this
+      // statement, and a table that cannot be read is a table that cannot
+      // drift either.
+      code=stack_expression(source,tree,caller_id,child(tree,id,0),state,out);
+      if code==0&&answering_facts==false&&statement_displaces_stack(source,tree,id)&&state[2]!=0{out[0]=statement.line;out[1]=statement.column;out[2]=4;out[3]=state[3];code=364;}
+    }else if statement.kind==30{
+      code=stack_expression(source,tree,caller_id,child(tree,id,0),state,out);
+      if code==0{code=stack_branches(source,tree,id,caller_id,state,out,seen,width);}
+    }else if statement.kind==31{
+      code=stack_expression(source,tree,caller_id,child(tree,id,2),state,out);
+    }else if statement.kind==32&&statement.aux==0{
+      // The refused form comes first, so a body that holds one never reaches
+      // the alignment verdict below and never reports it under another code.
+      code=refused_footprint(source,tree,id,out);
+      if code==0&&replaces_stack(source,tree,id){
+        let found:u64=written_space(source,tree,id);
+        if state[4]==0{state[0]=found;}else{state[0]=merge_space(state[0],found);}
+        state[1]=0;state[2]=0;state[3]=0;state[4]=1;
+      }
+      // The compensation above has already spent the fact. Every other
+      // displacement spends it on its own and leaves the displacement pending,
+      // which is the question 364 never asked: paying for the displacement is
+      // not what keeps the alignment, and a body that pushes its way to a call
+      // was discharging that callee stack_aligned(16) with rsp at 8 (mod 16).
+      if code==0&&displaces_stack(source,tree,id){state[1]=0;}
+      // THE LINE. Beside the alignment spend, not inside it: a fact and an
+      // alignment are different facts about different things, and the only
+      // reason one line carries both is that one instruction can kill both.
+      if code==0{spend_facts(source,tree,id,state,width);}
+      if code==0{code=stack_expression(source,tree,caller_id,instruction_part(tree,id,1),state,out);}
+      if code==0{code=stack_expression(source,tree,caller_id,instruction_part(tree,id,2),state,out);}
+      if code==0&&answering_facts==false&&state[2]!=0&&replaces_stack(source,tree,id)==false&&terminal_instruction(source,tree,id){
+        out[0]=statement.line;out[1]=statement.column;out[2]=5;out[3]=state[3];code=364;
+      }
+    }else if statement.kind==28{
+      // A call statement is row 8 of the statement table: it displaces rsp by
+      // the eight bytes of the return address it pushes and the ABI gives
+      // those eight bytes back, so the alignment fact survives the statement.
+      // The test is written as the two predicates rather than as the node
+      // kind precisely because that is the claim: displaces and restores are
+      // both true here, and a walk that spent the fact on displacement alone
+      // would refuse every body that calls a quiet callee. callee_moves_stack
+      // inside call_statement is the check behind the row, and it is what
+      // spends the fact when the callee may have moved the stack itself.
+      if statement_displaces_stack(source,tree,id)&&statement_restores_stack(source,tree,id)==false{state[1]=0;}
+      code=stack_expression(source,tree,caller_id,id,state,out);
+    }else if statement.kind==25{
+      code=stack_block(source,tree,id,caller_id,state,out,seen,width);
+    }
+    // A label definition (kind 32 aux 1) names a branch target and moves
+    // nothing. The statement kinds are closed by the parser, so an unknown
+    // kind cannot occur and is left alone, as body_clobbers leaves an unknown
+    // mnemonic to the encoder.
+    if code==0{id=statement.next_sibling;}
+  }
+  return code;
+}
+// Does this body hold an align_stack? Counted over the block subtree, so the
+// answer does not depend on which node a future statement form would attach to.
+fn block_aligns(tree:ntasm_ast.Tree,block_id:u64)->bool {
+  if block_id==0||block_id>tree.node_count{return false;}
+  if ntasm_ast.node_at(tree,block_id).kind!=25{return false;}
+  let mut id:u64=ntasm_ast.node_at(tree,block_id).first_child;
+  while id!=0{
+    if id>tree.node_count{return false;}
+    let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if node.kind==45{return true;}
+    if node.kind==25&&block_aligns(tree,id){return true;}
+    if node.kind==30{
+      let mut branch:u64=node.first_child;
+      while branch!=0&&branch<=tree.node_count{
+        let b:ntasm_ast.Node=ntasm_ast.node_at(tree,branch);
+        if b.kind==25&&block_aligns(tree,branch){return true;}
+        branch=b.next_sibling;
+      }
+    }
+    id=node.next_sibling;
+  }
+  return false;
+}
+// One function body, entered at the ABI guarantee of 17.3: a power of two at
+// most abi_ceiling, which is the only stack fact this pass may assume, and the
+// same one call_contracts credits at a call. align_stack takes that proof over
+// from there. A body without an align_stack is not walked at all, so no other
+// verdict moves.
+// THE FACT QUESTION'S OWN ENTRY, AND ITS OWN TRIGGER. `stack_body` asks
+// « does this body have an alignment obligation to HOLD? » and a body with no
+// `align_stack` has no such question, so it is not walked. This asks « at this
+// call, what do I know about each localisation? » and a body with no
+// `align_stack` STILL has facts, so it is walked always. Widening `stack_body`
+// instead of opening this would have made a body with facts and no alignment
+// obligation stop at its first instruction answering a question it never asked.
+//
+// THE SEED IS THE ENTRY PRECONDITION, and it is the parallel of
+// `state[1]=abi_ceiling()`: on entry, every parameter's precondition holds,
+// because that is what arriving at the body means. The walk then spends what
+// the body spends.
+fn facts_body(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,body:u64,call_id:u64,state:buf<u64>,out:buf<u64>,seen:buf<u64>,width:u64)->u64 {
+  if width<6{return 800;}
+  let n:u64=width-6;
+  if (n%2)!=0{return 800;}
+  let slots:u64=n/2;
+  state[0]=0;state[1]=0;state[2]=0;state[3]=0;state[4]=0;
+  state[5]=slots;
+  let mut k:u64=0;
+  while k<slots{
+    // THE EFFECTIVE FAMILY, FROM abi.argument_family, WHICH IS ITS SOURCE --
+    // the same decision that removed the stack-family mirror. An `in p:u64`
+    // that spells no `@GPR` still arrives in the default family of its raw
+    // ordinal, and a seed that answered 0 there would give the most common
+    // signature in the tree no slot at all -- the failure mode that looks most
+    // like a pass.
+    //
+    // ITS CONTRACT, read off its own header and not guessed: the answer IS the
+    // family, 1..16, and 0 only when the parameter owns no register at all. Only
+    // 800 is a refusal. Two mistakes are recorded here because I made both.
+    // Reading a family of 2 as an error code and returning it made every
+    // fixture answer 800. And asking `abi.argument_family` -- the obvious
+    // export, the one whose NAME is the right one -- made every fixture answer
+    // family 0, because that export publishes the DEFAULT family and zeroes it
+    // for an explicitly bound parameter. **An export whose name is right and
+    // whose coverage is not is the defect this file exists to record, and the
+    // cure was to publish the EFFECT rather than to work around the default.**
+    // A rule keyed on the default family would have invalidated nothing at all
+    // for every explicitly bound signature in the tree, and would have been
+    // green.
+    let family:u64=abi.effective_family(source,tree,caller_id,k);
+    if family==800{return 800;}
+    let at:u64=6+k;
+    if at>=len(state){return 800;}
+    state[at]=family;
+    k=k+1;
+  }
+  k=0;
+  while k<slots{
+    if 6+slots+k<len(state){state[6+slots+k]=1;}
+    k=k+1;
+  }
+  if call_id==0||call_id>tree.node_count{return 800;}
+  return stack_block(source,tree,body,caller_id,state,out,seen,width);
+}
+fn stack_body(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,body:u64,state:buf<u64>,out:buf<u64>,seen:buf<u64>)->u64 {
+  if block_aligns(tree,body)==false{return 0;}
+  state[0]=0;state[1]=abi_ceiling();state[2]=0;state[3]=0;state[4]=0;
+  // FIVE, and only five: this is the stack question, and a body with no
+  // align_stack is not walked at all. The fact question gets its OWN entry
+  // with its own trigger, because the two ask different things and a body
+  // can have facts with no alignment obligation to hold.
+  return stack_block(source,tree,body,id,state,out,seen,5);
+}
+// Validate terminal control flow. 337 rejects return in never;338 fallthrough
+// (reason1 value function,2 never);339 bare return in a value function;
+// 340 a statement that fallthrough cannot reach (reason1 after a terminal
+// statement or an unconditional jmp, 2 after a call to a never function).
+// 337/339 are decided on the return scan and 340 on the fallthrough scan,
+// both ahead of 338, which stays the verdict for a body that simply falls off
+// its end. The align_stack obligations of section 10 come after all of them, so
+// a body that already fails keeps its own diagnostic: 364 writes the reported
+// position, reason 1 a value that is not a positive power of two, 2 a power of
+// two the ABI does not permit, 3 an rsp no load types as a stack in the current
+// space, 4 a normal return with the stack still displaced, 5 a terminal
+// transfer with it still displaced, and the N of the align_stack in every case;
+// 326 reuses the frozen shape of 8.3 with family 4 and the predicate ordinal.
+// 336 is the frozen footprint refusal of 17.4, a form the encoder cannot emit,
+// reported at the mnemonic with the same code and position body_clobbers gives
+// it so that the two passes never disagree about one instruction; it only
+// fires inside a body that holds an align_stack, which is the only body this
+// pass walks. Success writes functions,terminal functions,checked returns,0.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64{
+  if tree.ok==false||tree.node_count==0||len(out)<4{return 800;}let shape:buf<u64>=alloc(runtime(),2);let dead:buf<u64>=alloc(runtime(),3);
+  let stack:buf<u64>=alloc(runtime(),5);let verdict:buf<u64>=alloc(runtime(),4);let seen:buf<u64>=alloc(runtime(),1);
+  let mut functions:u64=0;let mut terminal:u64=0;let mut returns:u64=0;let mut code:u64=0;
+  let mut line:u64=0;let mut column:u64=0;let mut reason:u64=0;let mut value:u64=0;let mut id:u64=1;
+  while id<=tree.node_count&&code==0{let fn_:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if fn_.kind==18{functions=functions+1;code=function_shape(source,tree,id,shape);if code==0{
+   let never:u64=shape[1];let mut node_id:u64=1;while node_id<=tree.node_count&&code==0{let node:ntasm_ast.Node=ntasm_ast.node_at(tree,node_id);if node.kind==29&&fn_.start<=node.start&&node.end<=fn_.end{returns=returns+1;if never!=0{code=337;line=node.line;column=node.column;}else if node.first_child==0{code=339;line=node.line;column=node.column;}}node_id=node_id+1;}
+    if code==0{code=block_dead(source,tree,shape[0],fn_.start,fn_.end,dead);
+    if code==340{line=dead[0];column=dead[1];reason=dead[2];}
+    else if code==0{if block_terminal(source,tree,shape[0]){terminal=terminal+1;}else{code=338;line=fn_.line;column=fn_.column;if never!=0{reason=2;}else{reason=1;}}}
+    if code==0{code=stack_body(source,tree,id,shape[0],stack,verdict,seen);
+    if code==364||code==326||code==336{line=verdict[0];column=verdict[1];reason=verdict[2];value=verdict[3];}}
+   }
+  }}id=id+1;}
+  // Every kind 45 node must sit inside a function body: the walks above reach
+  // the ones that do, so a leftover is a tree this pass cannot analyse and 800
+  // is its transactional answer, never a silent skip.
+  if code==0{let mut total:u64=0;let mut node_id:u64=1;while node_id<=tree.node_count{let n:ntasm_ast.Node=ntasm_ast.node_at(tree,node_id);if n.kind==45{total=total+1;}node_id=node_id+1;}if total!=seen[0]{code=800;}}
+  if code==0{out[0]=functions;out[1]=terminal;out[2]=returns;out[3]=0;}
+  else if code==336||code==337||code==339{out[0]=line;out[1]=column;out[2]=0;out[3]=0;}
+  else if code==338||code==340{out[0]=line;out[1]=column;out[2]=reason;out[3]=0;}
+  else if code==364||code==326{out[0]=line;out[1]=column;out[2]=reason;out[3]=value;}
+  rt_free(runtime(),seen);rt_free(runtime(),verdict);rt_free(runtime(),stack);rt_free(runtime(),dead);rt_free(runtime(),shape);return code;
+}
+
+// WHAT I KNOW ABOUT EACH LOCALISATION AT ONE CALL. Work-plan lot 24, the
+// structural half.
+//
+// A QUERY, and this file publishes codes 337/338/339/340/364/326/336 to the
+// pipeline; this one is not a stage and has no caller from validate.nova today.
+// It answers the question `check` cannot: `check` walks to the END of a body
+// and reports there, and this walks to a CALL and reports what is still true
+// there.
+//
+// out[0] the number of localisation slots, one per parameter of the caller;
+// out[1+k] the EFFECTIVE family slot k names, 0 when it names no register;
+// out[2+k] 1 while the fact still holds AT THE CALL, 0 once an instruction
+// before it wrote that register. The families are republished beside the
+// liveness so a caller never has to re-derive which register a slot is: the
+// number would otherwise be a count of unnamed things.
+//
+// Returns 0 with the vector published, 800 on a tree, a declaration or a call
+// this function cannot read, or an out buffer shorter than 2 plus the slot
+// count. It REFUSES rather than publishing a partial vector, because half a
+// vector reads as a complete one that happens to be shorter.
+export fn facts(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,call_id:u64,out:buf<u64>)->u64 {
+  if tree.ok==false||tree.node_count==0||len(out)<2{return 800;}
+  if caller_id==0||caller_id>tree.node_count{return 800;}
+  if call_id==0||call_id>tree.node_count{return 800;}
+  let caller:ntasm_ast.Node=ntasm_ast.node_at(tree,caller_id);
+  if caller.kind!=18{return 800;}
+  // The call must be INSIDE the caller, or the question has no point: a fact is
+  // about a register's content at a place in THIS body.
+  let at:ntasm_ast.Node=ntasm_ast.node_at(tree,call_id);
+  if caller.start>at.start||at.end>caller.end{return 800;}
+  let body:u64=body_block(tree,caller_id);
+  if body==0{return 800;}
+  let mut slots:u64=0;
+  let mut c:u64=caller.first_child;
+  while c!=0{
+    if c>tree.node_count{return 800;}
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,c);
+    if n.kind==19{slots=slots+1;}
+    c=n.next_sibling;
+  }
+  let width:u64=6+slots+slots;
+  if len(out)<2+slots{return 800;}
+  let state:buf<u64>=alloc(runtime(),width);
+  let seen:buf<u64>=alloc(runtime(),1);
+  let code:u64=facts_body(source,tree,caller_id,body,call_id,state,out,seen,width);
+  rt_free(runtime(),state);
+  rt_free(runtime(),seen);
+  if code!=0{return code;}
+  out[0]=slots;
+  return 0;
+}

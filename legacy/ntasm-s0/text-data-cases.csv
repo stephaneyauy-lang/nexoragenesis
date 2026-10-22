@@ -1,0 +1,34 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+text-data,TD-C00,file,legacy/ntasm-s0/text-data/TD-C00.ntasm,109,20986357f76e47a1d0614592e4aad750861f08625daee7340e40dc19ebef503f,NG_S0_T12_OK
+text-data,TD-C01,file,legacy/ntasm-s0/text-data/TD-C01.ntasm,119,c3fabd0ed842735fedc1aba8e7ddb9a892d74f665ff7387715f9901b08104f1e,NG_S0_T12_OK
+text-data,TD-C02,file,legacy/ntasm-s0/text-data/TD-C02.ntasm,100,b01f3b5d6bf17416a87e2ddf0fa07e04e29278b25b103faf77bbcc62ea1a1f91,NG_S0_T12_OK
+text-data,TD-C03,file,legacy/ntasm-s0/text-data/TD-C03.ntasm,96,f6288860bfcb2cc2495f5e27f26ff3aef0b5610fb14f935bf92c18e9869458c5,NG_S0_T12_OK
+text-data,TD-C04,file,legacy/ntasm-s0/text-data/TD-C04.ntasm,97,b29c920bd9b5e28986f09fac5ae88d007f04c4cd1f245899eb2db2fcd54465fa,NG_S0_T12_OK
+text-data,TD-C05,file,legacy/ntasm-s0/text-data/TD-C05.ntasm,100,8d3dd36e3287ebf19bdfeae2ed82a2773d835b8c2b42b8942866f26726c4c204,NG_S0_T12_OK
+text-data,TD-C06,file,legacy/ntasm-s0/text-data/TD-C06.ntasm,95,1361e511af60b932e0cacb168f12e6637be134d47b0edd6b01efc4bd1a414d74,NG_S0_T12_OK
+text-data,TD-C07,file,legacy/ntasm-s0/text-data/TD-C07.ntasm,97,a697171ddaa71ee0e1909c7caf289450e3589c64e376591c26472391f1ba1819,NG_S0_T12_OK
+text-data,TD-C08,file,legacy/ntasm-s0/text-data/TD-C08.ntasm,97,ec052897bd31cad0621527be662a60a339ebeeda3fabc8c4ca9633af85cf0b9c,NG_S0_T12_OK
+text-data,TD-C09,file,legacy/ntasm-s0/text-data/TD-C09.ntasm,98,71360b8feaa575e62741802b92e2b04601a49747d939f7f2e5fc29dcf8e96307,NG_S0_T12_OK
+text-data,TD-C10,file,legacy/ntasm-s0/text-data/TD-C10.ntasm,113,3a8dde64c381058fce11e1528936a2e939a93d206257fca42a3c0202be57a149,NG_S0_T12_OK
+text-data,TD-R00,file,legacy/ntasm-s0/text-data/TD-R00.ntasm,107,8753b865ae1331dbcd60833808e7d5efd5eff17abe0ccfd7911c1da35d756771,NGS0 E102 L0006 C0014 O00000059
+text-data,TD-R01,file,legacy/ntasm-s0/text-data/TD-R01.ntasm,98,c9dec732f8fa25782b9724e9051e80cc6ff91ee315f2c5362e654acbf2ba9132,NGS0 E102 L0006 C0009 O0000004E
+text-data,TD-R02,file,legacy/ntasm-s0/text-data/TD-R02.ntasm,100,ff4386c3568b2fe4e5d80d41e542a9634f3574a65399ea1fcc94694d2337a52b,NGS0 E102 L0006 C000A O0000004F
+text-data,TD-R03,file,legacy/ntasm-s0/text-data/TD-R03.ntasm,100,881adfc6e75dc18205d2b643c48aea327a5336163c39f2c77e1ed558b9ac5c8f,NGS0 E102 L0006 C000B O00000050
+text-data,TD-R04,file,legacy/ntasm-s0/text-data/TD-R04.ntasm,99,debe6696ec886352e04cd531a9b1d9585b9ed373a3ba54b4e2abaa9ff0f1875b,NGS0 E102 L0006 C000B O00000050
+text-data,TD-R05,file,legacy/ntasm-s0/text-data/TD-R05.ntasm,99,f83c6a38aed5224d73842328e9a126b420d0d7f34d3a773515d1483ac78e7f58,NGS0 E102 L0006 C0009 O0000004E
+text-data,TD-R06,file,legacy/ntasm-s0/text-data/TD-R06.ntasm,102,c07c78d076c23409c6edb52106630127863eb73c382312d5edf2ce45677c6b95,NGS0 E201 L0006 C000B O00000050
+text-data,TD-R07,file,legacy/ntasm-s0/text-data/TD-R07.ntasm,93,32a49a308e068e7c4356ee3037db8206f5a37188bb1eb193c8fb71748207378b,NGS0 E201 L0006 C0006 O0000004B
+text-data,TD-R08,file,legacy/ntasm-s0/text-data/TD-R08.ntasm,96,08dc24dc9cdc0752bc0cf82b6a5515960bbc99c13cb9b6e0823c1575315a1c93,NGS0 E201 L0006 C0006 O0000004B
+text-data,TD-R09,file,legacy/ntasm-s0/text-data/TD-R09.ntasm,95,e501701de87fe1c6f7eedf2debbe34139a6c83bba30b49e35fbd5af42d8effa6,NGS0 E201 L0006 C0007 O0000004C
+text-data,TD-R10,file,legacy/ntasm-s0/text-data/TD-R10.ntasm,101,00cc62a52a55bce19955a50c0a1e01a911098a4b5bbfc7eaa5a2693e215f645f,NGS0 E201 L0006 C0009 O0000004E
+text-data,TD-R11,file,legacy/ntasm-s0/text-data/TD-R11.ntasm,94,5faee1ee4706a3a0542e6d8519a3d59455b38f02eb7514e922f06890ad569682,NGS0 E201 L0006 C0006 O0000004B
+text-data,TD-R12,file,legacy/ntasm-s0/text-data/TD-R12.ntasm,95,85e452b21220f0f634e201647a3dc22216f8be2da3421ab9da10c4a4ed6ca239,NGS0 E201 L0006 C0006 O0000004B
+text-data,TD-R13,file,legacy/ntasm-s0/text-data/TD-R13.ntasm,95,8a5dedffe6b17f0b0b4f6493fe1fe68a1f2f618c4ad8c834422527c290d503f1,NGS0 E201 L0006 C0006 O0000004B
+text-data,TD-R14,file,legacy/ntasm-s0/text-data/TD-R14.ntasm,95,40e58650f6e34a5233ed55d4a2679e3182bd3a36d1b430237497ded9ef823c94,NGS0 E102 L0006 C0007 O0000004C
+text-data,TD-R15,file,legacy/ntasm-s0/text-data/TD-R15.ntasm,96,31acc0310dfe60221382d9300312f56a3ec2dc55ea318ddf8de1956c630d1b88,NGS0 E201 L0006 C0008 O0000004D
+text-data,TD-R16,file,legacy/ntasm-s0/text-data/TD-R16.ntasm,92,028c523f2afef06c67a92caa4488e133f814496daa4217acf843c89f495ba71d,NGS0 E201 L0006 C0005 O0000004A
+text-data,TD-R17,file,legacy/ntasm-s0/text-data/TD-R17.ntasm,97,baa77c1c99b3fe71eef7c846add2051b88ce4390e947d7410532c312285c7ec7,NGS0 E500 L0007 C0001 O00000057
+text-data,TD-R18,file,legacy/ntasm-s0/text-data/TD-R18.ntasm,98,76edc1813bca1b32d461fdea808c070c14f8b6d9d0120354517bed4ffe78e36c,NGS0 E500 L0006 C0001 O00000046
+text-data,TD-R19,file,legacy/ntasm-s0/text-data/TD-R19.ntasm,120,8fe8c87c98eb220070ce5b864821e9960f5455388f66d17217371dff26c850b9,NGS0 E500 L0007 C0001 O0000004D
+text-data,TD-R20,file,legacy/ntasm-s0/text-data/TD-R20.ntasm,104,620656477b9d38ac332c4c6a51f4b67f0522668c33f6f2d25b9ea9de8c4f09d5,NGS0 E102 L0006 C0011 O00000056
+text-data,TD-C11,file,legacy/ntasm-s0/text-data/TD-C11.ntasm,101,90d5b69efaa6dfc73e988005d36a5805ad03ccd501945149f7c61a2c13bb514b,NG_S0_T12_OK

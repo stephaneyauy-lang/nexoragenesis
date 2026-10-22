@@ -1,0 +1,9 @@
+module ntasm_nxo_inspect_text_entry;
+import ntasm_nxo_inspect;
+
+// mode 0 copies the canonical symbol name, mode 1 the canonical contract.
+// Both forward the same buffers so one entry exercises both accessors.
+fn main(input:buf<u8>,index:u64,out:buf<u8>,out_length:buf<u64>,mode:u64)->u64 {
+    if mode==1 { return ntasm_nxo_inspect.copy_symbol_contract(input,index,out,out_length); }
+    return ntasm_nxo_inspect.copy_symbol_name(input,index,out,out_length);
+}

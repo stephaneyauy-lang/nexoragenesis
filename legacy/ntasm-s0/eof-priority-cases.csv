@@ -1,0 +1,3 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+eof-priority,EOF-entry-first,file,legacy/ntasm-s0/diagnostic-priority/EOF-entry-first.ntasm,65,a4640620bfca375c85e3fdfd6b5ffea5837c0fb1f1e7ff51ee917920dc29a669,NGS0 E302 L0003 C0007 O0000001E
+eof-priority,EOF-ref-first,file,legacy/ntasm-s0/diagnostic-priority/EOF-ref-first.ntasm,71,664308b618859003141fef85f06c96fa1aee5c9eb481d282291d3aef2b4c8cae,NGS0 E301 L0006 C0005 O00000040

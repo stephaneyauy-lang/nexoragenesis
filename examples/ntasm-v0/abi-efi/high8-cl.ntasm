@@ -1,0 +1,10 @@
+module efi.byte
+target x86_64-nexora-none
+default_abi efi-x64-v0
+section .text {
+fn leaf(in p:u8 @cl)->u8
+effects {}
+clobbers {} {
+return p
+}
+}

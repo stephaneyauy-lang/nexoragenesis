@@ -1,0 +1,1166 @@
+module ntasm_macro_splice;
+
+// The splice: what turns the expander's separate region into the caller's
+// tree. ntasm_macro_expand.expand(source,tree,region) does not mutate the
+// caller's tree; it fills a region of its own, and everything that reads
+// that region back into a tree the later stages can walk lived inside
+// validate.nova, in a pipeline module whose closure is forty one modules and
+// whose whole program budget no producer can share. This module is that code
+// with nothing else, and its closure is three: ntasm_ast, ntasm_macro_expand
+// and itself.
+//
+// WHY IT IS A SEPARATE MODULE AND NOT A REFACTOR OF validate.nova. The
+// compiler resolves an import against the explicit input list and nothing
+// else: nova_compile_many_v2 does no transitive resolution, so an import
+// that is not in the list is a 302. That is a property of every module in
+// this tree, and it means moving code out of validate.nova is an edit to
+// every harness that compiles it, and moving it IN is what makes a producer
+// able to reach it at all.
+//
+// WHAT CROSSES THE BOUNDARY, and no more. Four functions and one type:
+// blank_splice allocates the state, expand_stage runs the seven passes over
+// a parsed tree, unit_of hands the later stages the tree they will read, and
+// splice_release frees every buffer the expansion allocated. The seven
+// passes, the kind and field ordinals and the Splice record stay private
+// here, because nothing outside this module reads them and every function
+// and every local of a program is charged to the one program wide budget
+// MAX_FUNCS that this move exists to make room for.
+//
+// NOTHING ABOUT THE PIPELINE'S BEHAVIOUR CHANGES. The bodies below are the
+// bodies that were in validate.nova, moved verbatim: the same order, the
+// same scratch words, the same 800, the same 203 retry, the same released
+// buffers. validate.nova calls the four entry points above, so the thirty
+// four stages run in the same order over the same tree.
+
+import ntasm_ast;
+import ntasm_macro_expand;
+
+// ------------------------------------------------------------------ kinds
+// The three kinds the expander and the splicer agree on. comptime(11) and
+// macro(13) are the declarations the expander never descends into, and
+// expand(31) is the invocation the splicer replaces.
+fn k_comptime()->u64 { return 11; }
+fn k_macro()->u64 { return 13; }
+fn k_expand()->u64 { return 31; }
+fn k_name()->u64 { return 90; }
+fn k_type()->u64 { return 36; }
+// Field ordinals of the flat twelve word node record.
+fn f_first()->u64 { return 8; }
+fn f_last()->u64 { return 9; }
+fn f_next()->u64 { return 10; }
+fn f_aux()->u64 { return 11; }
+fn f_start()->u64 { return 6; }
+fn f_end()->u64 { return 7; }
+// The expander's own walk depth cap, mirrored so the splicer cannot descend
+// further than the expander did.
+fn walk_cap()->u64 { return 64; }
+
+// ------------------------------------------------------- the splice state
+// Every buffer this module allocates for an expansion lives in this record,
+// so a refusal and a success release exactly the same set. text is the
+// buffer the later stages read: the caller source until an expansion
+// happens, the source extended by the name table afterwards.
+export struct Splice {
+    source:buf<u8>, tree:ntasm_ast.Tree,
+    region:buf<u64>, count:u64, name_words:u64,
+    map:buf<u64>, vis:buf<u64>, order:buf<u64>,
+    nodes:buf<u64>, total:u64,
+    text:buf<u8>, extra:buf<u8>
+}
+
+export fn blank_splice(source:buf<u8>,tree:ntasm_ast.Tree)->Splice {
+    // Every field gets its own empty buffer: the release sweeps all six, so
+    // two fields sharing one allocation would free it twice.
+    let region:buf<u64>=alloc(runtime(),0);
+    let map:buf<u64>=alloc(runtime(),0);
+    let vis:buf<u64>=alloc(runtime(),0);
+    let order:buf<u64>=alloc(runtime(),0);
+    let nodes:buf<u64>=alloc(runtime(),0);
+    let extra:buf<u8>=alloc(runtime(),0);
+    return Splice{source:source,tree:tree,region:region,count:0,name_words:0,
+        map:map,vis:vis,order:order,nodes:nodes,total:0,
+        text:source,extra:extra};
+}
+
+export fn splice_release(s:Splice)->u64 {
+    let region:buf<u64>=s.region;
+    let map:buf<u64>=s.map;
+    let vis:buf<u64>=s.vis;
+    let order:buf<u64>=s.order;
+    let nodes:buf<u64>=s.nodes;
+    let extra:buf<u8>=s.extra;
+    rt_free(runtime(),region);rt_free(runtime(),map);rt_free(runtime(),vis);
+    rt_free(runtime(),order);rt_free(runtime(),nodes);
+    rt_free(runtime(),extra);return 0;
+}
+
+// The first size tried for the expander's output buffer. It is a guess on
+// purpose: the expander publishes the exact requirement in out[3] on a 203,
+// so the retry below is sized by the expander and not by this number.
+fn region_words(tree:ntasm_ast.Tree)->u64 { return 64+tree.node_count*48; }
+
+// A produced node, read from the region the expander published at out[4]:
+// the name table first, then twelve words per node with one based ids.
+fn prod_get(s:Splice,id:u64,field:u64)->u64 {
+    let region:buf<u64>=s.region;
+    return region[4+s.name_words+(id-1)*12+field];
+}
+
+fn prod_kind(s:Splice,id:u64)->u64 { return prod_get(s,id,0); }
+fn prod_first(s:Splice,id:u64)->u64 { return prod_get(s,id,f_first()); }
+fn prod_last(s:Splice,id:u64)->u64 { return prod_get(s,id,f_last()); }
+fn prod_next(s:Splice,id:u64)->u64 { return prod_get(s,id,f_next()); }
+
+// A spliced tree node, read and written by id.
+fn node_get(s:Splice,id:u64,field:u64)->u64 {
+    let nodes:buf<u64>=s.nodes;
+    return nodes[(id-1)*12+field];
+}
+
+fn node_put(s:Splice,id:u64,field:u64,value:u64)->u64 {
+    let nodes:buf<u64>=s.nodes;
+    nodes[(id-1)*12+field]=value;return 0;
+}
+
+// Copy a produced record into a tree slot.
+fn pull(s:Splice,to:u64,from:u64)->u64 {
+    let nodes:buf<u64>=s.nodes;
+    let region:buf<u64>=s.region;
+    let a:u64=(to-1)*12;
+    let b:u64=4+s.name_words+(from-1)*12;
+    let mut i:u64=0;
+    while i<12 { nodes[a+i]=region[b+i];i=i+1; }
+    return 0;
+}
+
+// The tree the later stages read: the caller's own tree when the module has
+// no invocation, the spliced copy otherwise. token_words is shared with the
+// caller and is never released here.
+export fn unit_of(s:Splice)->ntasm_ast.Tree {
+    if s.total==0 { return s.tree; }
+    return ntasm_ast.Tree{ok:true,token_words:s.tree.token_words,
+        token_count:s.tree.token_count,node_words:s.nodes,node_count:s.total,
+        code:0,reason:0,source:0,line:0,column:0,start:0,end:0};
+}
+
+// ------------------------------------------------- the name table bridge
+// Every name the expander produces is a kind 90 node whose aux is 1 and
+// whose start and end address the expander's own name table, not the source
+// buffer. No stage in this pipeline is name table aware: they all read a
+// name as a byte range of the source. The table is therefore appended to a
+// private copy of the source and the produced offsets are shifted by the
+// source length, so one buffer resolves both. The copy keeps the original
+// bytes at their original offsets, so every span a stage already computed
+// still reads exactly the same text, and a longer buffer only relaxes the
+// bounds checks the stages already perform.
+fn build_text(s:Splice)->u64 {
+    let base:u64=len(s.source);
+    let span:u64=base+s.name_words*8;
+    let text:buf<u8>=alloc(runtime(),span);
+    let mut i:u64=0;
+    while i<base { text[i]=s.source[i];i=i+1; }
+    let region:buf<u64>=s.region;
+    let mut b:u64=0;
+    while b<s.name_words*8 {
+        let word:u64=region[4+b/8];
+        text[base+b]=u8(word>>((b%8)*8));
+        b=b+1;
+    }
+    let stale:buf<u8>=s.extra;
+    rt_free(runtime(),stale);
+    s.extra=text;s.text=text;return 0;
+}
+
+// ------------------------------------------------------ invocation pairing
+// The expander walks the module from the root, never descends into a
+// comptime or a macro declaration and stops at an expand invocation, so the
+// same traversal collects the invocations in the order the expander met
+// them. order[0] is the count, order[1..] the node ids.
+fn collect(s:Splice,id:u64,depth:u64)->u64 {
+    if depth>walk_cap() { return 0; }
+    if id==0 || id>s.tree.node_count { return 0; }
+    let order:buf<u64>=s.order;
+    let node:ntasm_ast.Node=ntasm_ast.node_at(s.tree,id);
+    if node.kind==k_comptime() || node.kind==k_macro() { return 0; }
+    if node.kind==k_expand() {
+        if order[0]<s.count {
+            order[order[0]+1]=id;
+            order[0]=order[0]+1;
+        }
+        return 0;
+    }
+    let mut at:u64=node.first_child;
+    while at!=0 {
+        collect(s,at,depth+1);
+        if at>s.tree.node_count { return 0; }
+        at=ntasm_ast.node_at(s.tree,at).next_sibling;
+    }
+    return 0;
+}
+
+// A produced root is a wrapper that no other produced node lists as a
+// child, so one sweep of the child lists marks every non root.
+fn mark_children(s:Splice,id:u64)->u64 {
+    let vis:buf<u64>=s.vis;
+    let first:u64=prod_first(s,id);
+    let last:u64=prod_last(s,id);
+    if first==0 { return 0; }
+    let mut child:u64=first;
+    while child!=0 {
+        if child>s.count { return 0; }
+        vis[child]=1;
+        if child==last { return 0; }
+        child=prod_next(s,child);
+    }
+    return 0;
+}
+
+// ----------------------------------------------------- the compaction pass
+// Give a tree id to every produced node that is not a wrapper. The kind 31
+// placeholders are dropped, so no stage that scans node ids flat ever meets
+// an expand node, and the id of a produced node is its offset in the
+// published region, so no subtree is assumed to be contiguous.
+fn compact(s:Splice)->u64 {
+    let map:buf<u64>=s.map;
+    let base:u64=len(s.source);
+    let mut total:u64=s.tree.node_count;
+    let mut id:u64=1;
+    while id<=s.count {
+        if prod_kind(s,id)!=k_expand() {
+            total=total+1;
+            map[id]=total;
+            pull(s,total,id);
+            // A produced name addresses the name table, so it is rebased on
+            // the appended copy. A spliced caller argument keeps its caller
+            // span and is left alone.
+            if prod_kind(s,id)==k_name() && prod_get(s,id,f_aux())==1 {
+                node_put(s,total,f_start(),node_get(s,total,f_start())+base);
+                node_put(s,total,f_end(),node_get(s,total,f_end())+base);
+            }
+        }
+        id=id+1;
+    }
+    s.total=total;return total;
+}
+
+// The expander stamps the invocation span on every node it produces, so a
+// stage that identifies a type by the type node's own span reads the
+// invocation text and cannot see the type at all. constant_types and
+// literal_initializers both do exactly that, so a produced u64 reads as a
+// 12 byte mismatch and the module is refused. A scalar type is exactly its
+// name, and that is the span the parser records for it, so the span is
+// re-derived from the name child. Only a scalar type is touched: a pointer
+// type is aux 1 and the parser spans it over the whole "ptr<space,elem>".
+fn respan_types(s:Splice)->u64 {
+    let map:buf<u64>=s.map;
+    let mut id:u64=1;
+    while id<=s.count {
+        let dest:u64=map[id];
+        if dest!=0 && prod_kind(s,id)==k_type() && prod_get(s,id,f_aux())==0 {
+            let child:u64=prod_first(s,id);
+            if child!=0 && prod_kind(s,child)==k_name() {
+                let named:u64=map[child];
+                if named!=0 {
+                    node_put(s,dest,f_start(),node_get(s,named,f_start()));
+                    node_put(s,dest,f_end(),node_get(s,named,f_end()));
+                }
+            }
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// A produced OPERAND carries the invocation span, for the same reason
+// respan_types exists: machine_ir reads operands out of the source text
+// between their own spans, and the invocation text is not what it means.
+// Two readers do that and both are refused today.
+//
+// read_magnitude reads a LITERAL's own span. The expander puts the literal's
+// value in the aux word, not in its span, so a produced literal arrives with
+// the invocation range -- "expand ret(41)" -- and read_magnitude answers 0
+// for that text, which literal() refuses in E_INPUT 940. A scalar TYPE
+// survives the same stamping because its own name is inside it and
+// respan_types reads the name back; a literal has no children, so there is
+// nothing inside it to read the value from.
+//
+// binary_op reads the gap BETWEEN two operand spans and maps that text to an
+// opcode. Both operands of a produced expression carry the SAME invocation
+// range, so the gap is empty, the node has no operator, and expression()
+// falls through to its "no operator" refusal, also E_INPUT 940. So the
+// operator has to be TEXT between two operand spans, which means the operands
+// have to be laid out in the order they read with the operator written
+// between them.
+//
+// Both are written into the same private copy of the source the name table
+// already extends, so the bytes before the appended run do not move and every
+// span a stage already computed still reads exactly the same text. A literal
+// is spelled in decimal from its own aux, and read_magnitude returns value+1
+// while literal() subtracts one, which is the encoding aux is already in: the
+// number read back is the number the node carries.
+//
+// ONLY AN INTEGER LITERAL IS TOUCHED, and the test is the token, not a guess
+// at the text. A produced string literal also arrives stamped with the
+// invocation span, and its aux is not a magnitude, so spelling the aux would
+// turn a string into a number: the literal() arm that reads source[start]==34
+// would never be reached and a module that lowers today would stop lowering.
+// The token is the discriminator that does not guess: a cloned literal keeps
+// the caller's own token and a materialised one is restamped with the integer
+// token of the range it was folded from (macro_expand.stamp_literal_token),
+// so an integer token at token_begin is exactly the set this pass may touch.
+//
+// AND ONLY AN OPERATOR THIS MODULE CAN NAME. put_op answers 0 for a code it
+// does not hold a spelling for, and a node whose operator is 0 keeps the
+// invocation span and is refused exactly as it is refused today. That is the
+// whole negative direction: an operator written from a guessed table would
+// lower the WRONG instruction, which is worse than a refusal, so the table
+// below is the lexer's own two byte codes (lexer.nova's `->` is 261 and is
+// not an operator) and the single byte codes the parser puts in an expression
+// aux (parser.nova precedence and its unary prefix test), read against
+// machine_ir.gap_text's own table so every spelling here maps back to the
+// code it came from.
+fn put_op(out:buf<u8>,at:u64,code:u64,dry:u64)->u64 {
+    if code==262 { if dry==0 { out[at]=61;out[at+1]=61; } return 2; }
+    if code==263 { if dry==0 { out[at]=33;out[at+1]=61; } return 2; }
+    if code==264 { if dry==0 { out[at]=60;out[at+1]=61; } return 2; }
+    if code==265 { if dry==0 { out[at]=62;out[at+1]=61; } return 2; }
+    if code==266 { if dry==0 { out[at]=60;out[at+1]=60; } return 2; }
+    if code==267 { if dry==0 { out[at]=62;out[at+1]=62; } return 2; }
+    if code==268 { if dry==0 { out[at]=38;out[at+1]=38; } return 2; }
+    if code==269 { if dry==0 { out[at]=124;out[at+1]=124; } return 2; }
+    // The single byte operators: the lexer's kind for one of them IS its own
+    // byte value, which is why these are the codes and not an index into a
+    // list. 33 '!' and 126 '~' are the unary pair, and 61 '=' is left out on
+    // purpose: parser.nova precedence never yields it, so no node can carry
+    // it, and an entry nothing can reach is an entry that was never checked.
+    if code==33 || code==37 || code==38 || code==42 || code==43 || code==45 ||
+       code==47 || code==60 || code==62 || code==94 || code==124 || code==126 {
+        if dry==0 { out[at]=u8(code); }
+        return 1;
+    }
+    return 0;
+}
+
+// Lay out one produced subtree into the appended run, in the order it reads.
+// dry is 1 for the sizing sweep, which must reach exactly the nodes the
+// writing sweep does or the buffer is the wrong size: same walk, same done
+// marks, no writes. A node already laid out returns the caller's position
+// unchanged, which is what makes the top sweep able to start at every root.
+fn layout_operand(s:Splice,done:buf<u64>,id:u64,at:u64,dry:u64)->u64 {
+    if id==0 || id>s.count { return at; }
+    if done[id]==1 { return at; }
+    done[id]=1;
+    let dest:u64=s.map[id];
+    if dest!=0 {
+        if wants_literal_span(s,id) {
+            let mut width:u64=literal_digits();
+            if dry==0 {
+                width=put_decimal(s.text,at,prod_get(s,id,f_aux()));
+                node_put(s,dest,f_start(),at);
+                node_put(s,dest,f_end(),at+width);
+            }
+            return at+width;
+        }
+        // An expression with a named operator and exactly two mapped
+        // operands: the operator goes between them, which is the gap
+        // binary_op reads, and the node's own span brackets the pair. A unary
+        // operator reads the gap between the NODE's start and its operand's
+        // start instead, and is left alone: no shape in this corpus reaches
+        // it, and an arm nothing exercises is an arm nothing checked.
+        if prod_kind(s,id)==k_expr() {
+            let code:u64=prod_get(s,id,f_aux());
+            let first:u64=prod_first(s,id);
+            let second:u64=prod_next(s,first);
+            if first!=0 && second!=0 && s.map[first]!=0 && s.map[second]!=0 {
+                if put_op(s.text,at,code,1)!=0 {
+                    let left:u64=layout_operand(s,done,first,at,dry);
+                    let written:u64=put_op(s.text,left,code,dry);
+                    let right:u64=layout_operand(s,done,second,left+written,dry);
+                    if dry==0 {
+                        node_put(s,dest,f_start(),
+                            node_get(s,s.map[first],f_start()));
+                        node_put(s,dest,f_end(),
+                            node_get(s,s.map[second],f_end()));
+                    }
+                    return right;
+                }
+            }
+        }
+        if prod_kind(s,id)==k_name() {
+            let from:u64=node_get(s,dest,f_start());
+            let to:u64=node_get(s,dest,f_end());
+            if to<from { return at; }
+            let width:u64=to-from;
+            if dry==0 {
+                let mut k:u64=0;
+                while k<width { s.text[at+k]=s.text[from+k];k=k+1; }
+                node_put(s,dest,f_start(),at);
+                node_put(s,dest,f_end(),at+width);
+            }
+            return at+width;
+        }
+    }
+    // Everything else contributes no text of its own and the walk descends
+    // through it, because the node that carries an operand is rarely the node
+    // that holds it: a produced `return` holds the produced expression, and a
+    // walk that stopped at the statement would reach no literal at all. A
+    // wrapper reaches here too, since compact drops the kind 31 placeholders
+    // and publishes no tree slot for one.
+    let mut child:u64=prod_first(s,id);
+    let last:u64=prod_last(s,id);
+    let mut walk:u64=at;
+    while child!=0 {
+        walk=layout_operand(s,done,child,walk,dry);
+        if child==last { break; }
+        child=prod_next(s,child);
+    }
+    if dest!=0 && dry==0 {
+        let first:u64=prod_first(s,id);
+        let kind:u64=prod_kind(s,id);
+        if kind==k_expr() && first!=0 && prod_next(s,first)==0 &&
+           (prod_get(s,id,f_aux())==0 || prod_get(s,id,f_aux())==40) && s.map[first]!=0 {
+            node_put(s,dest,f_start(),node_get(s,s.map[first],f_start()));
+            node_put(s,dest,f_end(),node_get(s,s.map[first],f_end()));
+        }
+        if kind==91 {
+            if first!=0 && last!=0 && s.map[first]!=0 && s.map[last]!=0 {
+                node_put(s,dest,f_start(),node_get(s,s.map[first],f_start()));
+                node_put(s,dest,f_end(),node_get(s,s.map[last],f_end()));
+            }
+        }
+    }
+    return walk;
+}
+
+// ============================ RE-DERIVED 2026-10-04, AND NOT THE BYTES THAT WERE
+// LOST. READ THIS BEFORE TRUSTING THE PROSE BELOW AS IF IT HAD ALWAYS BEEN HERE.
+//
+// `W212VacuousGates` truncated this file to zero bytes on 2026-10-04 at about
+// 03:33, redirecting through a symlink into its own `/tmp` shadow tree. It
+// reported the accident within a minute rather than leaving it to be found,
+// which is why this note exists at all instead of a mystery. The file was
+// RESTORED from `d1d61a05…` -- the digest this module carried BEFORE that lot
+// began -- attested by fifteen independent trees, among them
+// `out/coordination/b21-20261003/baseline/toolchain/ntasm-nova/`. Three
+// distinct digests survive in `out/`; the fifteen that agree are the ones that
+// were used, because fifteen trees agreeing is a pre-lot state and one tree is
+// a lucky copy.
+//
+// EVERY EDIT THAT LOT MADE TO THIS FILE WAS A COMMENT. Not one line of product
+// behaviour differed, so the restore restored prose and nothing else, and the
+// three gates came back identical to the dated baseline on the first run after
+// it. What was lost is the FOUR BLOCKS, and they were not kept anywhere: every
+// perturbation tree of that lot was deleted by its own working rule, the probe
+// sources live in `out/` and hold no module text, and this tree has no VCS.
+//
+// SO THE BLOCKS BELOW ARE RE-DERIVED FROM THE SESSION RECORD. They are not
+// recovered bytes and are not claimed to be identical to what was lost. They
+// are what the measurements in that record support, written back on the date
+// above, and the difference is the whole point: a re-derivation that does not
+// say so is indistinguishable from the thing it replaces, which is exactly the
+// failure a reader cannot detect and therefore cannot correct.
+//
+// If you are checking one of these claims, check the MEASUREMENT and not this
+// sentence. Each block says what was varied, what answered, and what the
+// instrument was. A claim here that does not survive its own re-measurement
+// should be deleted rather than defended.
+
+// ============================ TWO DEFECTS ANSWER 940, AND THEY SHARE ONLY
+// THE CODE. READ THIS BEFORE BLAMING EITHER ONE FOR THE OTHER.
+//
+// `940` is `machine_ir.nova:396 E_INPUT`, and on the module paths it is
+// answered at exactly one site: `machine_ir.nova:2430`, the fall-through of
+// `stmt()`, which dispatches on 26 let / 28 call / 29 return / 30 if / 32
+// instruction / 33 label / 46 align and refuses every other NTIR node. TWO
+// UNRELATED DEFECTS REACH THAT ONE LINE, and they were separated by cutting
+// this pass: with `respan_operands` removed, the produced-STATEMENT rows went
+// from 0 to 940 and the declaration rows did not move.
+//
+// THE DECLARATION DEFECT -- twenty-five red checks, in `validate` and `splice`
+// together. A macro whose result is `->ast.decl` is invoked from INSIDE a
+// function body, so the invocation node sits in that body's block child list,
+// and `substitute` copies the produced declaration onto the invocation's own
+// slot. The declaration's KIND is right -- 10 const, 18 function, 24 data, all
+// three admitted by `machine_ir.admits_index` -- and its POSITION is wrong: it
+// is a child of a block, where a statement belongs. Measured two independent
+// ways, in agreement: the parent is index 25, `block`.
+//
+// THE STATEMENT DEFECT -- this pass, and it is GREEN today because of this
+// pass. A produced STATEMENT literal carries the invocation span rather than
+// its own, `machine_ir.read_magnitude` walks that text, reads no decimal, and
+// `literal()` refuses. That is what the comment above `put_op` and
+// `layout_operand` describes, and `respan_operands` is the repair.
+//
+// THE CONSEQUENCE, and it is the whole point of writing it here. If the
+// statement rows go red after the declaration defect is fixed, that is NOT a
+// regression of the declaration fix -- it is THIS defect surfacing. And if a
+// future change here turns them red, that is this defect and not the
+// declaration one coming back. They share a code and nothing else. A reader
+// who sees a 940 in this module's paths must establish WHICH of the two
+// produced it, and the way to do that is to look at what the refused node IS --
+// a declaration means `substitute`, a literal means this pass -- not at the
+// number, which is the same for both.
+// One reallocation, sized by a dry walk and filled by the same walk.
+fn respan_operands(s:Splice)->u64 {
+    let vis:buf<u64>=s.vis;
+    let slots:u64=s.count+2;
+    let done:buf<u64>=alloc(runtime(),slots);
+    let mut i:u64=0;
+    while i<slots { done[i]=0;i=i+1; }
+    // The roots are the produced nodes mark_children left unmarked: every
+    // other produced node is a child of one of them, and mark_children is
+    // derived from the expander's own child lists rather than from an order
+    // this pass could get wrong.
+    let mut need:u64=0;
+    let mut id:u64=1;
+    while id<=s.count {
+        if vis[id]==0 { need=need+layout_operand(s,done,id,0,1); }
+        id=id+1;
+    }
+    if need==0 { rt_free(runtime(),done);return 0; }
+    let base:u64=len(s.text);
+    let text:buf<u8>=alloc(runtime(),base+need);
+    let old:buf<u8>=s.text;
+    i=0;
+    while i<base { text[i]=old[i];i=i+1; }
+    // The new copy is PUBLISHED before the writing sweep and not after it.
+    // layout_operand writes through s.text, so a sweep that ran while s.text
+    // still named the shorter buffer would write the appended run past its
+    // end -- which is a bounds refusal in the runtime and a corrupted module
+    // if the check were ever relaxed. The old copy is released through
+    // s.extra, which is the other name for the same buffer: build_text set
+    // both, and splice_release frees this one.
+    let stale:buf<u8>=s.extra;
+    rt_free(runtime(),stale);
+    s.extra=text;s.text=text;
+    i=0;
+    while i<slots { done[i]=0;i=i+1; }
+    let mut at:u64=base;
+    id=1;
+    while id<=s.count {
+        if vis[id]==0 { at=layout_operand(s,done,id,at,0); }
+        id=id+1;
+    }
+    rt_free(runtime(),done);
+    return 0;
+}
+
+// The literal the expander materialises, and the one it clones. It is the
+// only kind whose VALUE the expander puts in the aux word rather than in the
+// span, so it is the only kind whose span cannot name it.
+fn k_literal()->u64 { return 94; }
+// token_begin, field ordinal 1 of the flat twelve word record.
+fn f_token()->u64 { return 1; }
+// The lexer's integer token kind (lexer.nova:117), the same number
+// macro_expand.tok_int writes out and for the same reason: no module exports
+// the lexer's kinds.
+fn tok_int()->u64 { return 258; }
+// A u64 is twenty decimal digits at most, so every spelling fits in twenty
+// bytes and one multiplication sizes the whole appended run.
+fn literal_digits()->u64 { return 20; }
+
+// The expression node the parser builds around an operator, kind 35. It is
+// named here rather than read out of ntir because the splicer works on the
+// expander's region, whose kinds are the AST's.
+fn k_expr()->u64 { return 35; }
+fn wants_literal_span(s:Splice,id:u64)->bool {
+    if prod_kind(s,id)!=k_literal() { return false; }
+    let tokens:buf<u64>=s.tree.token_words;
+    let token:u64=prod_get(s,id,f_token());
+    if token>=s.tree.token_count { return false; }
+    return tokens[token*9]==tok_int();
+}
+
+// The decimal spelling of value at at, returning how many bytes it wrote.
+// ast.nova's decimal and the two put_decimal helpers read off the same tree
+// and none of them is exported, so the loop is written here rather than
+// imported: the compiler resolves an import against the explicit input list
+// and nothing else.
+fn put_decimal(out:buf<u8>,at:u64,value:u64)->u64 {
+    let mut digits:u64=1;
+    let mut rest:u64=value;
+    while rest>=10 { digits=digits+1;rest=rest/10; }
+    let mut i:u64=digits;
+    let mut rest2:u64=value;
+    while i!=0 { i=i-1;out[at+i]=u8(48+(rest2%10));rest2=rest2/10; }
+    return digits;
+}
+
+
+// Rebuild one produced child list inside the spliced tree. A wrapper child
+// contributes its own children in its place, so a nested expand leaves no
+// placeholder behind. Every child of a wrapper is itself a real node, so one
+// level of replacement is exact. A produced node is rebuilt on its own tree
+// slot; a wrapper is rebuilt as a bare chain and its head is published in
+// the map, so the caller can substitute it for an invocation.
+fn relink_list(s:Splice,produced:u64,node:u64)->u64 {
+    let map:buf<u64>=s.map;
+    let first:u64=prod_first(s,produced);
+    let last:u64=prod_last(s,produced);
+    let mut head:u64=0;
+    let mut tail:u64=0;
+    let mut at:u64=first;
+    while at!=0 {
+        if prod_kind(s,at)==k_expand() {
+            let inner:u64=prod_first(s,at);
+            let inner_last:u64=prod_last(s,at);
+            let mut piece:u64=inner;
+            while piece!=0 {
+                if map[piece]!=0 {
+                    if head==0 { head=map[piece]; } else { node_put(s,tail,f_next(),map[piece]); }
+                    tail=map[piece];
+                }
+                if piece==inner_last { break; }
+                piece=prod_next(s,piece);
+            }
+        } else if map[at]!=0 {
+            if head==0 { head=map[at]; } else { node_put(s,tail,f_next(),map[at]); }
+            tail=map[at];
+        }
+        if at==last { break; }
+        at=prod_next(s,at);
+    }
+    if node!=0 { node_put(s,node,f_first(),head);node_put(s,node,f_last(),tail); }
+    if tail!=0 { node_put(s,tail,f_next(),0); }
+    if node==0 { map[produced]=head; }
+    return 0;
+}
+
+// ============================ AND THIS IS THE TWENTY-FIVE. A `->ast.decl`
+// EXPANSION IS NOT HOISTED, AND THIS IS THE PASS THAT DOES NOT HOIST IT.
+// (RE-DERIVED 2026-10-04; see the block above `respan_operands`.)
+//
+// The loop below is correct for what it was written to do, and that is the
+// trap: it replaces an invocation with a produced subtree IN PLACE, and for
+// every `->ast.stmt` expansion that is exactly right. A `->ast.decl`
+// expansion is not a statement. Its invocation sits where a statement goes
+// -- inside the body block of whatever function called the macro -- and the
+// twelve-word copy puts a `const` / `function` / `data` node on that slot,
+// still parented by the block. `prune` then walks from the root, finds the
+// declaration perfectly REACHABLE, and retires nothing. Every check this pass
+// performs passes.
+//
+// The damage is downstream and this module is not the one that reports it:
+// `ntir.build` copies `afirst` verbatim with no relink, so the image carries
+// the nesting, and `machine_ir.body` walks a block's children calling `stmt()`
+// on each. A declaration is none of the seven kinds `stmt()` dispatches on, so
+// it falls through to `refuse(b,E_INPUT(),...)` -- 940. Measured: indices 18,
+// 24 and 10 refused under parent index 25.
+//
+// TWENTY-FIVE RED CHECKS, in `tests_ntasm_validate.c` and
+// `tests_ntasm_splice.c` together, all with `ret=940`. Every one of them is a
+// `->ast.decl` + `emit quote(decl)` fixture; every `->ast.stmt` fixture
+// carrying a literal is green; and every `->ast.decl` fixture that EXPECTS a
+// refusal gets it (`produced param` 353, `value to const` 363), so the code is
+// not refusing indiscriminately.
+//
+// WHAT THE FIX IS NOT, and these three are worth more than the fix because
+// they are what stops the next person making it green by making the tree
+// wrong. Do NOT weaken `machine_ir.stmt` to accept a declaration in a
+// statement position: that reads a declaration whose operands were never laid
+// out for a statement context, and a wrong instruction is worse than a
+// refusal -- the refusal was RIGHT. Do NOT touch `ntir.build`: it copies the
+// link fields verbatim and was never the pass that made the nesting. Do NOT
+// widen `prune` to compensate: `prune` passing is the third pass of the
+// blindness family below, and making it stricter without knowing why it was
+// lenient is a guess with a coverage count attached.
+//
+// WHERE THE FIX GOES, which is MEASURED and not chosen. On the caller's own
+// tree, a `fn` or a `data` written inside `section .text { ... }` is a child
+// of AST kind 17 -- `parser.nova`'s `section_decl` builds `node(p,17,...)` --
+// and a `const` written at module level is a child of kind 1. So a produced
+// declaration belongs at the section level, and its invocation has to be
+// unlinked so `prune`, the one pass that was already right about this, can
+// retire it: an unlinked node is unreachable, and unreachability is the only
+// thing `prune` retires.
+//
+// NOT DONE, and this is the honest state of it. An implementation was tried
+// and it moved the refusal from `940` to `815` -- `machine_ir.stmt` stopped
+// refusing, so the relocation reached its target -- and `ntir.verify` then
+// refused the image instead. `815` was narrowed to its FIRST arm,
+// `if own_next(words,count,last)!=0`, "the last child must end the chain",
+// which fires on every produced-declaration fixture, on no clear twin, and not
+// on the statement control. The ids behind it were NOT obtained: a decoder
+// overflowed the 35-entry kind table, and a second attempt published two
+// payload words into `spliced_shape`'s own output fields. So the relocation
+// is NECESSARY AND NOT SUFFICIENT, and nothing here knows what else has to
+// happen. The fix is not in this file. Do not write one that makes the
+// counters stop complaining without naming the residue it leaves.
+//
+// SUPERSEDED ON 2026-10-04, BY THE BLOCK DIRECTLY ABOVE `substitute`, and the
+// paragraph above is kept standing rather than rewritten because it is the
+// record of what was MEASURED then and the measurement is what a reader has to
+// check for themselves. What is no longer true is its own conclusion: "The
+// fix is not in this file." The relocation this paragraph calls NECESSARY AND
+// NOT SUFFICIENT is implemented, and the residue it could not name -- the
+// `own_next` arm of `ntir.verify`, 815 -- is closed by the same five writes
+// that close the relocation. The two sentences that survive unchanged are the
+// ones about instruments: `prune` and `spliced_shape` are still blind to
+// placement, `spliced_shape` is still green on it, and `out[4] == 0` is still
+// the assertion that cannot see this class of defect. The twenty-five counters
+// below are still the control, and what they now have to do is go to zero
+// rather than stay put.
+//
+// `validate.nova`'s `spliced_shape` WAS THE INSTRUMENT FOR THIS, AND IT WAS
+// TRIED, AND IT CANNOT SEE IT. Measured on the produced rows AND on their
+// clear twins: `out[3] holes=0`, `out[4] unreachable=0`, `out[5]
+// ntir.build=0`, `out[6] ntir.verify=0`. Every number it publishes is
+// satisfied on a tree that is nonetheless wrong. A pointer to an instrument
+// that was measured and failed is worse than no pointer, so the failure is
+// written here rather than the pointer left standing.
+//
+// WHY, and it is not a defect in that export. A mis-parented node is
+// REACHABLE -- that is what a mis-parenting IS. The node is in the tree, the
+// walk arrives at it, and the verifier follows the link and is satisfied.
+// Reachability and placement are INDEPENDENT properties, so no question of
+// the form "can you get there from there" detects "this belongs here". There
+// is no amount of running that instrument which would help, which is exactly
+// why it looked trustworthy.
+//
+// AND IT IS BLIND AFTER THE PLACEMENT IS CORRECTED TOO, which is the clause
+// that decides what to reach for next. Measured on a hoisted tree -- one with
+// the produced declaration appended to its section and its invocation
+// unlinked -- `holes=0` and `unreachable=0` still. So there is no state this
+// instrument can be in, before the fix or after it, in which it reports this
+// class of defect. Do NOT validate a fix to this with `spliced_shape`, and do
+// not read its zero as evidence that the fix landed. The only member of the
+// family below that ever saw this was `ntir.verify`, and it saw it only once
+// the first defect was out of the way.
+//
+// THE CONSEQUENCE, and this is the part that must not be lost: the splice
+// gate ASSERTS `out[4] == 0` as a green -- `tests_ntasm_splice.c:530` reads
+// `if (h.out[4] != 0 || ...) { failures++; }`, so the `!= 0` is the FAILURE
+// condition. That gate is therefore asserting that this class of defect is
+// absent, using an instrument that cannot see it. IT IS GREEN ON THE DEFECT.
+// And the blindness is a family of three -- `prune` walks from the root and
+// retires nothing, `spliced_shape` walks from the root and counts zero, and
+// `ntir.verify` follows the link and passes -- three passes each believing
+// another one checked, the third of them being the module whose entire job is
+// structural verification.
+//
+// SO THE CONTROL FOR A FIX IS NOT `out[4]`, which is already zero and must
+// stay zero and therefore measures nothing. The control is that the CLEAR-PATH
+// COUNTERS MUST NOT MOVE: `NTASM_NOVA_VALIDATE` staying at checks=480
+// failures=8 and `NTASM_NOVA_SPLICE` at checks=609 failures=17. Those
+// twenty-five ARE the control.
+//
+// ============================ AND THIS IS THE REPAIR: A PRODUCED DECLARATION
+// LEAVES THE STATEMENT POSITION IT WAS SUBSTITUTED INTO. READ THE BLOCK ABOVE
+// `respan_operands` FIRST -- IT IS WHAT SAYS WHICH 940 IS WHICH, AND THIS IS
+// THE DECLARATION ONE, NOT THE LITERAL ONE.
+// (Written 2026-10-04 by the lot that moved the twenty-five.)
+//
+// A `->ast.stmt` expansion replaces its invocation IN PLACE, and that is
+// correct: a statement goes exactly where a statement goes. A `->ast.decl`
+// expansion does not produce a statement. Its invocation sits in the body
+// block of whatever function called the macro, and the copy below puts a
+// `const` / `function` / `data` node on that slot -- still parented by the
+// block, where `machine_ir.stmt` dispatches on seven kinds and a declaration
+// is none of them. So the node is HOISTED, and it is hoisted to where a
+// hand-written declaration of the same kind already goes.
+//
+// THE DESTINATION IS MEASURED PER KIND, AND NONE OF IT IS CHOSEN HERE:
+//
+//   const, AST 10  ->  the UNIT node, AST 1
+//   fn,    AST 18  ->  a SECTION node, AST 17
+//   data,  AST 24  ->  a SECTION node, AST 17
+//
+// Three producers agree, and the two CROSSED placements are refused by the
+// grammar itself rather than by a later pass. `parser.nova`'s `section_decl`
+// opens `node(p,17)` with three attach arms -- 15 function, 17 data, 38
+// statement -- and no const arm, so a `const` written inside a section does
+// not parse; the same file's `source_tree` opens `node(p,1)` with a
+// constant_decl arm and no function arm and no data arm, so a `data` written
+// at module level does not parse either. `machine_ir` answers from the other
+// side: `section_of` dispatches on 18 and 24, `unit` on 10, 17 and 18. Not one
+// of those three says anything about REACHABILITY, and placement is a
+// different property from reachability -- which is why `prune` and
+// `spliced_shape` both report this tree as clean and why their zeros are not
+// evidence.
+//
+// WHY THE SECTION THE INVOCATION WAS ALREADY IN. A module may carry SEVERAL
+// sections and nothing in the grammar constrains which one a declaration
+// belongs to, so "the first section" would be a policy with no producer
+// behind it, and this file does not get to invent one. The one placement
+// that needs no policy is the one a HAND-WRITTEN declaration already
+// occupies: the declaration is hoisted into the section its own invocation
+// sits in. That placement is measured too -- a `fn` inside `section .rdata`
+// is accepted, so a section admits a function whatever the section is called
+// -- and it is the only destination available without choosing among them.
+//
+// AND THE NO-SECTION BRANCH, NAMED RATHER THAN GUESSED. An invocation inside
+// no section has no section to be hoisted into, so it goes to the unit: that
+// is the container a hand-written top-level declaration occupies, and
+// `machine_ir.unit` admits kinds 10, 17 and 18 there. A `data` in that
+// position is admitted by neither and stays refused downstream exactly as it
+// is refused today, which is the status quo ante and not a regression. No
+// fixture in either gate is in that position; it is written down because a
+// rule with an unnamed branch is a rule whose branch nobody has measured.
+//
+// FIVE LINK WRITES, AND FOUR OF THEM ARE MISSES THAT ANSWER 815, NOT 940.
+// Moving one node means repairing TWO lists, and the residue lands on a
+// different pass from the one this defect was measured on: `ntir.verify`
+// refuses 815 when the node recorded as `last_child` still carries a
+// `next_sibling`, and when the chain it walks does not hold exactly the
+// `child_count` it recorded. Appending to the section without detaching from
+// the block, or detaching without repairing the block's own two ends, moves
+// the refusal from one pass to another and reads like a different bug. The
+// loop that reports 815 walks ascending id and a section sorts BELOW a body
+// block, so the message cannot tell the reader which side was broken -- which
+// is why `hoist` below writes both lists unconditionally instead of writing
+// the one it expected to need.
+
+// The AST kinds the hoist dispatches on. They are the parser's ordinals and
+// NOT the IR's, because the splicer edits the AST: the caller's own tree and
+// the region the expander published are both AST. `machine_ir`'s own 10 is a
+// data record, so an ordinal read off that file would send a const to where a
+// data belongs.
+fn k_const()->u64 { return 10; }
+fn k_function()->u64 { return 18; }
+fn k_data()->u64 { return 24; }
+fn k_section()->u64 { return 17; }
+
+// The parent of every node, indexed by id, from one walk out of the root. The
+// root is its own parent, so one mark does two jobs: it stops a node being
+// pushed twice, and it terminates the walk upward in `section_above` without a
+// second sentinel. The stack shares the allocation, two words per id, and a
+// node is on the stack at most once because the mark is set when it is pushed
+// -- so a cycle closes on the mark rather than on a depth bound and the stack
+// cannot overflow what it was sized for.
+//
+// ONE WALK SERVES THE WHOLE PASS. A hoist changes two CHILD lists and no
+// PARENT link: it takes a leaf out of one list and adds it to another, so
+// every other invocation's ancestors are the same nodes afterwards. The table
+// is therefore built once, before the loop, and each lookup in it still names
+// the node it named when it was built.
+fn parents(s:Splice,table:buf<u64>)->u64 {
+    let total:u64=s.total;
+    let base:u64=total+2;
+    let mut size:u64=1;
+    table[1]=1;table[base]=1;
+    while size>0 {
+        size=size-1;
+        let id:u64=table[base+size];
+        let last:u64=node_get(s,id,f_last());
+        let mut child:u64=node_get(s,id,f_first());
+        while child!=0 && child<=total {
+            if table[child]==0 { table[child]=id;table[base+size]=child;size=size+1; }
+            if child==last { break; }
+            child=node_get(s,child,f_next());
+        }
+    }
+    return 0;
+}
+
+// The innermost SECTION above `id`, or 0 when there is none. The walk stops
+// at the root, which is a unit by construction: `source_tree` opens it as
+// `node(p,1)` and attaches every top level declaration to it.
+fn section_above(s:Splice,table:buf<u64>,id:u64)->u64 {
+    let mut node:u64=table[id];
+    while node!=1 && node!=0 {
+        if node_get(s,node,0)==k_section() { return node; }
+        node=table[node];
+    }
+    return 0;
+}
+
+// Move the produced declaration now occupying `at` -- the invocation's own
+// slot, which the copy in `substitute` has just filled -- out of the statement
+// position it was substituted into, and into the container the block above
+// names. A produced node that is not one of the three declaration kinds is
+// left exactly where the substitution put it, because for a statement that
+// placement is the correct one and this pass must not be able to disturb it.
+fn hoist(s:Splice,table:buf<u64>,at:u64)->u64 {
+    let kind:u64=node_get(s,at,0);
+    let mut dest:u64=0;
+    if kind==k_const() { dest=1; }
+    else if kind==k_function() || kind==k_data() {
+        dest=section_above(s,table,at);
+        if dest==0 { dest=1; }
+    }
+    if dest==0 { return 0; }
+    let origin:u64=table[at];
+    // Already a child of the destination, or not reachable from the root at
+    // all: either way there is nothing to move, and appending a node to the
+    // list it is already in would cut that list in half.
+    if origin==0 || origin==dest { return 0; }
+    let first:u64=node_get(s,origin,f_first());
+    // The predecessor is looked for ONLY when the node does not lead the list.
+    // A first child needs none, because the origin's own `first` is the write;
+    // searching for one anyway would compare the node's own next against the
+    // node and find nothing.
+    let mut prev:u64=0;
+    if first!=at {
+        let mut walk:u64=first;
+        while walk!=0 && walk<=s.total {
+            if node_get(s,walk,f_next())==at { prev=walk;break; }
+            walk=node_get(s,walk,f_next());
+        }
+    }
+    let after:u64=node_get(s,at,f_next());
+    // THE ORIGIN. Three links cover every position there is: `first` when the
+    // node led the list, the predecessor's `next` when it did not, and `last`
+    // when it ended the list. A list of one child writes both ends to 0, which
+    // is not tidiness -- `ntir.verify` refuses 818 on a parent whose two ends
+    // disagree about whether it has children.
+    if prev!=0 { node_put(s,prev,f_next(),after); }
+    else { node_put(s,origin,f_first(),after); }
+    if node_get(s,origin,f_last())==at { node_put(s,origin,f_last(),prev); }
+    // THE DESTINATION. The node's own `next` is closed here rather than left
+    // over from the list it came out of, and a non-zero next on the last child
+    // is precisely what 815 reads.
+    let tail:u64=node_get(s,dest,f_last());
+    if tail!=0 { node_put(s,tail,f_next(),at); } else { node_put(s,dest,f_first(),at); }
+    node_put(s,at,f_next(),0);
+    node_put(s,dest,f_last(),at);
+    return 0;
+}
+// Substitute each expansion for the invocation it replaces. The invocation
+// slot takes the first produced node and the last produced node keeps the
+// invocation's own next sibling, so the surrounding child list is untouched
+// and no parent search is needed FOR A STATEMENT. The order is fixed: the
+// chain is closed before the head is copied, otherwise a single node
+// replacement would lose the invocation's successor.
+//
+// THE CLAUSE THAT IS NOW FALSE IS "no parent search is needed", and it is
+// corrected in place rather than rewritten away, because a silent rewrite is
+// how a reader loses the fact that a STATEMENT expansion still needs no
+// parent at all -- which is the property that keeps this pass from being able
+// to disturb the nineteen clear rows. A DECLARATION does need one: `hoist` is
+// called on the same slot immediately after the copy, and it is that parent
+// search plus the two list repairs which is the whole of the fifth write.
+// Everything else here is untouched -- the produced head is still copied onto
+// the invocation's slot, and the produced slot it was copied off is still
+// retired by reachability in `prune` -- so a statement expansion reaches the
+// later passes through exactly the tree it reached before this pass existed.
+fn substitute(s:Splice)->u64 {
+    let map:buf<u64>=s.map;
+    let vis:buf<u64>=s.vis;
+    let order:buf<u64>=s.order;
+    let nodes:buf<u64>=s.nodes;
+    // One parent table for the whole pass, released on BOTH exits: the run is
+    // built with detect_leaks=1, so the refusal path returning without the
+    // release would be a second fault reported against this fix.
+    let table:buf<u64>=alloc(runtime(),(s.total+2)*2);
+    parents(s,table);
+    let mut roots:u64=0;
+    let mut index:u64=1;
+    let mut wrapper:u64=1;
+    while wrapper<=s.count {
+        if prod_kind(s,wrapper)==k_expand() && vis[wrapper]==0 {
+            roots=roots+1;
+            if index<=order[0] {
+                let head:u64=map[wrapper];
+                if head!=0 {
+                    let mut tail:u64=head;
+                    while node_get(s,tail,f_next())!=0 { tail=node_get(s,tail,f_next()); }
+                    let at:u64=(order[index]-1)*12;
+                    nodes[(tail-1)*12+f_next()]=nodes[at+f_next()];
+                    let mut field:u64=0;
+                    while field<12 {
+                        nodes[at+field]=nodes[(head-1)*12+field];
+                        field=field+1;
+                    }
+                    // The head's own slot now holds a second copy of a node
+                    // the tree already carries, and the invocation's own
+                    // children, the macro name and the arguments, are
+                    // replaced along with it. Neither is touched here. prune
+                    // retires every id the root cannot reach, so a stage
+                    // that scans ids flat never sees the declaration twice
+                    // and no id inside 1..node_count is a slot the tree
+                    // still claims and no pass can use.
+                    // A produced DECLARATION is not a statement and does not
+                    // belong where a statement goes, so the same slot is
+                    // hoisted out of this list and into the container a
+                    // hand-written declaration of that kind occupies. For
+                    // anything else this is a read and an immediate return.
+                    // id and not `at`, which is this pass's WORD OFFSET into
+                    // the node array -- the id is what `order` holds and what
+                    // `hoist` reads the tree by.
+                    hoist(s,table,order[index]);
+                }
+            }
+            index=index+1;
+        }
+        wrapper=wrapper+1;
+    }
+    rt_free(runtime(),table);
+    // The expander emits one wrapper per invocation it met, so a mismatch
+    // means the two traversals disagree and the tree must not be used.
+    if roots!=order[0] { return 800; }
+    return 0;
+}
+
+// Retire every node the root does not reach, and renumber what is left. The
+// spliced tree is built in two halves: the caller's own nodes, copied
+// verbatim so every span a stage already resolved still names the same node,
+// and the produced nodes the expander emitted, appended after them. A
+// substitution puts a produced head on the invocation's own slot and hands
+// the invocation's next sibling to the produced tail, so two kinds of node
+// are left behind. The produced head's slot, which now holds a second copy of
+// a node the tree already has, and the invocation's own children, the macro
+// name and the arguments, which the expansion replaced. Zeroing the head is
+// what this pass used to do, and it left the id inside 1..node_count: a slot
+// no stage dispatches on, because a flat scan reads kind 0 there and a walk
+// from the root never arrives. The intermediate representation reads the
+// count as the length of the id space, so such a slot is a node its image
+// cannot lower, and the tree is malformed by the IR's own definition.
+//
+// Reachability is the criterion, and not the count of invocations, because
+// the two sets are not the same set. The spent slots live in the produced
+// half and the replaced children in the caller's, so a reader that counts
+// holes by kind sees one per invocation and misses the rest; one walk from
+// the root finds both. The measured shape agrees: a module with one, two and
+// three invocations carries one, two and three kind 0 slots and three, four
+// and six unreachable ids.
+//
+// The id space is an array length, not a set of reachable nodes, so
+// unlinking alone would leave the hole exactly where it is: the count is
+// what the tree publishes and what the image is sized by, and an id the
+// count claims and the walk cannot reach is the same defect under another
+// name. A distinct terminal kind would be cheaper still and is refused on
+// purpose: kind 0 meaning "nothing here" is a property of the splicer, and
+// teaching the IR to accept it would put the producer's convention into the
+// contract of the thing whose correctness the product is relying on. So the
+// array is compacted, the three link fields are rewritten through the new
+// numbering, and s.total becomes the number of nodes the tree really has.
+// The copy runs into a fresh buffer, because a compaction that renumbered in
+// place would overwrite a record it has not read yet as soon as the dropped
+// ids are not all at the end.
+fn prune(s:Splice)->u64 {
+    let total:u64=s.total;
+    if total==0 { return 0; }
+    let keep:buf<u64>=alloc(runtime(),total+1);
+    let new_id:buf<u64>=alloc(runtime(),total+1);
+    let stack:buf<u64>=alloc(runtime(),total+1);
+    let mut i:u64=0;
+    while i<total+1 { keep[i]=0;new_id[i]=0;i=i+1; }
+    // The mark is set when a node is PUSHED, so a node is on the stack at
+    // most once, a cycle is closed by the mark rather than by a depth bound,
+    // and the stack of total+1 words cannot overflow.
+    let mut size:u64=1;
+    keep[0]=1;stack[0]=1;
+    while size>0 {
+        size=size-1;
+        let id:u64=stack[size];
+        let mut child:u64=node_get(s,id,f_first());
+        while child!=0 && child<=total {
+            if keep[child-1]==0 { keep[child-1]=1;stack[size]=child;size=size+1; }
+            child=node_get(s,child,f_next());
+        }
+    }
+    let mut fresh:u64=0;
+    i=1;
+    while i<=total {
+        if keep[i-1]==1 { fresh=fresh+1;new_id[i-1]=fresh; }
+        i=i+1;
+    }
+    let old:buf<u64>=s.nodes;
+    let nodes:buf<u64>=alloc(runtime(),(total+1)*12);
+    i=1;
+    while i<=total {
+        let to:u64=new_id[i-1];
+        if to!=0 {
+            let from:u64=(i-1)*12;
+            let dest:u64=(to-1)*12;
+            let mut field:u64=0;
+            while field<12 { nodes[dest+field]=old[from+field];field=field+1; }
+            // Only the three link fields carry an id, and every link of a
+            // kept node names a kept node, the walk having arrived by it.
+            let mut link:u64=nodes[dest+8];
+            if link>0 && link<=total { nodes[dest+8]=new_id[link-1]; }
+            link=nodes[dest+9];
+            if link>0 && link<=total { nodes[dest+9]=new_id[link-1]; }
+            link=nodes[dest+10];
+            if link>0 && link<=total { nodes[dest+10]=new_id[link-1]; }
+        }
+        i=i+1;
+    }
+    s.nodes=nodes;
+    s.total=fresh;
+    rt_free(runtime(),old);
+    rt_free(runtime(),stack);
+    rt_free(runtime(),new_id);
+    rt_free(runtime(),keep);
+    return fresh;
+}
+
+// ------------------------------------------------------- the expansion pass
+// spec/ntasm/ntasm.md 13: a macro is developed before the final verification of
+// types and contracts, so this runs first. Its diagnostic is propagated
+// verbatim: 201 keeps the refused budget reason, 203 keeps the required
+// buffer size, 800 keeps the structural refusal, and every 3xx hygiene
+// code reaches the caller unchanged. A module with no invocation leaves the
+// caller's tree and source exactly as they were.
+export fn expand_stage(s:Splice,scratch:buf<u64>)->u64 {
+    if s.tree.node_count==0 { scratch[0]=800;return 800; }
+    let words:u64=region_words(s.tree);
+    let region:buf<u64>=alloc(runtime(),words);
+    s.region=region;
+    let mut code:u64=ntasm_macro_expand.expand(s.source,s.tree,region);
+    if code==203 {
+        let need:u64=region[3];
+        if need>words {
+            rt_free(runtime(),region);
+            let bigger:buf<u64>=alloc(runtime(),need);
+            s.region=bigger;
+            code=ntasm_macro_expand.expand(s.source,s.tree,bigger);
+        }
+    }
+    if code!=0 {
+        scratch[0]=region[0];scratch[1]=region[1];
+        scratch[2]=region[2];scratch[3]=region[3];
+        return code;
+    }
+    s.count=region[1];
+    s.name_words=(region[2]+7)/8;
+    // No invocation, so nothing was produced: the caller's tree stands and
+    // the later stages read the caller's own source buffer.
+    if s.count==0 { return 0; }
+
+    build_text(s);
+
+    let slots:u64=s.count+2;
+    let map:buf<u64>=alloc(runtime(),slots);
+    let vis:buf<u64>=alloc(runtime(),slots);
+    let order:buf<u64>=alloc(runtime(),slots);
+    let nodes:buf<u64>=alloc(runtime(),(s.tree.node_count+s.count)*12);
+    let old_map:buf<u64>=s.map;
+    let old_vis:buf<u64>=s.vis;
+    let old_order:buf<u64>=s.order;
+    let old_nodes:buf<u64>=s.nodes;
+    rt_free(runtime(),old_map);rt_free(runtime(),old_vis);
+    rt_free(runtime(),old_order);rt_free(runtime(),old_nodes);
+    s.map=map;s.vis=vis;s.order=order;s.nodes=nodes;
+    let mut i:u64=0;
+    while i<slots { map[i]=0;vis[i]=0;order[i]=0;i=i+1; }
+
+    // The caller's nodes are copied verbatim, so every id a stage already
+    // resolved against the original tree still names the same node.
+    let words_in:buf<u64>=s.tree.node_words;
+    let words_out:buf<u64>=s.nodes;
+    let span:u64=s.tree.node_count*12;
+    i=0;
+    while i<span { words_out[i]=words_in[i];i=i+1; }
+
+    let mut id:u64=1;
+    while id<=s.count { mark_children(s,id);id=id+1; }
+    compact(s);
+    respan_types(s);
+    respan_operands(s);
+    id=1;
+    while id<=s.count {
+        if s.map[id]!=0 { relink_list(s,id,s.map[id]); }
+        id=id+1;
+    }
+    id=1;
+    while id<=s.count {
+        if prod_kind(s,id)==k_expand() { relink_list(s,id,0); }
+        id=id+1;
+    }
+    collect(s,1,0);
+    let mismatch:u64=substitute(s);
+    if mismatch!=0 { scratch[0]=mismatch;return mismatch; }
+    prune(s);
+    return 0;
+}

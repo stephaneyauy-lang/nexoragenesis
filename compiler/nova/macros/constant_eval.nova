@@ -1,0 +1,225 @@
+module constant_eval;
+
+import ntasm_ast;
+
+// Bounded literal-only constant expression evaluation for NTASM const
+// declarations. The accepted language is exactly: integer literals, groups,
+// unary + - ~, and the binary operators + - * / % & ^ | << >>. Every other
+// node shape is refused, so nothing depends on names, calls, comparisons or
+// logical operators.
+//
+// An evaluated integer is a sign and a magnitude, never a bare u64 bit
+// pattern. A pattern cannot say whether 0x8000000000000000 came from
+// -9223372036854775808 or from 0+9223372036854775808, so a pattern range test
+// accepted a positive 2^63 for i64. Here the sign comes from the source: a
+// literal is positive, a unary minus flips the sign, and every other operator
+// derives the sign from its operands. The declared range is then applied to
+// that sign and magnitude, so a positive result of magnitude 2^63 is out of
+// range for i64 while -9223372036854775808 is the i64 minimum.
+//
+// Arithmetic is checked signed-magnitude. A magnitude of 0 is always
+// positive, so there is no negative zero. A bitwise or shift operator is
+// undefined on a negative operand in this representation and fails closed
+// instead of being read as a positive result.
+//
+// The depth bound is 64 nodes on the path from the expression root to a
+// literal, the same bound and root depth as initializer_types.
+//
+// Internal status values, all distinct:
+//   0   success
+//   1   overflow or underflow
+//   2   division by zero
+//   3   modulo by zero
+//   4   invalid shift, amount 64 or more
+//   5   unsupported node shape
+//   6   unsupported operator
+//   7   expression deeper than the depth bound
+//   8   undefined negative operand in a bitwise or shift operator
+//   800 structural failure, no usable node
+//
+// No partial value is ever produced with a nonzero status, and line/column
+// locate the node that decided the failure.
+export struct Value {
+    status:u64,
+    negative:bool,
+    magnitude:u64,
+    line:u64,
+    column:u64
+}
+
+fn depth_bound()->u64 { return 64; }
+fn maximum()->u64 { return 0xFFFFFFFFFFFFFFFF; }
+fn minimum_magnitude()->u64 { return 0x8000000000000000; }
+
+fn failure(status:u64,line:u64,column:u64)->Value {
+    return Value{status:status,negative:false,magnitude:0,line:line,column:column};
+}
+
+// A produced value is never a negative zero, and carries no position.
+fn produced(negative:bool,magnitude:u64)->Value {
+    if magnitude==0 {
+        return Value{status:0,negative:false,magnitude:0,line:0,column:0};
+    }
+    return Value{status:0,negative:negative,magnitude:magnitude,line:0,column:0};
+}
+
+fn next_of(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count { return 0; }
+    let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    return node.next_sibling;
+}
+
+// Flip the sign. A magnitude of 0 stays positive.
+fn negate(value:Value)->Value {
+    if value.negative { return produced(false,value.magnitude); }
+    return produced(true,value.magnitude);
+}
+
+// Checked addition. Equal signs add the magnitudes and overflow is refused;
+// different signs subtract the magnitudes and the result keeps the sign of the
+// larger operand, so equal magnitudes give a positive zero.
+fn add(left:Value,right:Value,line:u64,column:u64)->Value {
+    if left.negative==right.negative {
+        if left.magnitude!=0 && right.magnitude>maximum()-left.magnitude {
+            return failure(1,line,column);
+        }
+        return produced(left.negative,left.magnitude+right.magnitude);
+    }
+    if left.magnitude>right.magnitude {
+        return produced(left.negative,left.magnitude-right.magnitude);
+    }
+    if right.magnitude>left.magnitude {
+        return produced(right.negative,right.magnitude-left.magnitude);
+    }
+    return produced(false,0);
+}
+
+// Checked subtraction as a+(-b). There is no separate underflow rule: 0-1 is
+// the negative value -1, which the declared range then rejects for an
+// unsigned type instead of wrapping around.
+fn subtract(left:Value,right:Value,line:u64,column:u64)->Value {
+    return add(left,negate(right),line,column);
+}
+
+fn multiply(left:Value,right:Value,line:u64,column:u64)->Value {
+    if left.magnitude==0 { return produced(false,0); }
+    if right.magnitude==0 { return produced(false,0); }
+    if right.magnitude>maximum()/left.magnitude { return failure(1,line,column); }
+    if left.negative!=right.negative {
+        return produced(true,left.magnitude*right.magnitude);
+    }
+    return produced(false,left.magnitude*right.magnitude);
+}
+
+// Truncating division toward zero. The one quotient with no signed-magnitude
+// representation is the negation of 2^63, refused as an overflow.
+fn divide(left:Value,right:Value,line:u64,column:u64)->Value {
+    if right.magnitude==0 { return failure(2,line,column); }
+    if left.magnitude==minimum_magnitude() && right.magnitude==1 &&
+       left.negative!=right.negative {
+        return failure(1,line,column);
+    }
+    if left.negative!=right.negative {
+        return produced(true,left.magnitude/right.magnitude);
+    }
+    return produced(false,left.magnitude/right.magnitude);
+}
+
+// The remainder takes the sign of the dividend.
+fn remainder(left:Value,right:Value,line:u64,column:u64)->Value {
+    if right.magnitude==0 { return failure(3,line,column); }
+    if left.negative { return produced(true,left.magnitude%right.magnitude); }
+    return produced(false,left.magnitude%right.magnitude);
+}
+
+// A bitwise operator is undefined on a negative operand here and fails closed
+// rather than reading the high bit of a pattern as a sign.
+fn bitwise(operation:u64,left:Value,right:Value,line:u64,column:u64)->Value {
+    if left.negative { return failure(8,line,column); }
+    if right.negative { return failure(8,line,column); }
+    if operation==38 { return produced(false,left.magnitude&right.magnitude); }
+    if operation==94 { return produced(false,left.magnitude^right.magnitude); }
+    return produced(false,left.magnitude|right.magnitude);
+}
+
+// A shift is undefined on a negative value or a negative amount here. An
+// amount of 64 or more is an invalid shift, and a left shift that would push
+// a bit out of the magnitude domain is an overflow.
+fn shift(operation:u64,left:Value,right:Value,line:u64,column:u64)->Value {
+    if left.negative { return failure(8,line,column); }
+    if right.negative { return failure(8,line,column); }
+    if right.magnitude>=64 { return failure(4,line,column); }
+    if operation==266 {
+        if left.magnitude>maximum()>>right.magnitude { return failure(1,line,column); }
+        return produced(false,left.magnitude<<right.magnitude);
+    }
+    return produced(false,left.magnitude>>right.magnitude);
+}
+
+// Checked binary application. Every status other than 0 or 6 is a numeric
+// failure of the operator itself; status 6 means the token is an operator
+// this evaluator does not implement, such as a comparison or && or ||.
+fn combine(operation:u64,left:Value,right:Value,line:u64,column:u64)->Value {
+    if operation==43 { return add(left,right,line,column); }
+    if operation==45 { return subtract(left,right,line,column); }
+    if operation==42 { return multiply(left,right,line,column); }
+    if operation==47 { return divide(left,right,line,column); }
+    if operation==37 { return remainder(left,right,line,column); }
+    if operation==38||operation==94||operation==124 {
+        return bitwise(operation,left,right,line,column);
+    }
+    if operation==266||operation==267 { return shift(operation,left,right,line,column); }
+    return failure(6,line,column);
+}
+
+// The parser stores every expression shape as node kind 35 and selects the
+// shape with aux: 40 group, 0 name reference, 1 call, a unary operator token
+// for unary forms, and a binary operator token for binary forms. Unary and
+// binary forms share the + - ~ tokens, so the child count, not the token,
+// decides between them.
+fn walk(tree:ntasm_ast.Tree,id:u64,depth:u64)->Value {
+    if id==0||id>tree.node_count {
+        return Value{status:800,negative:false,magnitude:0,line:0,column:0};
+    }
+    let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if depth>=depth_bound() { return failure(7,node.line,node.column); }
+    if node.kind==94 { return produced(false,node.aux); }
+    if node.kind!=35 { return failure(5,node.line,node.column); }
+    let operation:u64=node.aux;
+    let first:u64=node.first_child;
+    let second:u64=next_of(tree,first);
+    let third:u64=next_of(tree,second);
+    if first==0 { return failure(5,node.line,node.column); }
+    if operation==0||operation==1 { return failure(5,node.line,node.column); }
+    if operation==40 {
+        if second!=0 { return failure(5,node.line,node.column); }
+        return walk(tree,first,depth+1);
+    }
+    if second==0 {
+        if operation!=43&&operation!=45&&operation!=126 {
+            return failure(6,node.line,node.column);
+        }
+        let inner:Value=walk(tree,first,depth+1);
+        if inner.status!=0 { return inner; }
+        if operation==43 { return inner; }
+        if operation==126 {
+            // A complement of a negative value is not a sign and a magnitude.
+            if inner.negative { return failure(8,node.line,node.column); }
+            return produced(false,maximum()-inner.magnitude);
+        }
+        return negate(inner);
+    }
+    if third!=0 { return failure(5,node.line,node.column); }
+    let left:Value=walk(tree,first,depth+1);
+    if left.status!=0 { return left; }
+    let right:Value=walk(tree,second,depth+1);
+    if right.status!=0 { return right; }
+    return combine(operation,left,right,node.line,node.column);
+}
+
+// Evaluate the expression rooted at node id. The root is depth 0, so the path
+// from the root to a literal holds at most 64 nodes. This is the same bound
+// and the same root depth as initializer_types.integer_status_depth.
+export fn evaluate(tree:ntasm_ast.Tree,id:u64)->Value {
+    return walk(tree,id,0);
+}

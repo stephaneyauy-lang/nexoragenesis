@@ -1,0 +1,3 @@
+module grammar.test
+target x86_64-nexora-none
+section .text { mov rax,1; }

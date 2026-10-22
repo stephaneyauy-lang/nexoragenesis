@@ -1,0 +1,5 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+references-capacity,FX-limit,file,legacy/ntasm-s0/references-capacity/FX-limit.ntasm,20588,52486e47ea8242b7ddfac4417aa0fd2d766c90d0664c4b2dbbc3736b03452cdc,NG_S0_T12_OK
+references-capacity,FX-over,file,legacy/ntasm-s0/references-capacity/FX-over.ntasm,20598,2decf41279e19df8c2a6886b54173bf888aad4598d7a7c27a4a612673fa5380e,NGS0 E500 L0806 C0005 O00005040
+references-capacity,AD-limit,file,legacy/ntasm-s0/references-capacity/AD-limit.ntasm,9321,797fd7ae828b5a17278b1906410e9b171bb9ec2bd87b78d2fae7ce4ab663185a,NG_S0_T12_OK
+references-capacity,AD-over,file,legacy/ntasm-s0/references-capacity/AD-over.ntasm,9339,9bc5e46f988536653a092691670d8d87d174e8903beb58db9483251d6d9b5ef9,NGS0 E500 L0208 C000C O0000245C

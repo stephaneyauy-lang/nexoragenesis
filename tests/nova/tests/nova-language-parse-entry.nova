@@ -1,0 +1,32 @@
+module nova_language_parse_entry;
+import nova_language_parse;
+
+// LOT 151. The C bootstrap's entry point for the Nova language PARSER.
+//
+// SIX parameters, and the flat slot count is MEASURED, not assumed: this
+// signature is `source:buf<u8>` (two slots), then four `buf<u64>` (eight
+// slots), then `mode:u64` (one), which is ELEVEN flat slots. The lexer's
+// entry, one parameter narrower, measured five and its harness had been
+// written for sixteen -- so the count here is established by the same sweep
+// the lexer gate ran, and the gate for this lot sweeps it again rather than
+// believing the arithmetic.
+// Four modes, selected by the last slot:
+//   mode 0  parse(source, nodes, scopes, binds, fields, out)
+//           the whole artefact: source text in, node tree out.
+//   mode 1  keyword_read_back(out, 0)   the eight, byte per word
+//   mode 2  lattice_read_back(out, 0)    the twelve types, widths and classes
+//   mode 3  shape_read_back(out, 0)      the stride, the result size, the four
+//           refusal codes, the register classes and the node kinds
+//
+// Modes 1, 2 and 3 exist for the same reason: the gate reads its expectations
+// out of the EXECUTED module rather than out of a literal of its own, so a
+// stride or a kind number that changed here moves the gate with it. Mode 3 is
+// the one that matters most -- a harness holding its own copy of the stride
+// would read every node at the wrong offset and still print green numbers.
+export fn main(source:buf<u8>,nodes:buf<u64>,scopes:buf<u64>,binds:buf<u64>,
+               fields:buf<u64>,out:buf<u64>,mode:u64)->u64 {
+    if mode==1 { return nova_language_parse.keyword_read_back(out,0); }
+    if mode==2 { return nova_language_parse.lattice_read_back(out,0); }
+    if mode==3 { return nova_language_parse.shape_read_back(out,0); }
+    return nova_language_parse.parse(source,nodes,scopes,binds,fields,out);
+}

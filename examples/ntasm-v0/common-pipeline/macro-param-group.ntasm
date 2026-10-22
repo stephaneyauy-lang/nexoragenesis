@@ -1,0 +1,12 @@
+module macro_param_group
+target x86_64-nexora-uefi
+macro ret(v:ast.expr)->ast.stmt {
+return quote(stmt) { return $v*(1+2)+1; };
+}
+section .text {
+export fn main(in n:u64 @rcx)->u64
+effects {}
+clobbers {rax} {
+expand ret(n+1)
+}
+}

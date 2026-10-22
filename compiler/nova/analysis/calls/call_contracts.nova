@@ -1,0 +1,1574 @@
+module call_contracts;
+
+import ntasm_ast;
+import features;
+import effects;
+import clobbers;
+import register_widths;
+import abi;
+
+// Call site proof of the ten v0 predicate families. Nothing here assumes a
+// fact: every rule reads the caller's own declarations, which spec 8.1 and 8.2
+// make a closed and complete description of what its body can do.
+//
+// 1 feature(x)        the module feature mask
+// 2 non_null(x)       subject remap
+// 3 canonical(x)      subject remap
+// 4 stack_aligned(n)  the caller fact, or the ABI guarantee for a power of two
+//                     at most 16
+// 5 --                fail-closed default: a recognised name that no v0 rule
+//                     covers is refused, never assumed true
+// 6 stack_in(space)   the caller fact in the same space, and a caller that
+//                     declares no rsp clobber and whose body writes none
+// 7 interrupts_enabled()   the caller fact, and a caller declaring none of
+// 8 interrupts_disabled()  interrupt_state, control or privileged, and a body
+//                          performing none of the instructions that carry them
+// 9 msr_initialized(x)     the caller fact, remapped or selector identical, and
+//                          a caller declaring neither msr nor privileged and a
+//                          body touching neither
+// 10 mapping_present(x)    the remapped caller fact, and a caller that declares
+//                          no write effect and whose body stores nothing
+// 11 valid_user_return(rip,rsp)  the remapped two argument caller fact, and a
+//                          caller that declares no rsp clobber and whose body
+//                          writes none
+//
+// The subject remap is the non_null rule of spec 8.3: a callee subject must be
+// a plain callee in-parameter name, the call argument at that in-parameter
+// position must be a plain caller parameter name, and the caller set must hold
+// the same predicate about that exact name. A literal or computed call
+// argument proves nothing.
+//
+// Each guarded family also carries an invalidation guard, and each guard is
+// the conjunction of two independent halves: what the caller declaration says
+// it may do, and what the caller body can be seen to do. The declaration half
+// alone is not sound, because a declaration is an assertion and only the
+// passes that compose a body against it can tell an assertion from a claim:
+// read alone, effects {} clobbers {} satisfied every guard, so a caller whose
+// body stored, or moved rsp, or executed cli, was given a false proof for
+// stack_in, interrupts_enabled, interrupts_disabled, msr_initialized,
+// mapping_present and valid_user_return. check is a public entry and must be
+// honest on its own, so the body half composes the same predicate from the
+// caller instructions inside this pass. The five guarding passes still run
+// first in validate and in the standalone entry, so the pipeline is a defence
+// in depth over a local check rather than the thing that makes it sound.
+//
+// The body halves under-approximate nothing. The complete rule, read out of
+// the x86_64 conformance oracle, compiler/c/ntasm/backend/x64.c nt_x64_effects,
+// is a disjunction over six shapes for the stack and five for memory:
+//
+// A the body wrote an rsp family register when, for some statement of the
+//   declaration other than the call under proof,
+//   A1 a register destination at position 1 is rsp, sp, spl or esp and the
+//      opcode writes its first operand, the oracle write_operand call sites;
+//   A2 the same at position 2 of xchg, the only two operand writer;
+//   A3 the opcode is push, pushfq, pop, popfq, ret, return, call or iretq,
+//      which x64.c lines 942 to 944 and 1039 give a 1<<4 rsp write with no
+//      rsp operand; sysretq is the one form the oracle leaves out of that
+//      member, because it writes no general purpose register, the only
+//      registers_written it publishes being RFLAGS bit 17 from the shared
+//      tail at x64.c:1069 to :1074, and it is terminal, so no call after it
+//      is reachable;
+//   A4 the statement is align_stack N, spec 10, which body_clobbers composes
+//      as the rsp family and control_flow as a stack adjustment;
+//   A5 the statement is a call statement, which is A3's call reached through
+//      the statement grammar;
+//   A6 the opcode is outside the catalogue nt_x64_encode admits, which is a
+//      refusal and never a no-op.
+// B the body wrote memory when, for some statement of the declaration other
+//   than the call under proof,
+//   B1 the opcode is push, pushfq or call, which x64.c line 945 sets
+//      stack_write on with no memory operand at all, or the statement is a
+//      call statement that is not a balanced frame pair;
+//   B2 a memory operand at position 1 of an opcode that writes its first
+//      operand, or at any position of xchg;
+//   B3 a memory operand at position 2 of an opcode that only reads its second;
+//   B4 any other memory operand position, and any opcode outside the
+//      catalogue, which are the forms the oracle does not anchor.
+//
+// The call under proof is excluded from both halves because a call and the
+// return of its callee are the balanced frame pair, and charging it would
+// make stack_in and valid_user_return unprovable at every call site. That
+// reasoning was then applied to the call under proof alone, and every other
+// call statement in the body was charged outright on the stated ground that
+// whether it is balanced is a frame discipline fact this pass does not
+// check. That ground described the over-estimate rather than a fact about
+// the machine, and it cost a real proof: any caller whose body called a
+// helper lost mapping_present even when the helper provably returns and
+// stores nothing. A nested call is now read the same way the call under
+// proof always was, through balanced_call_pair, and is charged unless the
+// oracle shows the pair balancing. The callee must return, must have a body
+// in this tree, and that body must store nothing; a never callee, an import
+// and a callee that stores all keep the charge, as does a call whose callee
+// the tree does not resolve.
+//
+// The other two halves keep charging every nested call, because there the
+// over-estimate is not a conservative habit but a true statement: a call
+// writes rsp, x64.c line 942 gives it the 1<<4 register write with no operand
+// to name, so stack_in and valid_user_return still refuse a caller that
+// nests a call. Only the memory half is narrowed, and the harness pins both
+// directions of that: the balanced rows prove, and the store, push, never
+// and import rows refuse, each expectation derived from nt_x64_effects.
+//
+// The two halves still over-approximate in the safe direction, and they say
+// so: a caller that pushes and pops around its call, or that names rsp where
+// only cmp and test and bt and mul and div and idiv and invlpg and push and
+// the j forms would not, is refused, because deciding otherwise needs the
+// control flow graph this pass does not build.
+//
+// This rule cannot be delegated to the body_effects table and does not
+// duplicate it. body_effects answers which declared space one memory operand
+// access must be charged to, so it sees only operands that are memory
+// operands and answers 4, a refusal it reports as 336, for a form the oracle
+// does not anchor. A push whose operand is a register has no memory operand,
+// so no per operand table can reach the eight bytes B1 charges, and that eight
+// byte write is exactly the hole that let a push rax body prove
+// mapping_present. form is also private to body_effects, and importing it
+// fails to compile with E302, so the import is not available to this file
+// whatever the answer would have been.
+//
+// stack_aligned keeps its original unguarded caller-fact branch. Adding the
+// rsp guard there would shrink an already accepted set, and that decision
+// belongs to whoever owns that family.
+
+fn same_span(source:buf<u8>,a_start:u64,a_end:u64,
+             b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+fn same_word(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    if start>end || end>len(source) || (end-start)!=len(text) { return false; }
+    let mut i:u64=0;while i<len(text) {
+        if source[start+i]!=text[i] { return false; }i=i+1;
+    }return true;
+}
+
+// Byte-wise membership of the span source[start..end] in a pipe separated
+// closed list. It is member() of the x86_64 conformance oracle,
+// compiler/c/ntasm/backend/x64.c, line 794, so the groups below read like the
+// oracle branches they were read out of.
+fn member(source:buf<u8>,start:u64,end:u64,list:buf<u8>)->bool {
+    if start>end || end>len(source) { return false; }
+    let span:u64=end-start;let mut begin:u64=0;let mut at:u64=0;
+    while at<=len(list) {
+        if at==len(list) || list[at]==124 {
+            if at-begin==span {
+                let mut i:u64=0;let mut equal:bool=true;
+                while i<span {
+                    if source[start+i]!=list[begin+i] { equal=false;i=span; }
+                    i=i+1;
+                }
+                if equal { return true; }
+            }
+            begin=at+1;
+        }
+        at=at+1;
+    }
+    return false;
+}
+
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);
+    let mut id:u64=p.first_child;let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;index=index+1;
+    }
+    if id>tree.node_count { return 0; }return id;
+}
+
+fn decl_name_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if n.kind==18 { return child(tree,id,0); }
+    if n.kind==9 { return child(tree,id,1); }
+    return 0;
+}
+
+// A declaration carries one requires set (kind 22) and one ensures set (kind
+// 23). The parser wraps each predicate set in a keyword node holding a single
+// child of the same kind, so the predicate set is that child. 0 when the
+// declaration has no such clause, which is not an error: a callee without
+// requires constrains nothing.
+fn contract_body_id(tree:ntasm_ast.Tree,id:u64,kind:u64)->u64 {
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let mut child_id:u64=declaration.first_child;
+    while child_id!=0 {
+        if child_id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+        if n.kind==kind {
+            if n.first_child==0 || n.first_child!=n.last_child
+               || n.first_child>tree.node_count { return 0; }
+            let body:ntasm_ast.Node=ntasm_ast.node_at(tree,n.first_child);
+            if body.kind!=kind { return 0; }
+            return n.first_child;
+        }
+        child_id=n.next_sibling;
+    }
+    return 0;
+}
+
+fn predicate_name_id(tree:ntasm_ast.Tree,predicate_id:u64)->u64 {
+    let predicate:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate_id);
+    if predicate.kind!=33 || predicate.first_child==0
+       || predicate.first_child>tree.node_count { return 0; }
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate.first_child);
+    if q.kind!=91 || q.first_child==0 || q.first_child!=q.last_child
+       || q.first_child>tree.node_count { return 0; }
+    return q.first_child;
+}
+
+fn predicate_arg_id(tree:ntasm_ast.Tree,predicate_id:u64,ordinal:u64)->u64 {
+    let predicate:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate_id);
+    if predicate.first_child==0 || predicate.first_child>tree.node_count { return 0; }
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate.first_child);
+    let mut id:u64=q.next_sibling;let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;index=index+1;
+    }
+    if id>tree.node_count { return 0; }return id;
+}
+
+// Argument count of one predicate. 0 also means the shape is unusable, which
+// can then never match a wanted arity of one or two.
+fn predicate_arity(tree:ntasm_ast.Tree,predicate_id:u64)->u64 {
+    if predicate_id==0 || predicate_id>tree.node_count { return 0; }
+    let predicate:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate_id);
+    if predicate.first_child==0 || predicate.first_child>tree.node_count {
+        return 0;
+    }
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate.first_child);
+    let mut id:u64=q.next_sibling;let mut count:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;count=count+1;
+    }
+    return count;
+}
+
+fn simple_name_id(tree:ntasm_ast.Tree,expression_id:u64)->u64 {
+    if expression_id==0 || expression_id>tree.node_count { return 0; }
+    let expression:ntasm_ast.Node=ntasm_ast.node_at(tree,expression_id);
+    if expression.kind!=35 || expression.aux!=0 || expression.first_child==0
+       || expression.first_child!=expression.last_child
+       || expression.first_child>tree.node_count { return 0; }
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,expression.first_child);
+    if q.kind!=91 || q.first_child==0 || q.first_child!=q.last_child
+       || q.first_child>tree.node_count { return 0; }
+    return q.first_child;
+}
+
+fn predicate_family(source:buf<u8>,name:ntasm_ast.Node)->u64 {
+    let f:buf<u8>="feature";if same_word(source,name.start,name.end,f){return 1;}
+    let n:buf<u8>="non_null";if same_word(source,name.start,name.end,n){return 2;}
+    let c:buf<u8>="canonical";if same_word(source,name.start,name.end,c){return 3;}
+    let s:buf<u8>="stack_aligned";
+    if same_word(source,name.start,name.end,s){return 4;}
+    let t:buf<u8>="stack_in";if same_word(source,name.start,name.end,t){return 6;}
+    let e:buf<u8>="interrupts_enabled";
+    if same_word(source,name.start,name.end,e){return 7;}
+    let d:buf<u8>="interrupts_disabled";
+    if same_word(source,name.start,name.end,d){return 8;}
+    let m:buf<u8>="msr_initialized";
+    if same_word(source,name.start,name.end,m){return 9;}
+    let p:buf<u8>="mapping_present";
+    if same_word(source,name.start,name.end,p){return 10;}
+    let v:buf<u8>="valid_user_return";
+    if same_word(source,name.start,name.end,v){return 11;}
+    return 5;
+}
+
+fn parameter_name_id(tree:ntasm_ast.Tree,decl_id:u64,ordinal:u64)->u64 {
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    let mut id:u64=declaration.first_child;let mut index:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==19 {
+            if index==ordinal { return child(tree,id,0); }
+            index=index+1;
+        }
+        id=n.next_sibling;
+    }
+    return 0;
+}
+
+fn parameter_index(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+                   name:ntasm_ast.Node)->u64 {
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    let mut id:u64=declaration.first_child;let mut index:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 18446744073709551615; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==19 {
+            let name_id:u64=child(tree,id,0);
+            if name_id==0 { return 18446744073709551615; }
+            let candidate:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+            if same_span(source,candidate.start,candidate.end,name.start,name.end) {
+                return index;
+            }
+            index=index+1;
+        }
+        id=n.next_sibling;
+    }
+    return 18446744073709551615;
+}
+
+// An out parameter consumes no call argument: its position is skipped when a
+// callee subject is remapped onto a call argument, and a subject that names an
+// out parameter has no argument at all and is never provable. inout keeps its
+// argument like in.
+fn is_out(source:buf<u8>,parameter:ntasm_ast.Node)->bool {
+    if parameter.start>=len(source) || parameter.start+3>len(source) {
+        return false;
+    }
+    return source[parameter.start]==111 && source[parameter.start+1]==117
+       && source[parameter.start+2]==116;
+}
+
+fn in_parameter_index(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+                      name:ntasm_ast.Node)->u64 {
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    let mut id:u64=declaration.first_child;let mut index:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 18446744073709551615; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==19 {
+            let name_id:u64=child(tree,id,0);
+            if name_id==0 { return 18446744073709551615; }
+            let candidate:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+            if same_span(source,candidate.start,candidate.end,name.start,
+                         name.end) {
+                if is_out(source,n) { return 18446744073709551615; }
+                return index;
+            }
+            if is_out(source,n)==false { index=index+1; }
+        }
+        id=n.next_sibling;
+    }
+    return 18446744073709551615;
+}
+
+// Kind 28 is shared by ABI clauses and call statements. Exclude only
+// the known ABI shape (dashed name); malformed calls still reach error 800.
+fn is_call(tree:ntasm_ast.Tree,n:ntasm_ast.Node)->bool {
+    if n.kind==28 {
+        if n.first_child==0 || n.first_child>tree.node_count { return true; }
+        return ntasm_ast.node_at(tree,n.first_child).kind!=92;
+    }
+    return n.kind==35 && n.aux==1;
+}
+
+fn call_name_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+    let qid:u64=child(tree,id,0);if qid==0 { return 0; }
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,qid);
+    if q.kind!=91 || q.last_child==0 || q.last_child>tree.node_count { return 0; }
+    return q.last_child;
+}
+
+fn call_arg_id(tree:ntasm_ast.Tree,id:u64,ordinal:u64)->u64 {
+    let qid:u64=child(tree,id,0);if qid==0 { return 0; }
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,qid);
+    let mut arg:u64=q.next_sibling;let mut index:u64=0;
+    while arg!=0 && index<ordinal {
+        if arg>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,arg);
+        arg=n.next_sibling;index=index+1;
+    }
+    if arg>tree.node_count { return 0; }return arg;
+}
+
+// A caller fact discharges a callee predicate only when the whole predicate
+// matches: same name bytes, same arity, argument for argument. Matching the
+// name and the first argument alone would let valid_user_return(p,q) in the
+// caller satisfy non_null(p) in the callee, so the arity is part of the match.
+//
+// AND IT IS ONLY A MATCH IF THE FACT IS STILL TRUE HERE. Lot 24. A caller's
+// `requires` is a statement about the state on ENTRY, and this function used
+// to read it at a call site in the middle of the body without asking what the
+// body did in between -- so a caller that overwrote its own `@rcx` parameter's
+// register and then called a callee requiring `non_null` of it was credited
+// with a fact that was already false. `caller_caps` cannot see this, and the
+// reason is worth writing down because the bit LOOKS like the answer: bit 8
+// is "no memory write", computed on implicit stack writes and memory
+// operands, and `mov rcx, 7` is neither. A guard over the machine's MEMORY is
+// not a write set over a parameter's LOCATION. The question is therefore
+// asked of abi.fact_is_live, which walks the caller's body up to the call,
+// descends into the callees it meets, and REFUSES rather than assumes when
+// the walk cannot finish. Refusing here can only turn an acceptance into a
+// 326, never the reverse, so it cannot invent a proof.
+fn fact_matches(source:buf<u8>,tree:ntasm_ast.Tree,set_id:u64,arity:u64,
+                wanted_name:ntasm_ast.Node,wanted_first:u64,
+                wanted_second:u64,caller_id:u64,call_id:u64)->bool {
+    if set_id==0 { return false; }
+    let set:ntasm_ast.Node=ntasm_ast.node_at(tree,set_id);
+    let mut pred_id:u64=set.first_child;
+    while pred_id!=0 && pred_id<=tree.node_count {
+        let candidate:ntasm_ast.Node=ntasm_ast.node_at(tree,pred_id);
+        let name_id:u64=predicate_name_id(tree,pred_id);
+        let mut hit:bool=false;
+        if name_id!=0 && predicate_arity(tree,pred_id)==arity {
+            let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+            hit=same_span(source,name.start,name.end,
+                          wanted_name.start,wanted_name.end);
+        }
+        if hit && arity!=0 {
+            hit=wanted_first!=0;
+            if hit {
+                let first:ntasm_ast.Node=ntasm_ast.node_at(tree,wanted_first);
+                let arg0:u64=predicate_arg_id(tree,pred_id,0);
+                if arg0==0 { hit=false; }
+                else {
+                    let a0:ntasm_ast.Node=ntasm_ast.node_at(tree,arg0);
+                    hit=same_span(source,a0.start,a0.end,first.start,first.end);
+                }
+            }
+        }
+        if hit && arity==2 {
+            let second:ntasm_ast.Node=ntasm_ast.node_at(tree,wanted_second);
+            let arg1:u64=predicate_arg_id(tree,pred_id,1);
+            if arg1==0 { hit=false; }
+            else {
+                let a1:ntasm_ast.Node=ntasm_ast.node_at(tree,arg1);
+                hit=same_span(source,a1.start,a1.end,second.start,second.end);
+            }
+        }
+        if hit {
+            // THE ONE SITE THE WHOLE INVALIDATION RULE READS. A predicate that
+            // matches and is no longer true is not a fact, and returning true
+            // here is exactly the stale credit lot 24 exists to remove. The
+            // scan continues rather than stopping, so a caller that carries the
+            // same fact twice -- once destroyed, once not -- is still credited
+            // on the survivor.
+            if abi.fact_is_live(source,tree,caller_id,call_id,pred_id)!=1 {
+                hit=false;
+            }
+        }
+        if hit { return true; }
+        pred_id=candidate.next_sibling;
+    }
+    return false;
+}
+
+// One remapping step: a call argument discharges a callee subject only when it
+// is a plain name that is a parameter of the caller. A literal, a computed
+// expression or a local name proves nothing (spec 8.3).
+fn caller_bound_argument(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,
+                         argument_id:u64)->u64 {
+    if argument_id==0 || argument_id>tree.node_count { return 0; }
+    let name_id:u64=simple_name_id(tree,argument_id);
+    if name_id==0 { return 0; }
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+    if parameter_index(source,tree,caller_id,name)==18446744073709551615 {
+        return 0;
+    }
+    return argument_id;
+}
+
+// The full subject remap: callee in-parameter, then call argument, then caller
+// parameter carrying the same fact. A second_id of 0 asks for a unary
+// predicate; a two argument predicate must remap both subjects and keeps the
+// callee argument order, because the frame predicate is ordered.
+fn subject_proved(source:buf<u8>,tree:ntasm_ast.Tree,callee_id:u64,
+                  caller_id:u64,call_id:u64,pname:ntasm_ast.Node,
+                  subject_id:u64,second_id:u64,arity:u64,
+                  caller_set:u64)->bool {
+    let subject:u64=simple_name_id(tree,subject_id);
+    if subject==0 { return false; }
+    let subject_name:ntasm_ast.Node=ntasm_ast.node_at(tree,subject);
+    let ordinal:u64=in_parameter_index(source,tree,callee_id,subject_name);
+    if ordinal==18446744073709551615 { return false; }
+    let argument:u64=caller_bound_argument(source,tree,caller_id,
+                                          call_arg_id(tree,call_id,ordinal));
+    if argument==0 { return false; }
+    if second_id==0 {
+        return fact_matches(source,tree,caller_set,arity,pname,argument,0,
+                            caller_id,call_id);
+    }
+    let second:u64=simple_name_id(tree,second_id);
+    if second==0 { return false; }
+    let second_name:ntasm_ast.Node=ntasm_ast.node_at(tree,second);
+    let second_ordinal:u64=in_parameter_index(source,tree,callee_id,
+                                              second_name);
+    if second_ordinal==18446744073709551615 { return false; }
+    let second_argument:u64=caller_bound_argument(
+        source,tree,caller_id,call_arg_id(tree,call_id,second_ordinal));
+    if second_argument==0 { return false; }
+    return fact_matches(source,tree,caller_set,arity,pname,
+                        argument,second_argument,caller_id,call_id);
+}
+
+// stack_in takes a space, not a value, so its argument is matched against the
+// closed v0 space catalogue of spec section 7 instead of being remapped. Any
+// other spelling is refused rather than treated as an unknown space.
+fn is_space(source:buf<u8>,node:ntasm_ast.Node)->bool {
+    let a:buf<u8>="user";if same_word(source,node.start,node.end,a){return true;}
+    let b:buf<u8>="kernel";if same_word(source,node.start,node.end,b){return true;}
+    let c:buf<u8>="physical";
+    if same_word(source,node.start,node.end,c){return true;}
+    let d:buf<u8>="mmio";if same_word(source,node.start,node.end,d){return true;}
+    let e:buf<u8>="device";
+    if same_word(source,node.start,node.end,e){return true;}
+    let f:buf<u8>="firmware";
+    return same_word(source,node.start,node.end,f);
+}
+
+fn set_id_of(tree:ntasm_ast.Tree,decl_id:u64,kind:u64)->u64 {
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    let mut id:u64=declaration.first_child;
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==kind { return id; }
+        id=n.next_sibling;
+    }
+    return 0;
+}
+
+// The declaration halves of the invalidation guard. Each answers what the
+// caller said it may do; the body halves below answer what its own body can
+// be seen to do, and caller_caps ANDs the two.
+
+// The caller may have moved its stack pointer. register_widths family 5 is
+// rsp with the sp, spl and esp aliases, so bit 4 of the clobber family mask.
+// An absent or unusable set reads as "may have moved", never as a pass.
+fn moves_stack(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+               scratch:buf<u64>)->bool {
+    let set_id:u64=set_id_of(tree,decl_id,21);
+    if set_id==0 { return true; }
+    if clobbers.summarize(source,tree,set_id,scratch)!=0 { return true; }
+    if (scratch[0]&16)!=0 { return true; }
+    return false;
+}
+
+// The caller may have performed one of the masked effect atoms. Atom bits are
+// atom index minus one in the v0 vocabulary: privileged 1, msr 5, control 6,
+// interrupt_state 7. An absent or unusable set reads as "may have".
+fn declares_atoms(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,mask:u64,
+                  scratch:buf<u64>)->bool {
+    let set_id:u64=set_id_of(tree,decl_id,20);
+    if set_id==0 { return true; }
+    if effects.summarize(source,tree,set_id,scratch)!=0 { return true; }
+    if (scratch[0]&mask)!=0 { return true; }
+    return false;
+}
+
+// The caller may have stored to memory. A mapping is installed or torn down by
+// a store on a page table, and a store adds the write effect of its space, so
+// any writes_mem entry at all disables the mapping_present rule.
+fn writes_memory(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+                 scratch:buf<u64>)->bool {
+    let set_id:u64=set_id_of(tree,decl_id,20);
+    if set_id==0 { return true; }
+    if effects.summarize(source,tree,set_id,scratch)!=0 { return true; }
+    if scratch[2]!=0 { return true; }
+    return false;
+}
+
+// The body halves. Same three questions, asked of the instructions the
+// declaration owns instead of of the declaration.
+
+// Every shape of body statement a guard can see, as one code so the three body
+// walks below read the same enumeration.
+//  0 nothing: not a statement this declaration owns
+//  1 an instruction, its opcode read through instruction_name
+//  2 align_stack N, node kind 45, spec 10: a statement with no opcode child,
+//    so instruction_name cannot name it and the oracle has no mnemonic for it
+//  3 a call statement, the oracle call form reached through the statement
+//    grammar instead of the instruction grammar
+// The call being proved, call_id, is 0 in every walk except the one that
+// proves it, where it is excluded: a call and the return of its callee are the
+// balanced frame pair, so the call under proof is not a write the guard may
+// charge. Every other call statement in the body is charged, because whether
+// it is balanced is a frame discipline fact this pass does not check.
+fn body_source(tree:ntasm_ast.Tree,decl_id:u64,call_id:u64,id:u64)->u64 {
+    if id==0 || id>tree.node_count || decl_id==0
+       || decl_id>tree.node_count { return 0; }
+    if id==call_id { return 0; }
+    let statement:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let owner:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    if owner.start>statement.start || statement.end>owner.end { return 0; }
+    if statement.kind==32 && statement.aux==0 { return 1; }
+    if statement.kind==45 { return 2; }
+    if statement.kind==28 { return 3; }
+    if statement.kind==35 && statement.aux==1 { return 3; }
+    return 0;
+}
+
+// The opcode name of one instruction, or a zero node when the shape is
+// unusable. A zero node has an empty span, so it belongs to no opcode the
+// catalogue admits, which every walk below reads as the refusal it is and not
+// as a no-op.
+fn instruction_name(tree:ntasm_ast.Tree,id:u64)->ntasm_ast.Node {
+    let empty:ntasm_ast.Node=ntasm_ast.Node{kind:0,token_begin:0,token_end:0,
+        source:0,line:0,column:0,start:0,end:0,first_child:0,last_child:0,
+        next_sibling:0,aux:0};
+    let name_id:u64=child(tree,id,0);
+    if name_id==0 || name_id>tree.node_count { return empty; }
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+    if name.kind!=90 { return empty; }
+    return name;
+}
+
+// True when the operand is a plain register of the rsp family, which is the
+// only shape in which a v0 instruction writes one: a destination is either a
+// register or a memory operand, and a memory operand only forms an address
+// from rsp, which reads it and never moves it. A label and a literal are not
+// registers either, so a branch target and an immediate stay out of the way.
+fn writes_rsp(source:buf<u8>,tree:ntasm_ast.Tree,operand_id:u64)->bool {
+    let name_id:u64=simple_name_id(tree,operand_id);
+    if name_id==0 { return false; }
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+    return register_widths.family(source,name.start,name.end)==5;
+}
+
+// The instructions that write rsp without naming it, so no clobbers set can
+// declare them. It is the whole implicit set, eight long, read out of the
+// oracle member push|pushfq|pop|popfq|ret|return|call of x64.c line 942, which
+// sets registers_read and registers_written to 1<<4 for all seven of them,
+// plus iretq, which x64.c line 1039 sets to registers_read and registers_written
+// both equal to 1<<4. That 1<<4 is the low sixteen bits of the published value
+// and not always the whole of it. The bit 17 that sometimes rides along comes
+// from two DIFFERENT places, which is why no rule generalised from one member
+// of this table fits the others. The tail at x64.c:1069 to :1074 adds bit 17 to
+// whichever of registers_read and registers_written the flags direction names,
+// so popfq gets registers_written 0x20010 and iretq gets 0x20010, while pushfq
+// and ret publish 0x00010. pushfq is the harder case, because its bit 17 does
+// not come from the tail at all: x64.c:953 sets registers_read bit 17 inside
+// the member branch, for pushfq alone, and pushfq touches no flags at all so
+// the tail never fires. pushfq and popfq therefore publish the same low
+// sixteen bits, 0x0010, and differ on bit 17, and neither the mnemonic, nor
+// the spelling, nor the membership of this oracle member predicts which. The
+// set is right, and the reason is the rsp bit each one publishes, which every
+// one of them does; bit 17 is RFLAGS, outside all sixteen families
+// register_widths numbers, and charging it is body_intrinsics' question.
+//
+// call is in the set on the oracle own authority: it is the instruction form
+// of the call statement, and x64.c line 944 does charge it the rsp write, so
+// the earlier claim that v0 models call and return as no register write was
+// false against the declared authoritative oracle even though the balanced
+// frame pair reading is why the call under proof is not itself charged.
+// return is unreachable as an opcode, the lexer makes it the return
+// statement, and it is kept for parity with the oracle member.
+//
+// sysretq is deliberately not here. It writes no general purpose register, and
+// that is the claim, not "it publishes no registers_written": x64.c:1032 sets
+// no registers_written inside the sysretq branch, but the tail at x64.c:1069
+// to :1074 adds bit 17 to every form that touches flags, and x64.c:1036 sets
+// flags_written for sysretq, so nt_x64_effects publishes 0x020000. Bit 17 is
+// RFLAGS, outside all sixteen families register_widths numbers, which is why
+// charging it is body_intrinsics' question and not this one. The earlier
+// wording here said the oracle publishes no registers_written at all, which
+// that tail falsifies. Spec 17.4 says it writes no GPR and spec 8.3 names it
+// as the one form outside the implicit set, so charging it would still
+// contradict the normative rule for a guard. It is also not a fail open to
+// leave it out: x64.c line 1035 makes it terminal, so no call that follows it
+// in the same body is reachable and there is no call site for the fact to be
+// proved false at. align_stack is not in this table either because it is not
+// an instruction: body_source gives it its own code, and spec 10 composes it
+// as the rsp family in body_clobbers and as a stack adjustment in
+// control_flow.
+fn adjusts_stack(source:buf<u8>,name:ntasm_ast.Node)->bool {
+    let a:buf<u8>="push|pushfq|pop|popfq|ret|return|call|iretq";
+    return member(source,name.start,name.end,a);
+}
+
+// Every mnemonic nt_x64_encode admits, in the order of the nt_x64_effects
+// branches it was read out of. A mnemonic outside the closed catalogue is not
+// a form the oracle publishes a footprint for, and the project rule is an
+// explicit refusal and never a no-op, so each of the three body walks below
+// treats it as a writer. That direction costs an accepted proof; the opposite
+// one would invent one.
+fn known_opcode(source:buf<u8>,name:ntasm_ast.Node)->bool {
+    let a:buf<u8>="mov|load|store|movzx|movsx|movsxd|lea|add|adc|sub|sbb|and|or|xor|cmp|test|inc|dec|neg|not|shl|shr|sar|rol|ror|imul|mul|div|idiv|cbw|cwde|cdqe|cwd|cdq|cqo";
+    if member(source,name.start,name.end,a) { return true; }
+    let b:buf<u8>="push|pushfq|pop|popfq|ret|return|call|jmp|je|jne|jb|jae|jbe|ja|jl|jge|jle|jg|js|jns|jo|jno|jp|jnp";
+    if member(source,name.start,name.end,b) { return true; }
+    let c:buf<u8>="sete|setne|setb|setae|setbe|seta|setl|setge|setle|setg|sets|setns|setp|setnp|seto|setno|cmove|cmovne|cmovb|cmovae|cmovbe|cmova|cmovl|cmovge|cmovle|cmovg|cmovs|cmovns|cmovp|cmovnp|cmovo|cmovno|bswap|bt|bts|btr|btc|bsf|bsr|xchg";
+    if member(source,name.start,name.end,c) { return true; }
+    let d:buf<u8>="nop|pause|ud2|cpuid|rdtsc|lfence|sfence|mfence|cli|sti|hlt|swapgs|rdmsr|wrmsr|syscall|sysretq|iretq|read_cr|write_cr|sgdt|sidt|lgdt|lidt|ltr|invlpg|in|out";
+    return member(source,name.start,name.end,d);
+}
+
+// The instructions the oracle never charges a write_operand, that is the ones
+// whose first operand it only reads. cmp and test are the arith group minus
+// its write, x64.c line 872; bt is the bit group minus its write, x64.c line
+// 983; mul, div and idiv set registers_written directly from the operand
+// width instead of through write_operand, x64.c line 930; invlpg only reads,
+// x64.c line 1056; push only reads, x64.c line 950, and its stack write is
+// charged by implicit_stack_write instead; and every j form reads its operand
+// and writes no register, x64.c line 962. This is the exact complement of
+// the oracle write_operand call sites on operand 0, so naming rsp in first
+// position costs the caller its stack fact on every other mnemonic and on
+// none of these.
+fn keeps_first(source:buf<u8>,name:ntasm_ast.Node)->bool {
+    let a:buf<u8>="cmp|test|bt|mul|div|idiv|invlpg|push";
+    if member(source,name.start,name.end,a) { return true; }
+    if name.start>=name.end || name.end>len(source) { return false; }
+    return source[name.start]==106;
+}
+
+// xchg is the one v0 instruction that writes a register it does not name
+// first, so its second operand is a destination too.
+fn is_xchg(source:buf<u8>,name:ntasm_ast.Node)->bool {
+    let word:buf<u8>="xchg";
+    return same_word(source,name.start,name.end,word);
+}
+
+// The caller body may have written an rsp family register.
+fn body_moves_stack(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+                    call_id:u64)->bool {
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let shape:u64=body_source(tree,decl_id,call_id,id);
+        // align_stack writes the rsp family by construction and a call
+        // statement is the oracle call form, which x64.c line 944 charges the
+        // rsp write to.
+        if shape==2 { return true; }
+        if shape==3 { return true; }
+        if shape==1 {
+            let name:ntasm_ast.Node=instruction_name(tree,id);
+            if known_opcode(source,name)==false { return true; }
+            if adjusts_stack(source,name) { return true; }
+            if keeps_first(source,name)==false {
+                if writes_rsp(source,tree,child(tree,id,1)) { return true; }
+                if is_xchg(source,name)
+                   && writes_rsp(source,tree,child(tree,id,2)) { return true; }
+            }
+        }
+        id=id+1;
+    }
+    return false;
+}
+
+// The masked atoms one instruction carries, with the bit numbering the
+// declaration halves use: privileged 1, msr 16, control 32, interrupt_state
+// 64. These are the atoms body_intrinsics composes for the same instruction,
+// and no other atom of the vocabulary reaches either guard, which ask for 97
+// privileged, control and interrupt_state, and 17 msr and privileged, so
+// changes_flags and the ordering atoms are not repeated here. An atom absent
+// from this table is one the guards never ask about, never one they may
+// ignore: the two masks and the body_intrinsics table are read together, and
+// an opcode outside the catalogue never reaches this table at all because
+// body_declares_atoms refuses it before asking.
+fn body_atoms(source:buf<u8>,name:ntasm_ast.Node)->u64 {
+    let cli:buf<u8>="cli";if same_word(source,name.start,name.end,cli){return 65;}
+    let sti:buf<u8>="sti";if same_word(source,name.start,name.end,sti){return 65;}
+    let hlt:buf<u8>="hlt";if same_word(source,name.start,name.end,hlt){return 1;}
+    let popfq:buf<u8>="popfq";
+    if same_word(source,name.start,name.end,popfq){return 1;}
+    let in_:buf<u8>="in";if same_word(source,name.start,name.end,in_){return 1;}
+    let out:buf<u8>="out";if same_word(source,name.start,name.end,out){return 1;}
+    let rdmsr:buf<u8>="rdmsr";
+    if same_word(source,name.start,name.end,rdmsr){return 17;}
+    let wrmsr:buf<u8>="wrmsr";
+    if same_word(source,name.start,name.end,wrmsr){return 17;}
+    let swapgs:buf<u8>="swapgs";
+    if same_word(source,name.start,name.end,swapgs){return 33;}
+    let read_cr:buf<u8>="read_cr";
+    if same_word(source,name.start,name.end,read_cr){return 33;}
+    let write_cr:buf<u8>="write_cr";
+    if same_word(source,name.start,name.end,write_cr){return 33;}
+    let syscall:buf<u8>="syscall";
+    if same_word(source,name.start,name.end,syscall){return 32;}
+    let sysretq:buf<u8>="sysretq";
+    if same_word(source,name.start,name.end,sysretq){return 33;}
+    let iretq:buf<u8>="iretq";if same_word(source,name.start,name.end,iretq){return 33;}
+    let sgdt:buf<u8>="sgdt";if same_word(source,name.start,name.end,sgdt){return 33;}
+    let sidt:buf<u8>="sidt";if same_word(source,name.start,name.end,sidt){return 33;}
+    let lgdt:buf<u8>="lgdt";if same_word(source,name.start,name.end,lgdt){return 33;}
+    let lidt:buf<u8>="lidt";if same_word(source,name.start,name.end,lidt){return 33;}
+    let ltr:buf<u8>="ltr";if same_word(source,name.start,name.end,ltr){return 33;}
+    let invlpg:buf<u8>="invlpg";
+    if same_word(source,name.start,name.end,invlpg) { return 33; }
+    return 0;
+}
+
+// The caller body may have performed one of the masked atoms.
+fn body_declares_atoms(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+                       call_id:u64,mask:u64)->bool {
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let shape:u64=body_source(tree,decl_id,call_id,id);
+        // align_stack carries no atom, and the oracle gives the call form no
+        // effect and no privilege level either, x64.c line 942.
+        if shape==1 {
+            let name:ntasm_ast.Node=instruction_name(tree,id);
+            // A mnemonic the oracle publishes no footprint for may carry any
+            // atom, so it is read as carrying all of them.
+            if known_opcode(source,name)==false { return true; }
+            if (body_atoms(source,name)&mask)!=0 { return true; }
+        }
+        id=id+1;
+    }
+    return false;
+}
+
+// The three mnemonics the oracle charges a stack write to with no memory
+// operand at all: x64.c line 945, member push|pushfq|call, sets
+// e.stack_write=1 and x64.c line 948 gives stack_read instead to pop, popfq,
+// ret and return. The eight bytes land in the space the stack is in, which is
+// a space the v0 catalogue has no name for, so no per operand table over
+// memory operands can ever see this write. It is also why call_contracts
+// cannot consume the body_effects table instead of holding this rule: the two
+// answer different questions, this one whether a body wrote memory at all and
+// body_effects which declared space an operand access must be charged to.
+fn implicit_stack_write(source:buf<u8>,name:ntasm_ast.Node)->bool {
+    let a:buf<u8>="push|pushfq|call";
+    return member(source,name.start,name.end,a);
+}
+
+// Whether a memory operand at one position of one instruction is a write,
+// straight off the oracle write_operand call sites. Position 0 is the opcode,
+// position 1 is the first operand and position 2 the second, which is the
+// numbering body_effects walks. A first operand is a write on every mnemonic
+// the oracle writes through write_operand, which is every mnemonic outside
+// keeps_first. A second operand is a write only for xchg, whose two write_operand
+// calls at x64.c lines 997 and 998 are the only pair in the oracle; it is a
+// read for the sources of the read_operand groups and an address, not an
+// access, for lea. Every other position is a form the oracle does not anchor,
+// and an unanchored form is a refusal that costs an accepted proof, never
+// one that invents it.
+//
+// lgdt, lidt and ltr answer write where body_effects answers read, and this
+// used to be described here as a divergence "on purpose and never downward".
+// That description was wrong twice over and the code says so plainly. The
+// oracle reads their descriptor, x64.c:1050 to :1056 calls read_operand for
+// every member of the descriptor group except invlpg, so nt_x64_effects
+// publishes memory_read 1 and memory_write 0 for all three, and body_effects
+// charges them that read. This table answers only whether an operand is a
+// WRITE, so it cannot answer read, and it answers write for them. But nobody
+// weighed the read against the write: they are simply absent from keeps_first
+// and from its 'j' branch, so position 1 falls through to the answer at the
+// end of the function, which is write. invlpg is the one member of the group
+// that keeps_first names outright, and that single fact is the whole reason
+// invlpg is not in this group. So the direction is safe by the fallthrough
+// rather than by an argument, which is a weaker guarantee than it looks:
+// anything the list is next edited to name stops being a write here for a
+// reason no comment will record. Anyone who wants these three to diverge
+// deliberately has to write the decision down, and to give it a test that
+// fails when the list changes.
+//
+// The reason this comment gave before all of that, that the oracle charges
+// them neither a read nor a write, was simply false, and is what wave 5 lot
+// 6 recorded as a false comment. Then load in first position, which the
+// encoder refuses and the oracle would charge through its mov group, is a
+// write here; and bsf, bsr and the cmov forms in first position, which the
+// encoder also refuses, are writes here.
+fn memory_operand_writes(source:buf<u8>,name:ntasm_ast.Node,position:u64)->bool {
+    if position==1 {
+        if keeps_first(source,name) { return false; }
+        return true;
+    }
+    if position==2 {
+        if is_xchg(source,name) { return true; }
+        let a:buf<u8>="mov|store|load|movzx|movsx|movsxd|lea|add|adc|sub|sbb|and|or|xor|cmp|test|imul|bsf|bsr|bt|bts|btr|btc|in|out|write_cr";
+        if member(source,name.start,name.end,a) { return false; }
+        let b:buf<u8>="cmove|cmovne|cmovb|cmovae|cmovbe|cmova|cmovs|cmovns|cmovp|cmovnp|cmovl|cmovge|cmovle|cmovg|cmovo|cmovno";
+        if member(source,name.start,name.end,b) { return false; }
+    }
+    return true;
+}
+
+// The declaration one call statement names, 0 when the name matches no
+// declaration in this tree. It is the same span comparison check itself
+// performs, so the callee the narrowing reads is the callee the proof is
+// about and never a second reader of the call grammar. An import declaration
+// is kind 9 and carries no body in this tree, so it resolves to an id whose
+// body walk finds nothing; the caller treats that as unreadable, not empty.
+fn call_callee(source:buf<u8>,tree:ntasm_ast.Tree,call_id:u64)->u64 {
+    let name_id:u64=call_name_id(tree,call_id);
+    if name_id==0 { return 0; }
+    let called:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+    let mut callee_id:u64=0;
+    let mut d:u64=1;
+    while d<=tree.node_count {
+        let decl:ntasm_ast.Node=ntasm_ast.node_at(tree,d);
+        if decl.kind==18 || decl.kind==9 {
+            let dn_id:u64=decl_name_id(tree,d);
+            if dn_id!=0 {
+                let dn:ntasm_ast.Node=ntasm_ast.node_at(tree,dn_id);
+                if same_span(source,dn.start,dn.end,called.start,called.end) {
+                    callee_id=d;
+                }
+            }
+        }
+        d=d+1;
+    }
+    return callee_id;
+}
+
+// Whether one nested call statement is a balanced frame pair, which is the
+// same reason the call under proof is not charged against itself: a call and
+// the return of its callee push and pop the same eight bytes. The oracle
+// gives call and push the same stack_write, x64.c:945 and :946, and gives
+// return a stack_read, x64.c:948, so the pair is the same eight bytes on the
+// oracle's own authority and not by a reading of this file.
+//
+// The pair balances only when the callee returns. A never callee never
+// returns, so nothing pops what the call pushed, and the charge stands. So
+// does a callee this tree cannot read, an import with no body here, because
+// an unreadable body is not an empty one. And so does a callee whose own body
+// stores or pushes: that memory reaches the caller whatever the frame does,
+// which is the question the guard asks and the one the balanced pair was
+// never a licence to ignore.
+fn balanced_call_pair(source:buf<u8>,tree:ntasm_ast.Tree,call_id:u64,
+                      call_id_under_proof:u64,depth:u64)->bool {
+    let callee_id:u64=call_callee(source,tree,call_id);
+    if callee_id==0 { return false; }
+    let callee:ntasm_ast.Node=ntasm_ast.node_at(tree,callee_id);
+    // An import carries no body here, so its body cannot be shown empty.
+    if callee.kind!=18 { return false; }
+    if is_never(source,tree,callee_id) { return false; }
+    if body_writes_memory_depth(source,tree,callee_id,call_id_under_proof,
+                                depth-1) {
+        return false;
+    }
+    return true;
+}
+
+// The caller body may have written memory. Three shapes answer it: an
+// instruction, charged on its implicit stack write and on the memory
+// operands the oracle anchors to a write; an alignment statement, which
+// writes none, so shape 2 is not charged; and a call, kind 28 or kind 35
+// with aux 1, charged only when it is not a balanced frame pair.
+//
+// A call used to be charged outright here, on the reading that the callee
+// effects are not read. That refused every caller whose body held a second
+// call, which is the ordinary shape of a program that calls a helper, and it
+// refused a mapping_present that is in fact true: the call and the callee
+// return push and pop the same eight bytes, so the call itself writes nothing
+// the caller does not get back. The narrowing charges a nested call exactly
+// when the frame is not balanced, which balanced_call_pair reads off the
+// callee: it must return, it must have a body in this tree, and that body
+// must store nothing. Every one of those three is a refusal, so a callee
+// that never returns, an import, and a callee that stores all keep the
+// charge, and a call whose callee cannot be resolved keeps it too.
+//
+// The walk descends into the callee body, so a chain of helpers is followed
+// to its end rather than charged at the first link. That descent is what
+// makes a cycle possible, and the depth bound is what closes it: at depth 0
+// the walk charges without descending, which is the direction that refuses,
+// so mutual recursion costs a proof and never a soundness. The bound is
+// checked before the descent and never after, so it cannot be the thing that
+// admits a write.
+fn body_writes_memory_depth(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+                            call_id:u64,depth:u64)->bool {
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let shape:u64=body_source(tree,decl_id,call_id,id);
+        // shape 3 is a call, not align_stack. It is charged unless it is a
+        // balanced frame pair, and it is charged outright once the walk has
+        // no depth left to follow a callee with.
+        if shape==3 {
+            if depth==0 { return true; }
+            if balanced_call_pair(source,tree,id,call_id,depth)==false {
+                return true;
+            }
+        }
+        if shape==1 {
+            let name:ntasm_ast.Node=instruction_name(tree,id);
+            if known_opcode(source,name)==false { return true; }
+            if implicit_stack_write(source,name) { return true; }
+            let mut operand_id:u64=child(tree,id,0);
+            let mut position:u64=0;
+            while operand_id!=0 {
+                if operand_id>tree.node_count { return true; }
+                let operand:ntasm_ast.Node=ntasm_ast.node_at(tree,operand_id);
+                if operand.kind==34 {
+                    if memory_operand_writes(source,name,position) {
+                        return true;
+                    }
+                }
+                operand_id=operand.next_sibling;
+                position=position+1;
+            }
+        }
+        id=id+1;
+    }
+    return false;
+}
+
+// The entry the caller_caps guard asks, at the depth bound the module
+// declares. The bound is the number of declarations in the tree, which no
+// call chain can exceed, so a chain of helpers is always followed to its end
+// and only a cycle is cut.
+fn body_writes_memory(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+                      call_id:u64)->bool {
+    let mut declarations:u64=0;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==18 || n.kind==9 { declarations=declarations+1; }
+        id=id+1;
+    }
+    if declarations==0 { return true; }
+    return body_writes_memory_depth(source,tree,decl_id,call_id,declarations);
+}
+
+// Guard bits handed to prove: 1 the stack cannot move, 2 the interrupt state
+// cannot change, 4 no MSR access, 8 no memory write. A bit is set only when
+// the declaration half and the body half of its guard both say the machine
+// state the fact names is untouched, so the pass is sound called on its own
+// and not only behind the five passes that would have caught the lie first.
+// The body half is asked per call site, with that call node excluded, so the
+// balanced frame pair under proof is not charged against itself and every
+// other call in the body is.
+fn caller_caps(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,call_id:u64,
+               scratch:buf<u64>)->u64 {
+    let mut caps:u64=0;
+    if moves_stack(source,tree,caller_id,scratch)==false
+       && body_moves_stack(source,tree,caller_id,call_id)==false { caps=caps|1; }
+    // cli and sti carry interrupt_state, sysretq, iretq, swapgs and the control
+    // register operations carry control, and all of them are privileged.
+    if declares_atoms(source,tree,caller_id,97,scratch)==false
+       && body_declares_atoms(source,tree,caller_id,call_id,97)==false {
+        caps=caps|2;
+    }
+    if declares_atoms(source,tree,caller_id,17,scratch)==false
+       && body_declares_atoms(source,tree,caller_id,call_id,17)==false {
+        caps=caps|4;
+    }
+    if writes_memory(source,tree,caller_id,scratch)==false
+       && body_writes_memory(source,tree,caller_id,call_id)==false {
+        caps=caps|8;
+    }
+    return caps;
+}
+
+// A never function has no return, so its ensures describes the state at the
+// transfer point and not a return that does not exist (spec 8.3). The return
+// type is the first kind 36 child of the declaration; only a bare name can be
+// never, every composite type carries an inner type node instead.
+fn is_never(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64)->bool {
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);
+    let mut id:u64=declaration.first_child;
+    while id!=0 {
+        if id>tree.node_count { return false; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==36 {
+            if n.first_child==0 || n.first_child!=n.last_child
+               || n.first_child>tree.node_count { return false; }
+            let name:ntasm_ast.Node=ntasm_ast.node_at(tree,n.first_child);
+            if name.kind!=90 { return false; }
+            let never:buf<u8>="never";
+            return same_word(source,name.start,name.end,never);
+        }
+        id=n.next_sibling;
+    }
+    return false;
+}
+
+// Prove one callee requires predicate. 1 when the caller carries the fact, 0
+// when it cannot, 800 on a malformed tree.
+fn prove(source:buf<u8>,tree:ntasm_ast.Tree,callee_id:u64,caller_id:u64,
+         call_id:u64,pred_id:u64,caller_set:u64,feature_mask:u64,
+         caps:u64)->u64 {
+    let pname_id:u64=predicate_name_id(tree,pred_id);
+    if pname_id==0 { return 800; }
+    let pname:ntasm_ast.Node=ntasm_ast.node_at(tree,pname_id);
+    let family:u64=predicate_family(source,pname);
+    if family==5 { return 0; }
+    let arity:u64=predicate_arity(tree,pred_id);
+    if family==7 || family==8 {
+        if arity!=0 { return 800; }
+        if (caps&2)==0 { return 0; }
+        if fact_matches(source,tree,caller_set,0,pname,0,0,
+                        caller_id,call_id) { return 1; }
+        return 0;
+    }
+    if arity==0 { return 800; }
+    let arg0:u64=predicate_arg_id(tree,pred_id,0);
+    if arg0==0 { return 800; }
+    if family==1 {
+        let feature_name_id:u64=simple_name_id(tree,arg0);
+        if feature_name_id==0 { return 0; }
+        let feature_name:ntasm_ast.Node=ntasm_ast.node_at(tree,feature_name_id);
+        let bit:u64=features.lookup(source,feature_name.start,feature_name.end);
+        if bit!=0 && (feature_mask&bit)!=0 { return 1; }
+        return 0;
+    }
+    // The ceiling of 16 binds BOTH branches, and it binds them on the CALLEE
+    // argument. It used to bind only the ABI branch below, which made the
+    // caller-fact branch a way around it: a caller carrying
+    // stack_aligned(32) byte-matched a callee stack_aligned(32) and the call
+    // was proved. spec 17.3 states the ceiling once and excludes 32 by name,
+    // and the C oracle refuses the same source with 503, so the caller-fact
+    // branch was a fail-open and not a second reading. The guard is
+    // conservative in the only direction the invalidation rule allows: it can
+    // turn an acceptance into a refusal and never the reverse, so it cannot
+    // invent a proof. A callee argument that is not an integer literal at all
+    // is refused here rather than left to the byte match, because
+    // stack_aligned(N) names an alignment and a name is not one.
+    if family==4 {
+        let parg:ntasm_ast.Node=ntasm_ast.node_at(tree,arg0);
+        if parg.kind!=94 || parg.aux==0 || parg.aux>16
+           || (16%parg.aux)!=0 { return 0; }
+        if fact_matches(source,tree,caller_set,1,pname,arg0,0,
+                        caller_id,call_id) { return 1; }
+        return 1;
+    }
+    if family==6 {
+        if (caps&1)==0 { return 0; }
+        let parg:ntasm_ast.Node=ntasm_ast.node_at(tree,arg0);
+        if is_space(source,parg)==false { return 0; }
+        if fact_matches(source,tree,caller_set,1,pname,arg0,0,
+                        caller_id,call_id) { return 1; }
+        return 0;
+    }
+    if family==9 {
+        if (caps&4)==0 { return 0; }
+        if simple_name_id(tree,arg0)!=0 {
+            if subject_proved(source,tree,callee_id,caller_id,call_id,
+                              pname,arg0,0,1,caller_set) { return 1; }
+            return 0;
+        }
+        if fact_matches(source,tree,caller_set,1,pname,arg0,0,
+                        caller_id,call_id) { return 1; }
+        return 0;
+    }
+    if family==10 {
+        if (caps&8)==0 { return 0; }
+        if simple_name_id(tree,arg0)!=0 {
+            if subject_proved(source,tree,callee_id,caller_id,call_id,
+                              pname,arg0,0,1,caller_set) { return 1; }
+            return 0;
+        }
+        if fact_matches(source,tree,caller_set,1,pname,arg0,0,
+                        caller_id,call_id) { return 1; }
+        return 0;
+    }
+    if family==11 {
+        if (caps&1)==0 { return 0; }
+        let arg1:u64=predicate_arg_id(tree,pred_id,1);
+        if arg1==0 { return 800; }
+        if simple_name_id(tree,arg0)==0 || simple_name_id(tree,arg1)==0 {
+            return 0;
+        }
+        if subject_proved(source,tree,callee_id,caller_id,call_id,
+                          pname,arg0,arg1,2,caller_set) { return 1; }
+        return 0;
+    }
+    if subject_proved(source,tree,callee_id,caller_id,call_id,
+                      pname,arg0,0,1,caller_set) { return 1; }
+    return 0;
+}
+
+// Coverage of one callee ensures predicate by the caller own ensures. Spec 8.3
+// only says the caller state is then updated by the callee ensures, and no v0
+// pass consumes the caller entry facts, so the transferred facts would have no
+// observer. Requiring the caller to re-declare them is the conservative
+// reading of "every call verifies ensures" in spec 16: a callee postcondition
+// the caller drops is reported instead of being transferred silently. This is
+// a coverage test only; nothing here checks the caller declaration against the
+// caller body. A predicate argument that is a plain name is covered only
+// through the remap, so a callee local can never be matched against a caller
+// parameter of the same spelling; the stack_in space name and every non name
+// argument are compared byte for byte.
+fn covers(source:buf<u8>,tree:ntasm_ast.Tree,callee_id:u64,caller_id:u64,
+          call_id:u64,pred_id:u64,caller_ens:u64)->bool {
+    let pname_id:u64=predicate_name_id(tree,pred_id);
+    if pname_id==0 { return false; }
+    let pname:ntasm_ast.Node=ntasm_ast.node_at(tree,pname_id);
+    let family:u64=predicate_family(source,pname);
+    if family==5 { return false; }
+    let arity:u64=predicate_arity(tree,pred_id);
+    if arity==0 {
+        return fact_matches(source,tree,caller_ens,0,pname,0,0,
+                            caller_id,call_id);
+    }
+    let arg0:u64=predicate_arg_id(tree,pred_id,0);
+    if arg0==0 { return false; }
+    if family==6 {
+        let parg:ntasm_ast.Node=ntasm_ast.node_at(tree,arg0);
+        if is_space(source,parg)==false { return false; }
+        return fact_matches(source,tree,caller_ens,1,pname,arg0,0,
+                            caller_id,call_id);
+    }
+    if arity==1 {
+        if simple_name_id(tree,arg0)!=0 {
+            return subject_proved(source,tree,callee_id,caller_id,call_id,
+                                  pname,arg0,0,1,caller_ens);
+        }
+        return fact_matches(source,tree,caller_ens,1,pname,arg0,0,
+                            caller_id,call_id);
+    }
+    if arity!=2 { return false; }
+    let arg1:u64=predicate_arg_id(tree,pred_id,1);
+    if arg1==0 { return false; }
+    if simple_name_id(tree,arg1)==0 { return false; }
+    return subject_proved(source,tree,callee_id,caller_id,call_id,
+                          pname,arg0,arg1,2,caller_ens);
+}
+
+// Prove the ten predicate families at each call, then transfer the callee
+// ensures. Success writes declarations,calls,proved predicates,0, where proved
+// counts both proven requires predicates and covered ensures predicates. 326
+// writes call position, family 1 feature/2 non_null/3 canonical/4 stack
+// aligned/5 recognized but uncovered by any v0 rule/6 stack_in/7 interrupts
+// enabled/8 interrupts disabled/9 msr initialized/10 mapping present/11 valid
+// user return, and the callee requires predicate ordinal. 365 writes the
+// uncovered callee ensures predicate position, reason 1, and its ordinal. 800
+// is transactional on invalid AST shape.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+    let feature_summary:buf<u64>=alloc(runtime(),4);
+    let guard:buf<u64>=alloc(runtime(),4);
+    let mut feature_code:u64=features.check(source,tree,feature_summary);
+    if feature_code!=0 {
+        rt_free(runtime(),feature_summary);rt_free(runtime(),guard);return 800;
+    }
+    let feature_mask:u64=feature_summary[2];
+    let mut declarations:u64=0;let mut calls:u64=0;let mut proved:u64=0;
+    let mut code:u64=0;let mut err_line:u64=0;let mut err_column:u64=0;
+    let mut err_family:u64=0;let mut err_index:u64=0;let mut err_reason:u64=0;
+    let mut id:u64=1;while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==18 || n.kind==9 { declarations=declarations+1; }
+        id=id+1;
+    }
+    id=1;
+    while id<=tree.node_count && code==0 {
+        let call:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if is_call(tree,call) {
+            calls=calls+1;let name_id:u64=call_name_id(tree,id);
+            if name_id==0 { code=800; }
+            else {
+                let called:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                let mut caller_id:u64=0;let mut callee_id:u64=0;let mut d:u64=1;
+                while d<=tree.node_count {
+                    let decl:ntasm_ast.Node=ntasm_ast.node_at(tree,d);
+                    if decl.kind==18 || decl.kind==9 {
+                        let dn_id:u64=decl_name_id(tree,d);
+                        if dn_id!=0 {
+                            let dn:ntasm_ast.Node=ntasm_ast.node_at(tree,dn_id);
+                            if same_span(source,dn.start,dn.end,called.start,called.end) {
+                                callee_id=d;
+                            }
+                        }
+                        if decl.kind==18 && decl.start<=call.start
+                           && call.end<=decl.end { caller_id=d; }
+                    }
+                    d=d+1;
+                }
+                if caller_id==0 || callee_id==0 { code=800; }
+                else {
+                    let caller_req:u64=contract_body_id(tree,caller_id,22);
+                    let callee_req:u64=contract_body_id(tree,callee_id,22);
+                    let caps:u64=caller_caps(source,tree,caller_id,id,guard);
+                    if callee_req!=0 {
+                        let set:ntasm_ast.Node=ntasm_ast.node_at(tree,callee_req);
+                        let mut pred_id:u64=set.first_child;let mut ordinal:u64=0;
+                        while pred_id!=0 && code==0 {
+                            let verdict:u64=prove(source,tree,callee_id,
+                                                  caller_id,id,pred_id,
+                                                  caller_req,feature_mask,caps);
+                            if verdict==800 { code=800; }
+                            else if verdict==0 {
+                                code=326;err_line=called.line;
+                                err_column=called.column;err_family=
+                                    predicate_family(source,ntasm_ast.node_at(
+                                        tree,predicate_name_id(tree,pred_id)));
+                                err_index=ordinal;
+                            } else { proved=proved+1; }
+                            let predicate:ntasm_ast.Node=
+                                ntasm_ast.node_at(tree,pred_id);
+                            pred_id=predicate.next_sibling;ordinal=ordinal+1;
+                        }
+                    }
+                    // A call to a never callee never comes back, so it produces
+                    // no caller post state and owes no ensures coverage.
+                    let callee_ens:u64=contract_body_id(tree,callee_id,23);
+                    if code==0 && callee_ens!=0
+                       && (is_never(source,tree,callee_id)==false
+                           || is_never(source,tree,caller_id)==true) {
+                        let caller_ens:u64=contract_body_id(tree,caller_id,23);
+                        let ens:ntasm_ast.Node=ntasm_ast.node_at(tree,callee_ens);
+                        let mut pred_id:u64=ens.first_child;let mut ordinal:u64=0;
+                        while pred_id!=0 && code==0 {
+                            if covers(source,tree,callee_id,caller_id,id,
+                                      pred_id,caller_ens)==false {
+                                let pname:ntasm_ast.Node=ntasm_ast.node_at(
+                                    tree,predicate_name_id(tree,pred_id));
+                                code=365;err_line=pname.line;err_column=pname.column;
+                                err_reason=1;err_index=ordinal;
+                            } else { proved=proved+1; }
+                            let predicate:ntasm_ast.Node=
+                                ntasm_ast.node_at(tree,pred_id);
+                            pred_id=predicate.next_sibling;ordinal=ordinal+1;
+                        }
+                    }
+                }
+            }
+        }
+        id=id+1;
+    }
+    if code==0 { out[0]=declarations;out[1]=calls;out[2]=proved;out[3]=0; }
+    else if code==326 {
+        out[0]=err_line;out[1]=err_column;out[2]=err_family;out[3]=err_index;
+    } else if code==365 {
+        out[0]=err_line;out[1]=err_column;out[2]=err_reason;out[3]=err_index;
+    }
+    rt_free(runtime(),feature_summary);
+    rt_free(runtime(),guard);
+    return code;
+}
+
+// ===================== RSP AND THE CHANNEL THAT COULD CARRY IT ============
+// This note is at the foot of the file on purpose. implicit_stack_write above
+// is where a reader of the stack-write rule lands, and putting this text there
+// moved every line below it, which broke five line citations in spec/ntasm/ntasm.md
+// and turned the registry gate red on an IDENT-MISSING it correctly caught. A
+// finding that costs the document its anchors has to be written somewhere the
+// document does not reach, and nothing cites past line 1071.
+//
+// THE REFERENCE HAS A SECOND FIELD AND THE PRODUCT HAS NO WAY TO DECLARE IT.
+// `stack_write` is a field of its own beside the register mask, not inside it
+// (x64.h:110, next to `memory_read` and `memory_write`), and x64.c:945 sets it
+// for push, pushfq and call while x64.c:948 gives `stack_read` instead to pop,
+// popfq, ret and return. That is the same shape as `changes_flags` duplicating
+// bit 17: ONE obligation published in TWO channels, so a consumer can read
+// whichever one it can discharge. The product projects the register mask, and
+// implicit_stack_write reads the stack field, and NOTHING projects the stack
+// field into something a programmer can write.
+//
+// So the third channel does not exist, and the reason is that NOBODY HAS BUILT
+// IT rather than that the language forbids it. Measured by gate, not asserted
+// here: `tests_ntasm_call_contracts.c` asks the pipeline to accept
+// `effects {stack_write}` and is refused `321` reason 1 at the name, with
+// byte-for-byte the verdict of the misspelling `stack_writ`, while
+// `effects {writes_mem}` in the same position is ACCEPTED. The atom channel is
+// live and has no row for this name. A twelfth row over the same eleven bits
+// could not name it either, and this is the part that is easy to get wrong:
+// `stack_write` is not an atom at all, it is a field BESIDE the mask, so the
+// eleven rows of atom_kind are a complete projection of the reference's
+// eleven `effects` positions (x64.h:92-104) and are not missing one.
+//
+// A FUNCTION CAN DECLARE THAT IT WRITES `rsp` TODAY. `clobbers {rsp}` is
+// accepted on a body whose only stack writer is its own return, which
+// abi.nova:513-518 asserts in capitals and the gate now measures at run time.
+// Nothing forbids the declaration. Nothing verifies it either, and that pair
+// of facts is the whole of the answer: the subset rule in call_clobbers
+// compares callee against caller and never the reverse, so no callee reads its
+// caller's set and a false declaration is invisible to the pass that would
+// catch it.
+//
+// AND THE DECLARATION IS NOT LOCAL. This is the cost, and it is a different
+// cost from the one the A4 reserve names. A callee that declares the frame
+// family refuses its caller in `331` with the missing family bit until the
+// caller declares it too, and that obligation climbs the call graph to every
+// ancestor at any depth. So putting `rsp` in a `clobbers` set costs a FIXPOINT
+// OVER THE CALL GRAPH, not one entry in each of some number of bodies, and a
+// count of bodies cannot express it.
+//
+// THE DECISION IS TAKEN, and it is the frame. The `rsp` write is a property of
+// the FRAME and it belongs to the frame rule. It is not a register property and
+// it does not belong in a `clobbers` set. The `clobbers` set above is correct
+// as it stands and nothing in this file narrows it, and the two halves of that
+// sentence are the two halves of the reason.
+//
+// The reason is spec 8.2: `clobbers` is the set of registers whose ENTRY VALUE
+// is not restored at the boundary, and `rsp` IS restored. Both halves of that
+// were read in the bytes before this paragraph was written, because the
+// decision is one the owner of this lot had already had wrong.
+//
+// THE RESTORATION, REFERENCE SIDE. The reference epilogue is codegen.c:871 to
+// :911 and its FIRST act is `mov rsp,rbp` at codegen.c:872, unconditionally,
+// before any of the thirteen and before `ret`. `rsp` is not restored by
+// balancing pushes; it is reloaded from the frame pointer, so no sequence of
+// body instructions can leave it wrong at the boundary. The thirteen it then
+// pops are codegen.c:93 to :94 and they do not contain 4 or 5: `rsp` and `rbp`
+// are not among the registers a declaration can spend. The same file says the
+// same thing in prose at codegen.c:37 to :58, and the product's epilogue is the
+// same instruction in the same position in the sequence, x64_lower_nxo.nova
+// :2547, followed by its own `ret` at :2566. The reference also declines to
+// charge a balanced call, but the two facts the old sentence ran together are
+// at DIFFERENT lines and the citation has been corrected against them:
+// frontend.c:5506 to :5508 is the one that clears BIT(4), reading
+// `effective_writes &= ~BIT(4); /* balanced CALL/RET stack motion */` under a
+// `call_indirect` test, while frontend.c:5493 to :5498 is a different rule
+// entirely -- it refuses EVERY other raw statement whose facts touch the stack,
+// with the diagnostic "requires unavailable stack/frame balance proof". The
+// superseded citation was "frontend.c:5499 to :5500", which is a closing brace
+// and the start of the `may_trap` test; it named neither. A citation that
+// resolves to a brace is worse than one that is missing, because a missing one
+// is visible.
+//
+// THE RESTORATION, PRODUCT SIDE, AND WHAT IT DOES NOT PROVE. The product
+// restores `rsp` the same way and this gate does not dispute that. What the
+// product does NOT do is verify a balance: the stack half of the guard walks
+// STATEMENTS, and a `push rbx` followed by its `pop rbx` is refused exactly
+// like a `push rbx` with no pop. Measured, both directions, as "falsify 1" and
+// its control in tests_ntasm_call_contracts.c. So the restoration the decision
+// reasons from is the epilogue's, established from the producer's bytes, and
+// NOT something this pass proves about a body. Nothing here should be read as
+// claiming otherwise.
+//
+// IS THAT LIMIT A DEFECT, A DELIBERATE DIFFERENCE, OR A LIMIT TO DOCUMENT? All
+// three framings were on the table and the answer is measured, two-sided, on
+// identical bodies, 2026-09-30. READ THE TWO COLUMN HEADERS AS THE INSTRUMENTS
+// THEY ARE, because this compares two different passes and not two runs of one
+// pass: "reference" is nt_compile, the whole C frontend and the oracle, and
+// "this pass" is call_contracts.check ALONE in mode 1. The product side of
+// this table is therefore NOT a claim that the whole Nova pipeline compiles
+// those bodies, and nothing here should be read as one. The question "which of
+// the two rules is a superset of the other" has NO single answer, and the part
+// of it that does not is the part worth writing down.
+//
+//   body                                  reference        this pass
+//   plain, no stack motion                accepted         accepted
+//   bare `push rbx`, no pop               REFUSED E503     accepted
+//   balanced `push rbx` / `pop rbx`       REFUSED E503     accepted
+//   bare `pop rbx`, no push               REFUSED E503     accepted
+//   typed call of a helper                accepted         accepted
+//   `call_indirect rax`                   accepted         accepted
+//   the balanced pair around a proved call,
+//     family 6 stack_in                     REFUSED E600     REFUSED 326
+//
+// On the axis of WHICH BODES ARE ADMITTED, this pass is a STRICT SUPERSET of
+// the reference: every body the reference admits, this admits, and it admits
+// the three push/pop bodies the reference refuses outright. That is not an
+// accident and it is not a hole. The reference buys its soundness by refusing
+// `push` and `pop` as raw machine statements AT ALL -- frontend.c:5493 to
+// :5498 refuses any statement whose facts carry stack_read, stack_write or
+// BIT(4)|BIT(5), with the diagnostic "requires unavailable stack/frame
+// balance proof" -- and that refusal has nothing to do with a contract, a
+// caller or a frame rule. This pass admits the statement and then CHARGES it,
+// in the contract families, at 326 with the family in out[2]. The two rules
+// are the same decision taken at two different levels, and this one is
+// strictly more permissive at the language level and strictly more
+// conservative at the contract level. So the recorded limit is a DELIBERATE
+// DIFFERENCE, not a defect: it costs real proofs, and the price is named and
+// pinned by the "falsify 1" balanced row above rather than left implicit.
+//
+// ON THE OTHER AXIS THE TWO ARE INCOMPARABLE, and this is where the framing in
+// the brief is wrong and the correction matters. The comparison usually drawn
+// is "the reference declines to charge a balanced call, this pass declines to
+// charge a balanced push/pop, so one is a superset of the other". They are not
+// comparable, because they are not about the same thing. The reference's
+// narrowing is a NAMED EXEMPTION for one instruction: frontend.c:5506 to
+// :5508 clears BIT(4) when, and only when, the name is `call_indirect`, and it
+// asks NOTHING about the callee -- not that it returns, not that it has a
+// body, not that it stores nothing. This pass's narrowing is
+// `balanced_call_pair`, and it applies to ANY call whose callee provably
+// returns, has a body in this tree, and that body stores nothing. The
+// reference's rule is therefore NARROWER in the instruction it exempts and
+// UNCONDITIONAL in what it assumes; this pass's is WIDER in the instructions it
+// can spare and CONDITIONAL on a callee it actually checked. Neither contains
+// the other, and the last row of the table is the proof that they are not even
+// answering at one level: the reference stops at E600, which is a predicate
+// its checker does not implement, while this pass reaches 326 and names family
+// 6. Calling either a superset of the other would be a claim about a
+// containment relation that no pair of rows here establishes.
+//
+// THE THREE SHAPES THAT WOULD HAVE FALSIFIED IT, each measured rather than
+// argued, in the same gate. An unbalanced epilogue: it fails for that one
+// function, and the failure is local, which is the distinction the move turns
+// on. A nested frame: a call nested in the CALLEE costs the caller nothing and
+// is accepted, while the same nesting in the CALLER is refused, so the charge
+// lands on the one function whose body carries the write and on no other. A
+// tail call: closed, below, by measurement rather than left open.
+//
+// THE TAIL CALL, AND THE OPEN END IS NOW CLOSED. The superseded text read:
+// "a `jmp` out of a body transfers the frame and has no epilogue, so IF the
+// product ever emits one, the restoration premise is void on that path". The IF
+// has been measured, and the answer is that the product does not emit one.
+//
+// MEASURED, 2026-09-30, through BOTH producers, not through one entry:
+// x64-lower-nxo-function-bodies-entry mode 5 is build_function_bodies, the
+// frameless one, and mode 6 is build_framed_functions. Both were asked every
+// shape, because "the product refuses a tail call" is only true if the refusal
+// is a property of the SHAPE and not of which producer happened to see it.
+// With a declared clobber, so the branch path is actually reached:
+//
+//   jmp to a label of the SAME body        -> 0,    and e9 is in .text
+//   jmp to another FUNCTION (the tail call)-> 821,  output buffer intact
+//   jmp to a LABEL OF ANOTHER FUNCTION     -> 821,  output buffer intact
+//   jmp to a DATA symbol                   -> 821,  output buffer intact
+//   jmp to a name defined NOWHERE          -> 821,  output buffer intact
+//   call the same callee, no jmp            -> 0
+//
+// Two things in that table are load bearing and neither is the "refused".
+// FIRST, the control arm is green: the same-body label jmp is ACCEPTED and
+// emits e9, so the 821s are not a producer that refuses every branch. The
+// rows differ in one token -- WHICH FUNCTION the target is declared in -- and
+// that token decides the verdict. SECOND, and this is the part that changes
+// what the decision owes: the tail call answers with the SAME code as a name
+// defined nowhere. The producer has no tail-call rule at all. An out-of-body
+// target is simply an UNRESOLVED LABEL, because both branch resolvers are
+// scoped to the current function: find_body_label, the frameless one, scans
+// only the label RECORDS of the function being emitted, x64_lower_nxo.nova
+// :1796 to :1814, and find_label, the framed one, scans only that function's
+// own label table, :2636 to :2645. Both return a miss sentinel and both call
+// sites turn it into 821, at :2052 and at :2989. A function declaration is not
+// a label record, so it cannot be found.
+//
+// SO THE ANSWER TO "does the frame rule refuse it, charge it, or is it out of
+// scope" is NONE OF THE THREE, and the reason is worth stating because it is
+// not the answer anyone expected. It is not refused by a frame rule and it is
+// not charged: no such instruction can be produced, so there is nothing for a
+// frame rule to have an opinion about. The restoration premise of decision 2
+// holds on every path the product can currently reach, and the reason it holds
+// is the label scoping above, which is a property of the BRANCH RESOLVER and
+// not of this pass.
+//
+// AND THE PROPERTY IS NOT THIS FILE'S TO HOLD. It survives only while both
+// resolvers stay function-scoped. If either is ever widened to see a function
+// name, or a data symbol, the premise is void on that path and the frame rule
+// is where the answer belongs -- not a `clobbers` set, which is what decision
+// 2 decided and what this measurement re-confirms rather than re-opens. The
+// rows that would catch that are the ones above, and they live in the producer
+// gate, not in this one, because this pass cannot see the emitted bytes.
+//
+// WHERE A FRAME WRITE IS CHARGED, CONCRETELY. It is charged by the frame rule
+// and only there: `body_moves_stack` above, which walks the caller's own body
+// and refuses `stack_in` and `valid_user_return` when it sees an `rsp` family
+// write, whether that write names `rsp` or is one of the implicit forms
+// `adjusts_stack` lists. That charge is LOCAL: it reads one body and it
+// obliges nobody else. The shape is the same as `changes_flags`, one obligation
+// in two channels, and the guard discipline carries over unchanged. The
+// declaration half and the body half are read together, and a body write is
+// charged whether or not any set names it, which is why the "falsify 1" row is
+// refused on a body whose `clobbers` set is empty and honest.
+//
+// AND THE FIXPOINT IS GONE, MEASURED ON A CHAIN AND NOT ARGUED. The cost of
+// the old charge was a fixpoint over the call graph: `missing_bits` at
+// call_clobbers.nova:96 requires the callee's families to be a subset of the
+// caller's, so one declaring body obliges every ancestor at any depth, and a
+// count of bodies cannot express that. The new charge has no such shape,
+// because a frame write is not a declaration and there is no subset relation
+// left to violate. Measured as an A/B over one entry, one mode and one program
+// shape, in tests_ntasm_call_contracts.c, arms A against B:
+//
+//   frame channel, 3 rungs, leaf writes a balanced push/pop, and no
+//     declaration anywhere                            -> accepted, 3 decls
+//   frame channel, 4 rungs, the same, no declaration    -> accepted, 5 decls
+//   mask channel,   3 rungs, leaf declares {rsp}       -> 331, bit 16
+//   mask channel,   the same, mid pays too              -> 331, one rung up
+//   mask channel,   4 rungs, two hops paid              -> 331, one rung up
+//
+// The refusal moves one rung up the graph for every rung that is paid and
+// never reaches a bottom, which is what a fixpoint looks like. The frame
+// column at the same depths is flat: nothing to declare, nothing to pay, and a
+// fourth rung changes nothing. The difference is one of KIND, not of amount.
+//
+// THE HONEST PART OF THE OLD SET, WHICH THE MOVE DOES NOT DELETE. A body that
+// genuinely does not restore a register is describing itself accurately, and
+// abi.nova:513 to :518 is right that refusing the declaration would forbid a
+// true statement. `clobbers {rsp}` stays ACCEPTED and stays UNVERIFIED, which
+// is the state quo and is deliberately not changed here: this decision moves
+// where the frame write is CHARGED, and it forbids no declaration. What it
+// establishes is that a body which balances its frame owes its callers no
+// `rsp` entry, which is the restoration rule doing its work.

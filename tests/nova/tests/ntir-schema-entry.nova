@@ -1,0 +1,79 @@
+module ntir_schema_entry;
+import ntasm_ast;
+import ntasm_parser;
+import ntasm_lexer;
+import ntir;
+import register_widths;
+
+// A7.01, porte de schéma NTIR du coordinateur Claude (4 octobre 2026). Ce module
+// RAPPORTE ce que ntir.nova répond ; la porte C le compare à spec/ntir-v0.md.
+//
+//   mode 0  constantes exportées dans report
+//   mode 2  kind_text(index) dans text, kind_at(index) dans report[0]
+//   mode 3  header_text() dans text
+//   mode 4  parse, ntir.build, ntir.verify, ntir.serialize : image dans out,
+//           texte dans text, report[0]=code
+//   mode 5  ntir.verify sur l'image DÉJÀ dans out (que la porte a pu abîmer)
+export fn main(source:buf<u8>,mode:u64,index:u64,unused:buf<u64>,
+        out:buf<u64>,text:buf<u8>,text_length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<32 || len(text_length)<1 { return 800; }
+    if mode==0 {
+        report[0]=ntir.FORMAT_MAJOR();
+        report[1]=ntir.FORMAT_MINOR();
+        report[2]=ntir.KIND_BASE();
+        report[3]=ntir.HEADER_WORDS();
+        report[4]=ntir.NODE_WORDS();
+        report[5]=ntir.KIND_COUNT();
+        report[6]=ntir.CLASS_NONE();
+        report[7]=ntir.CLASS_MEMORY();
+        report[8]=ntir.CLASS_IMMEDIATE();
+        report[9]=ntir.CLASS_RELOCATABLE();
+        report[10]=ntir.CLASS_CONTROL();
+        report[11]=ntir.CLASS_LABEL();
+        report[12]=ntir.CLASS_LIMIT();
+        report[13]=ntir.FAMILY_LIMIT();
+        report[14]=ntir.WIDTH_MEMORY();
+        report[15]=ntir.WIDTH_POINTER();
+        report[16]=ntir.SIGNED_UNSIGNED();
+        report[17]=ntir.SIGNED_SIGNED();
+        report[18]=ntir.SIGNED_NONE();
+        report[19]=ntir.E_TYPE_REFUSED();
+        return 0;
+    }
+    if mode==2 {
+        report[0]=ntir.kind_at(index);
+        let mut name:buf<u8>=ntir.kind_text(index);
+        return copy_text(name,text,text_length);
+    }
+    if mode==3 {
+        let mut tag:buf<u8>=ntir.header_text();
+        return copy_text(tag,text,text_length);
+    }
+    if mode==4 {
+        if len(out)<ntir.HEADER_WORDS() { return 800; }
+        let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+        if tree.ok==false { ntasm_ast.release(tree); return 800; }
+        let mut built:u64=ntir.build(source,tree,out,len(out));
+        ntasm_ast.release(tree);
+        if built!=0 { return built; }
+        let mut checked:u64=ntir.verify(out,out[3],report);
+        if checked!=0 { return checked; }
+        let mut written:u64=ntir.serialize(out,out[3],text,text_length);
+        report[0]=written;
+        return written;
+    }
+    if mode==5 {
+        if len(out)<ntir.HEADER_WORDS() { return 800; }
+        return ntir.verify(out,out[3],report);
+    }
+    return 800;
+}
+
+fn copy_text(s:buf<u8>,text:buf<u8>,text_length:buf<u64>)->u64 {
+    let mut size:u64=len(s);
+    if size>len(text) { return 827; }
+    let mut i:u64=0;
+    while i<size { text[i]=s[i]; i=i+1; }
+    text_length[0]=size;
+    return 0;
+}

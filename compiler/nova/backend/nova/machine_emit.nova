@@ -1,0 +1,2125 @@
+module machine_emit;
+
+import machine_ir;
+import x64_fixed;
+import ntasm_nxo;
+import effects;
+
+// MACHINE IR/1.0 -> x86-64 -> NXO, common frame emitter.
+// Reads a verified MIR image and declaration/name spans only: no AST, NTIR,
+// source reparse, allocation fallback or C producer.
+//
+// Every immutable computed value has an eight-byte slot. Sixteen GPR cells
+// and a flags cell are separate runtime state shared by all blocks. Register
+// reads snapshot a declared slice at their execution site; 8/16-bit writes
+// replace that slice, 32-bit writes zero the high half, 64-bit writes replace
+// the family. Immutable IN parameter snapshots do not alias these cells;
+// OUT/INOUT names read the current bound cell, according to resolved ABI flags.
+//
+// Incoming registers and flags are captured before scratch work. Instructions
+// capture flags immediately, before normalization or partial-write mechanics.
+// A boolean branch reads a value; a jcc restores the runtime flags cell.
+//
+// An explicit call mask is checked against the callee's MIR declaration and
+// output bindings. Arguments are materialized before physical state is loaded.
+// Returned physical outputs update the cells. At return, families outside
+// the declared clobbers/output set are restored; declared outputs are published
+// through their saved slots, and flags follow the declared preservation rule.
+// rsp is aligned to sixteen bytes at calls, with thirty-two-byte home space.
+//
+// Image order is not dependency order: definitions later in the same block
+// are needed recursively before use. Parameters and literals may be read from
+// another block. Runtime cells carry register flow across joins and back edges.
+// E980..985 are emitter diagnostics; report is (record, code, kind, 0).
+export fn E_IMAGE()->u64 { return 980; }
+export fn E_FORM()->u64 { return 981; }
+export fn E_CALL()->u64 { return 982; }
+export fn E_CONTRACT()->u64 { return 983; }
+export fn E_LAYOUT()->u64 { return 984; }
+export fn E_ENCODE()->u64 { return 985; }
+
+struct E {
+    words:buf<u64>, count:u64, source:buf<u8>, values:u64,
+    text:buf<u8>, at:u64,
+    defs:buf<u64>, slots:buf<u64>, done:buf<u64>, place:buf<u64>,
+    extent:buf<u64>, used:buf<u64>,
+    fixes:buf<u64>, fix_count:u64, rels:buf<u64>, rel_count:u64,
+    enc:buf<u8>,
+    saved:u64, keep:u64, cells:u64, args:u64, mask:u64, raw_mask:u64, func:u64, fend:u64, block:u64, bend:u64,
+    code:u64, record:u64, current:u64, last_call:u64, calls:u64,
+    // THE ABI PROFILE, SPLIT IN TWO. `unit_profile` is the profile of the
+    // UNIT, read once per build; `prof_cache` holds one entry per record, the
+    // profile of that function computed on first use and stored PLUS ONE, so
+    // a stored zero means "not computed" and a computed zero -- an unknown
+    // digest -- is stored as one. `funcs` is the index of the function records
+    // of the unit, in record order, and `func_n` its length.
+    unit_profile:u64, funcs:buf<u64>, func_n:u64, prof_cache:buf<u64>
+}
+// A growable-by-bound text: contracts and names are built into one of these
+// and copied out by length.
+struct T { bytes:buf<u8>, at:u64, cap:u64, bad:u64 }
+
+// ---- the image -------------------------------------------------------------
+fn W(e:E,r:u64,i:u64)->u64 {
+    let w:buf<u64>=e.words;
+    return w[machine_ir.HEADER_WORDS()+(r-1)*machine_ir.NODE_WORDS()+i];
+}
+fn K(e:E,r:u64)->u64 { return W(e,r,0); }
+fn fail(e:E,code:u64,record:u64)->u64 {
+    if e.code==0 { e.code=code; e.record=record; }
+    return e.code;
+}
+// The record after the last record of the subtree rooted at r: the first
+// later record whose depth is not deeper than r's. Preorder makes this exact.
+fn subtree_end(e:E,r:u64)->u64 {
+    let depth:u64=W(e,r,19);
+    let mut n:u64=r+1;
+    while n<=e.count && W(e,n,19)>depth { n=n+1; }
+    return n;
+}
+fn same_span(e:E,a0:u64,a1:u64,b0:u64,b1:u64)->bool {
+    let s:buf<u8>=e.source;
+    if a0>a1 || b0>b1 || a1>len(s) || b1>len(s) { return false; }
+    if a1-a0!=b1-b0 { return false; }
+    let mut i:u64=0;
+    while i<a1-a0 { if s[a0+i]!=s[b0+i] { return false; } i=i+1; }
+    return true;
+}
+
+// ---- bytes -----------------------------------------------------------------
+fn put(e:E,byte:u64)->u64 {
+    let t:buf<u8>=e.text;
+    if e.at>=len(t) { return fail(e,E_LAYOUT(),e.func); }
+    t[e.at]=u8(byte&255);
+    e.at=e.at+1;
+    return 0;
+}
+fn put32_at(e:E,at:u64,value:u64)->u64 {
+    let t:buf<u8>=e.text;
+    t[at]=u8(value&255);t[at+1]=u8((value>>8)&255);
+    t[at+2]=u8((value>>16)&255);t[at+3]=u8((value>>24)&255);
+    return 0;
+}
+// THE ENCODERS ARE x64_fixed's, unchanged: out[0] is the length and out[1..]
+// the bytes, and a non-zero answer is the encoder's refusal, reported as
+// E_ENCODE rather than as a guess at the bytes.
+fn emit_bytes(e:E,rc:u64)->u64 {
+    if e.code!=0 { return e.code; }
+    if rc!=0 { return fail(e,E_ENCODE(),e.func); }
+    let b:buf<u8>=e.enc;
+    let n:u64=b[0];
+    let mut i:u64=1;
+    while i<=n && e.code==0 { let byte:u64=b[i]; put(e,byte); i=i+1; }
+    return e.code;
+}
+fn op0(e:E,name:buf<u8>)->u64 { let b:buf<u8>=e.enc; return emit_bytes(e,x64_fixed.encode(name,0,1,0,b)); }
+fn rr(e:E,name:buf<u8>,dst:u64,src:u64,width:u64)->u64 {
+    let b:buf<u8>=e.enc; return emit_bytes(e,x64_fixed.encode_rr(name,2,dst,src,width,1,0,b));
+}
+fn ri(e:E,name:buf<u8>,dst:u64,width:u64,imm:u64)->u64 {
+    let b:buf<u8>=e.enc; return emit_bytes(e,x64_fixed.encode_ri(name,2,dst,width,imm,0,1,0,b));
+}
+fn un(e:E,name:buf<u8>,reg:u64)->u64 {
+    let b:buf<u8>=e.enc; return emit_bytes(e,x64_fixed.encode_unary(name,1,reg,64,1,0,b));
+}
+fn shift_imm(e:E,name:buf<u8>,reg:u64,amount:u64)->u64 {
+    let b:buf<u8>=e.enc; return emit_bytes(e,x64_fixed.encode_shift_imm(name,2,reg,64,amount,1,0,b));
+}
+fn shift_cl(e:E,name:buf<u8>,width:u64)->u64 {
+    let b:buf<u8>=e.enc; return emit_bytes(e,x64_fixed.encode_shift_cl(name,2,0,width,1,0,1,0,b));
+}
+fn setcc(e:E,name:buf<u8>)->u64 {
+    let b:buf<u8>=e.enc; return emit_bytes(e,x64_fixed.encode_setcc(name,1,2,8,1,0,b));
+}
+fn push(e:E,reg:u64)->u64 {
+    let b:buf<u8>=e.enc; let name:buf<u8>="push";
+    let rc:u64=emit_bytes(e,x64_fixed.encode_stack(name,1,1,64,reg,0,1,0,b));
+    rt_free(runtime(),name);
+    return rc;
+}
+fn pop(e:E,reg:u64)->u64 {
+    let b:buf<u8>=e.enc; let name:buf<u8>="pop";
+    let rc:u64=emit_bytes(e,x64_fixed.encode_stack(name,1,1,64,reg,0,1,0,b));
+    rt_free(runtime(),name);
+    return rc;
+}
+// THE NAME IS BORROWED BY THE ENCODER: x64_fixed reads the mnemonic and keeps
+// nothing. These wrappers OWN the name they are given, because the name is a
+// literal the caller created for ONE call: the encoder has answered, the
+// literal is freed, and the answer is the encoder's own, whatever it was. A
+// name used more than once is NOT given to them.
+fn op0_owned(e:E,name:buf<u8>)->u64 { let r:u64=op0(e,name); rt_free(runtime(),name); return r; }
+fn rr_owned(e:E,name:buf<u8>,dst:u64,src:u64,width:u64)->u64 { let r:u64=rr(e,name,dst,src,width); rt_free(runtime(),name); return r; }
+fn ri_owned(e:E,name:buf<u8>,dst:u64,width:u64,imm:u64)->u64 { let r:u64=ri(e,name,dst,width,imm); rt_free(runtime(),name); return r; }
+fn un_owned(e:E,name:buf<u8>,reg:u64)->u64 { let r:u64=un(e,name,reg); rt_free(runtime(),name); return r; }
+fn shift_imm_owned(e:E,name:buf<u8>,reg:u64,amount:u64)->u64 { let r:u64=shift_imm(e,name,reg,amount); rt_free(runtime(),name); return r; }
+fn shift_cl_owned(e:E,name:buf<u8>,width:u64)->u64 { let r:u64=shift_cl(e,name,width); rt_free(runtime(),name); return r; }
+fn setcc_owned(e:E,name:buf<u8>)->u64 { let r:u64=setcc(e,name); rt_free(runtime(),name); return r; }
+fn jump_to_owned(e:E,name:buf<u8>,conditional:bool,target_block:u64)->u64 { let r:u64=jump_to(e,name,conditional,target_block); rt_free(runtime(),name); return r; }
+// mov between a register and [base+disp]; direction 0 loads, 1 stores.
+fn mem(e:E,direction:u64,reg:u64,width:u64,base:u64,disp:u64)->u64 {
+    let b:buf<u8>=e.enc;
+    return emit_bytes(e,x64_fixed.encode_mov_memory(direction,reg,width,base,16,1,disp,0,1,0,b));
+}
+fn negate(value:u64)->u64 { return (~value)+1; }
+// The rel32 of a near jump, call or jcc is the last four bytes of the
+// instruction x64_fixed just wrote, so the site is e.at-4 after the write.
+fn jump_to(e:E,name:buf<u8>,conditional:bool,target_block:u64)->u64 {
+    let b:buf<u8>=e.enc;
+    if conditional { emit_bytes(e,x64_fixed.encode_jcc(name,1,4,0,0,0,1,0,b)); }
+    else { emit_bytes(e,x64_fixed.encode_control(name,1,4,0,0,0,1,0,b)); }
+    if e.code!=0 { return e.code; }
+    let f:buf<u64>=e.fixes;
+    if e.fix_count*2+2>len(f) { return fail(e,E_LAYOUT(),target_block); }
+    f[e.fix_count*2]=e.at-4;f[e.fix_count*2+1]=target_block;
+    e.fix_count=e.fix_count+1;
+    return 0;
+}
+// A REL32 relocation against the object symbol of a declaration record
+// (a function, an import or a data). The symbol index is not known until the
+// table is sorted, so the declaration record is kept and resolved at the end.
+fn relocate(e:E,declaration:u64)->u64 {
+    if e.code!=0 { return e.code; }
+    let r:buf<u64>=e.rels;
+    if e.rel_count*2+2>len(r) { return fail(e,E_LAYOUT(),declaration); }
+    r[e.rel_count*2]=e.at-4;r[e.rel_count*2+1]=declaration;
+    e.rel_count=e.rel_count+1;
+    let used:buf<u64>=e.used;
+    used[declaration]=1;
+    return 0;
+}
+
+// ---- values ------------------------------------------------------------------
+fn frame(e:E,slot:u64)->u64 { return negate(e.saved+8*slot); }
+fn definer(e:E,value:u64)->u64 {
+    let defs:buf<u64>=e.defs;
+    if value==0 || value>=len(defs) { return 0; }
+    return defs[value];
+}
+fn local_access(e:E,r:u64)->bool {
+    if K(e,r)==2086 { return true; }
+    if K(e,r)!=2067 { return false; }
+    let d:u64=definer(e,W(e,r,5));
+    return d!=0 && K(e,d)==2086;
+}
+// Makes sure the record defining `value` has been lowered, lowering it now
+// when it is a later record of the current block. Constants need nothing.
+fn need(e:E,value:u64)->u64 {
+    if e.code!=0 { return e.code; }
+    let d:u64=definer(e,value);
+    if d==0 { return fail(e,E_IMAGE(),e.func); }
+    if K(e,d)==2058 { return 0; }
+    if K(e,d)==2056 && W(e,d,22)!=1 { return fail(e,E_FORM(),d); }
+    if d<=e.func || d>=e.fend { return fail(e,E_FORM(),d); }
+    // Cross-block immutable values require proof at the actual use site,
+    // not at an auxiliary metadata record or just at emission time.
+    if K(e,d)!=2054 && W(e,d,16)!=e.block {
+        if machine_ir.value_available_at(e.words,e.count,e.current,value)==false { return fail(e,E_FORM(),d); }
+        let seen:buf<u64>=e.done;
+        if seen[d]==0 { return fail(e,E_FORM(),d); }
+        return 0;
+    }
+    let done:buf<u64>=e.done;
+    if done[d]!=0 { return 0; }
+    // A memory snapshot/initialization belongs to its execution site.
+    // Never pull it forward recursively while satisfying a dependency.
+    if local_access(e,d) { return fail(e,E_FORM(),d); }
+    if d>e.block && d<e.bend {
+        let current:u64=e.current;let code:u64=lower(e,d);e.current=current;return code;
+    }
+    return fail(e,E_FORM(),d);
+}
+// Loads a value into a register. A `mir_const` is its literal, materialized
+// in place; anything else is read from its slot, and `need` must have run.
+fn ld(e:E,reg:u64,value:u64)->u64 {
+    if e.code!=0 { return e.code; }
+    let d:u64=definer(e,value);
+    if d==0 { return fail(e,E_IMAGE(),e.func); }
+    if K(e,d)==2058 { let mov:buf<u8>="mov"; return ri_owned(e,mov,reg,64,W(e,d,5)); }
+    let done:buf<u64>=e.done;
+    let slots:buf<u64>=e.slots;
+    if (K(e,d)==2056 && W(e,d,22)!=1) || done[d]==0 || slots[value]==0 { return fail(e,E_FORM(),d); }
+    if K(e,d)==2054 && (W(e,d,13)&(machine_ir.FLAG_DIR_OUT()+machine_ir.FLAG_DIR_INOUT()))!=0 {
+        mem(e,0,reg,64,5,cell_frame(e,W(e,d,15)));
+        if W(e,d,21)!=0 { let shift:buf<u8>="shr"; shift_imm_owned(e,shift,reg,W(e,d,21)); }
+        return normalize(e,reg,W(e,d,9),W(e,d,10));
+    }
+    mem(e,0,reg,64,5,frame(e,slots[value]));
+    if K(e,d)==2054 {
+        if W(e,d,21)!=0 { let shift:buf<u8>="shr"; shift_imm_owned(e,shift,reg,W(e,d,21)); }
+        normalize(e,reg,W(e,d,9),W(e,d,10));
+    }
+    return e.code;
+}
+fn st(e:E,value:u64,reg:u64)->u64 {
+    if e.code!=0 { return e.code; }
+    let slots:buf<u64>=e.slots;
+    if value==0 || value>=len(slots) || slots[value]==0 { return fail(e,E_FORM(),e.func); }
+    return mem(e,1,reg,64,5,frame(e,slots[value]));
+}
+// The width two operands are compared at: the wider of the two definitions,
+// rounded up to a machine width. A literal `0` is typed at 8 bits and a
+// register at 64, and comparing at 8 would drop the register's high bytes.
+fn operand_width(e:E,a:u64,b:u64)->u64 {
+    let mut w:u64=0;
+    let da:u64=definer(e,a);
+    let db:u64=definer(e,b);
+    if da!=0 && W(e,da,9)>w { w=W(e,da,9); }
+    if db!=0 && W(e,db,9)>w { w=W(e,db,9); }
+    if w<=8 { return 8; }
+    if w<=16 { return 16; }
+    if w<=32 { return 32; }
+    return 64;
+}
+
+// ---- operations --------------------------------------------------------------
+fn arith(e:E,r:u64,op:u64,a:u64,b:u64)->u64 {
+    let out:u64=W(e,r,4);
+    if op==machine_ir.OP_COPY() {
+        let mut src:u64=a;
+        if W(e,r,8)>=2 && b!=0 { src=b; }
+        let folded:Immediate=immediate_operand(e,src,0);
+        if K(e,r)==2065 && folded.present && folded.signed<=1 { let mov:buf<u8>="mov"; ri_owned(e,mov,0,64,folded.value); }
+        else { need(e,src);ld(e,0,src); }
+        // THE IMMEDIATE IS A CELL, and its last read is the one above.
+        rt_free(runtime(),folded);
+        return st(e,out,0);
+    }
+    let predicate:bool=op>=machine_ir.OP_EQ() && op<=machine_ir.OP_GE_S();
+    let width:u64=W(e,r,9);
+    let folded_b:Immediate=immediate_operand(e,b,0);
+    let folded_raw:bool=K(e,r)==2065 && folded_b.present && folded_b.signed<=1;
+    need(e,a); if folded_raw==false { need(e,b); }
+    ld(e,0,a);
+    if folded_raw { let mov:buf<u8>="mov"; ri_owned(e,mov,1,64,folded_b.value); }
+    else { ld(e,1,b); }
+    // THE IMMEDIATE IS A CELL, and its last read is the one above.
+    rt_free(runtime(),folded_b);
+    if predicate==false { normalize(e,0,width,W(e,r,10)); normalize(e,1,width,W(e,r,10)); }
+    // A zero-count shift preserves source flags, not flags from scratch normalization.
+    if (W(e,r,22)&4)!=0 { restore_flags(e); }
+    let mut result:u64=0;
+    if op==machine_ir.OP_ADD() { let n:buf<u8>="add"; rr_owned(e,n,0,1,width); }
+    else if op==machine_ir.OP_SUB() { let n:buf<u8>="sub"; rr_owned(e,n,0,1,width); }
+    else if op==machine_ir.OP_AND() { let n:buf<u8>="and"; rr_owned(e,n,0,1,width); }
+    else if op==machine_ir.OP_OR() { let n:buf<u8>="or"; rr_owned(e,n,0,1,width); }
+    else if op==machine_ir.OP_XOR() { let n:buf<u8>="xor"; rr_owned(e,n,0,1,width); }
+    else if op==machine_ir.OP_MUL() {
+        let n:buf<u8>="imul"; let encoded:buf<u8>=e.enc;
+        let mut bits:u64=width; if bits==8 { bits=64; }
+        emit_bytes(e,x64_fixed.encode_imul(n,2,0,0,0,1,0,0,bits,1,1,0,bits,16,16,1,0,0,1,0,encoded));
+        rt_free(runtime(),n);
+    }
+    else if op==machine_ir.OP_DIV() || op==machine_ir.OP_REM() {
+        if W(e,r,10)==1 { let c:buf<u8>="cqo"; op0_owned(e,c); let n:buf<u8>="idiv"; un_owned(e,n,1); }
+        else { let m:buf<u8>="mov"; ri_owned(e,m,2,32,0); let n:buf<u8>="div"; un_owned(e,n,1); }
+        if op==machine_ir.OP_REM() { result=2; }
+    }
+    else if op==machine_ir.OP_SHL() { let n:buf<u8>="shl"; shift_cl_owned(e,n,width); }
+    else if op==machine_ir.OP_SHR() { let n:buf<u8>="shr"; shift_cl_owned(e,n,width); }
+    else if op==machine_ir.OP_SAR() { let n:buf<u8>="sar"; shift_cl_owned(e,n,width); }
+    else if op>=machine_ir.OP_EQ() && op<=machine_ir.OP_GE_S() {
+        // rdx is cleared BEFORE the compare: a mov does not touch the flags,
+        // and setcc writes only dl, so the result is exactly 0 or 1.
+        let m:buf<u8>="mov"; ri_owned(e,m,2,32,0);
+        let c:buf<u8>="cmp"; rr_owned(e,c,0,1,operand_width(e,a,b));
+        result=2;
+        if op==machine_ir.OP_EQ() { let n:buf<u8>="sete"; setcc_owned(e,n); }
+        else if op==machine_ir.OP_NE() { let n:buf<u8>="setne"; setcc_owned(e,n); }
+        else if op==machine_ir.OP_LT_U() { let n:buf<u8>="setb"; setcc_owned(e,n); }
+        else if op==machine_ir.OP_LT_S() { let n:buf<u8>="setl"; setcc_owned(e,n); }
+        else if op==machine_ir.OP_GT_U() { let n:buf<u8>="seta"; setcc_owned(e,n); }
+        else if op==machine_ir.OP_GT_S() { let n:buf<u8>="setg"; setcc_owned(e,n); }
+        else if op==machine_ir.OP_LE_U() { let n:buf<u8>="setbe"; setcc_owned(e,n); }
+        else if op==machine_ir.OP_LE_S() { let n:buf<u8>="setle"; setcc_owned(e,n); }
+        else if op==machine_ir.OP_GE_U() { let n:buf<u8>="setae"; setcc_owned(e,n); }
+        else { let n:buf<u8>="setge"; setcc_owned(e,n); }
+    }
+    else { return fail(e,E_FORM(),r); }
+    if (W(e,r,22)&4)!=0 { capture_flags(e); }
+    if predicate==false { normalize(e,result,width,W(e,r,10)); }
+    return st(e,out,result);
+}
+fn emit_unary(e:E,r:u64)->u64 {
+    let op:u64=W(e,r,14);
+    let a:u64=W(e,r,5);
+    // `-` and `~` below 64 bits: refused, as a narrow operation is (`exact_narrow`).
+    let width:u64=W(e,r,9);
+    need(e,a);ld(e,0,a);
+    if op==machine_ir.OP_NEG() { let n:buf<u8>="neg"; un_width_owned(e,n,0,width); normalize(e,0,width,W(e,r,10)); return st(e,W(e,r,4),0); }
+    if op==machine_ir.OP_NOT() { let n:buf<u8>="not"; un_width_owned(e,n,0,width); normalize(e,0,width,W(e,r,10)); return st(e,W(e,r,4),0); }
+    if op==machine_ir.OP_LNOT() {
+        let m:buf<u8>="mov"; ri_owned(e,m,2,32,0);
+        let c:buf<u8>="cmp"; ri_owned(e,c,0,64,0);
+        let n:buf<u8>="sete"; setcc_owned(e,n);
+        return st(e,W(e,r,4),2);
+    }
+    return fail(e,E_FORM(),r);
+}
+// THE WIDTH INVARIANT for the records whose width is a DECLARATION's: a
+// conversion's target, a load's element, a call's declared result. Such a
+// value narrower than 64 bits is held in its slot zero-extended when unsigned
+// and sign-extended when signed (word 10 is 1), so a comparison or a 64-bit
+// read of the slot sees the value the type means: a signed `i32` element of -5
+// is not 4294967291. Widths other than 8, 16 and 32 are left alone: 64 has
+// nothing above it and a boolean is 0 or 1. Operations are NOT normalized
+// after the source width operation.
+fn normalize(e:E,reg:u64,width:u64,signed:u64)->u64 {
+    if e.code!=0 { return e.code; }
+    // A typed boolean call only guarantees its result bit. Clear the upper
+    // register bits before storing/widening it, just as for narrow integers.
+    if width==1 { let mask:buf<u8>="and";return ri_owned(e,mask,reg,64,1); }
+    if width!=8 && width!=16 && width!=32 { return 0; }
+    let l:buf<u8>="shl"; shift_imm_owned(e,l,reg,64-width);
+    if signed==1 { let s:buf<u8>="sar"; return shift_imm_owned(e,s,reg,64-width); }
+    let s:buf<u8>="shr"; return shift_imm_owned(e,s,reg,64-width);
+}
+// extend: aux is the source signedness, aux2 the bits added (coerce in
+// machine_ir.nova). truncate: aux2 the bits removed. The source is widened by
+// its own signedness, then the result is normalized to the target's width and
+// signedness (`i8 -> u32` of -1 is 0xFFFFFFFF, not 64 one-bits).
+fn emit_resize(e:E,r:u64,extend:bool)->u64 {
+    let a:u64=W(e,r,5);
+    let width:u64=W(e,r,9);
+    need(e,a);ld(e,0,a);
+    if extend {
+        if W(e,r,15)>width { return fail(e,E_FORM(),r); }
+        normalize(e,0,width-W(e,r,15),W(e,r,14));
+    }
+    normalize(e,0,width,W(e,r,10));
+    return st(e,W(e,r,4),0);
+}
+// Same width, another signedness: the bits are the value's, the
+// normalization is the new signedness's (`u32 -> i32` of 0xFFFFFFFF is -1).
+fn emit_convert(e:E,r:u64)->u64 {
+    let a:u64=W(e,r,5);
+    need(e,a);ld(e,0,a);
+    normalize(e,0,W(e,r,9),W(e,r,10));
+    return st(e,W(e,r,4),0);
+}
+fn machine_width(width:u64)->bool { return width==8 || width==16 || width==32 || width==64; }
+// The declaration a symbol names: a storage `data` first, then a function.
+fn named_storage(e:E,symbol:u64)->u64 {
+    if symbol==0 || symbol>e.count || K(e,symbol)!=2057 { return 0; }
+    let s0:u64=W(e,symbol,5);
+    let s1:u64=W(e,symbol,6);
+    let mut r:u64=1;
+    while r<=e.count {
+        if K(e,r)==2060 && W(e,r,16)==1 && (W(e,r,13)&(machine_ir.FLAG_RDATA()+machine_ir.FLAG_WDATA()))!=0 {
+            if same_span(e,s0,s1,W(e,r,6),W(e,r,7)) { return r; }
+        }
+        r=r+1;
+    }
+    return callee(e,symbol);
+}
+fn emit_address(e:E,r:u64)->u64 {
+    let base:u64=W(e,r,5);
+    let index:u64=W(e,r,6);
+    let symbol:u64=W(e,r,7);
+    let scale:u64=W(e,r,14);
+    let disp:u64=W(e,r,15);
+    if base!=0 { need(e,base); }
+    if index!=0 { need(e,index); }
+    if symbol!=0 {
+        let target:u64=named_storage(e,symbol);
+        if target==0 { return fail(e,E_FORM(),r); }
+        let b:buf<u8>=e.enc;
+        emit_bytes(e,x64_fixed.encode_lea(0,64,17,16,1,0,0,1,0,b));
+        relocate(e,target);
+    } else { let m:buf<u8>="mov"; ri_owned(e,m,0,32,0); }
+    let add:buf<u8>="add";
+    if base!=0 { ld(e,1,base); rr(e,add,0,1,64); }
+    if index!=0 {
+        ld(e,1,index);
+        let l:buf<u8>="shl";
+        if scale==2 { shift_imm(e,l,1,1); }
+        if scale==4 { shift_imm(e,l,1,2); }
+        if scale==8 { shift_imm(e,l,1,3); }
+        rt_free(runtime(),l);
+        rr(e,add,0,1,64);
+    }
+    if disp!=0 { let m:buf<u8>="mov"; ri_owned(e,m,1,64,disp); rr(e,add,0,1,64); }
+    rt_free(runtime(),add);
+    return st(e,W(e,r,4),0);
+}
+fn emit_local_cell(e:E,r:u64)->u64 {
+    let value:u64=W(e,r,4);let initial:u64=W(e,r,5);
+    let slots:buf<u64>=e.slots;
+    if value==0 || value>=len(slots) || slots[value]==0 { return fail(e,E_FORM(),r); }
+    let offset:u64=frame(e,slots[value]+1);
+    need(e,initial);ld(e,2,initial);
+    normalize(e,2,W(e,r,14),W(e,r,15));
+    mem(e,1,2,64,5,offset);
+    let bytes:buf<u8>=e.enc;
+    emit_bytes(e,x64_fixed.encode_lea(0,64,5,16,1,offset,0,1,0,bytes));
+    return st(e,value,0);
+}
+fn emit_load(e:E,r:u64)->u64 {
+    let a:u64=W(e,r,5);
+    let width:u64=W(e,r,9);
+    if machine_width(width)==false { return fail(e,E_FORM(),r); }
+    need(e,a);ld(e,1,a);
+    // edx is cleared first, so a byte or word load leaves a zero-extended
+    // value in rdx; a dword load zero-extends by itself.
+    let m:buf<u8>="mov"; ri_owned(e,m,2,32,0);
+    mem(e,0,2,width,1,0);
+    // A signed narrow element is sign-extended (the width invariant).
+    normalize(e,2,width,W(e,r,10));
+    return st(e,W(e,r,4),2);
+}
+fn emit_store(e:E,r:u64)->u64 {
+    let a:u64=W(e,r,5);
+    let v:u64=W(e,r,6);
+    let mut width:u64=W(e,r,9);
+    let literal:Immediate=immediate_operand(e,v,0);
+    if W(e,r,15)!=0 {
+        if literal.present {
+            if literal.signed>1 { rt_free(runtime(),literal);return fail(e,E_FORM(),r); }
+            width=W(e,r,15);
+            let name:buf<u8>="mov"; let enc:buf<u8>=e.enc;
+            let rc:u64=x64_fixed.encode_binary(name,2,3,0,0,width,2,0,0,0,5,16,1,0,0,literal.value,literal.signed,1,0,enc);
+            rt_free(runtime(),name);
+            if rc!=0 { rt_free(runtime(),literal);return fail(e,E_FORM(),r); }
+        } else {
+            if width!=W(e,r,15) { return fail(e,E_FORM(),r); }
+            let source:u64=source_register(e,v,0); let computed:u64=definer(e,v);
+            if source==0 && (computed==0 || K(e,computed)!=2065) { return fail(e,E_FORM(),r); }
+        }
+    }
+    if machine_width(width)==false { return fail(e,E_FORM(),r); }
+    // A store wider than the `data` it names is refused (fifth review,
+    // executed: `store [b]:ptr<user,u32>,rax` wrote eight bytes into a
+    // four-byte datum, a form the reference refuses with E400). The store's
+    // own width comes from the annotation's pointer node, as a load's does
+    // (`emit_asm`), so the width compared is the one the datum declares.
+    let ad:u64=definer(e,a);
+    if ad!=0 && K(e,ad)==2066 && W(e,ad,7)!=0 {
+        let datum:u64=named_storage(e,W(e,ad,7));
+        if datum!=0 && K(e,datum)==2060 && W(e,datum,9)!=0 && W(e,datum,9)<width { return fail(e,E_FORM(),r); }
+    }
+    need(e,a); if literal.present==false || literal.signed>1 { need(e,v); }
+    ld(e,1,a);
+    if literal.present && literal.signed<=1 { let mov:buf<u8>="mov"; ri_owned(e,mov,2,64,literal.value); }
+    else { ld(e,2,v); }
+    // THE IMMEDIATE IS A CELL, and its last read is the one above.
+    rt_free(runtime(),literal);
+    return mem(e,1,2,width,1,0);
+}
+// The function record a callee symbol names: a local function by its own name,
+// an import by its local name or by its qualified target.
+fn callee(e:E,symbol:u64)->u64 {
+    if symbol==0 || symbol>e.count || K(e,symbol)!=2057 { return 0; }
+    let s0:u64=W(e,symbol,5);
+    let s1:u64=W(e,symbol,6);
+    // THE FUNCTION INDEX, NOT THE WHOLE IMAGE. The records this loop used to
+    // visit AND TEST -- the function records of the unit -- are exactly the
+    // records the index holds, and the index holds them in the SAME ORDER, so
+    // the first match that wins is the record that won before. The two spans
+    // compared are the same two: the function's own name span, then the name
+    // span of its import target. The symbol is still checked the same way.
+    let funcs:buf<u64>=e.funcs;
+    let n:u64=e.func_n;
+    let mut i:u64=0;
+    while i<n {
+        let r:u64=funcs[i];
+        if W(e,r,8)>=3 && same_span(e,s0,s1,W(e,r,6),W(e,r,7)) { return r; }
+        let t:u64=import_target(e,r);
+        if t!=0 && same_span(e,s0,s1,W(e,t,5),W(e,t,6)) { return r; }
+        i=i+1;
+    }
+    return 0;
+}
+// MIR/0.3: an import's qualified target is its first child, a mir_symbol.
+fn import_target(e:E,f:u64)->u64 {
+    if W(e,f,5)!=0 || f+1>e.count { return 0; }
+    if K(e,f+1)!=2057 || W(e,f+1,16)!=f { return 0; }
+    return f+1;
+}
+// The k-th formal of a function record (0-based), or 0.
+fn formal(e:E,f:u64,k:u64)->u64 {
+    let end:u64=subtree_end(e,f);
+    let mut r:u64=f+1;
+    while r<end {
+        if K(e,r)==2054 && W(e,r,16)==f && W(e,r,14)==k { return r; }
+        r=r+1;
+    }
+    return 0;
+}
+// The width of the register a parameter is bound to, read off the PARAMETER:
+// validation (register_widths.check, 318) has already required a bound
+// register's width to equal the declared type's, so the type width IS the
+// binding width. It used to be looked up through the `mir_bind` that carries
+// the parameter's value, and machine_ir's binding table is module-wide: a
+// second function binding the same register overwrote the first one's cell,
+// so the first function's parameter looked unbound and was refused 982 for a
+// binding it had (independent review, 7 October 2026). 0 when unbound.
+fn bound_width(e:E,f:u64,p:u64)->u64 {
+    if W(e,p,15)==0 || W(e,p,16)!=f { return 0; }
+    return W(e,p,9);
+}
+fn implicit_family(ordinal:u64)->u64 {
+    if ordinal==0 { return 2; }if ordinal==1 { return 3; }
+    if ordinal==2 { return 9; }if ordinal==3 { return 10; }return 0;
+}
+fn formal_family(e:E,p:u64)->u64 {
+    let explicit:u64=W(e,p,15);if explicit!=0 { return explicit; }
+    return implicit_family(W(e,p,14));
+}
+fn transport_width(width:u64)->u64 { if width==1 { return 8; }return width; }
+fn passable(e:E,f:u64,p:u64)->u64 {
+    if (W(e,p,13)&machine_ir.FLAG_DIR_UNREAD())!=0 { return E_CALL(); }
+    if machine_width(transport_width(W(e,p,9)))==false { return E_CALL(); }
+    let signature:u64=signature_root(e,p);
+    if signature==0 || W(e,signature,14)==2 { return E_CONTRACT(); }
+    let profile:u64=abi_profile(e,f);
+    if profile==0 { return E_CONTRACT(); }
+    if profile==2 && W(e,p,14)>=4 {
+        if W(e,p,15)!=0 || (W(e,p,13)&(machine_ir.FLAG_DIR_OUT()+machine_ir.FLAG_DIR_INOUT()))!=0 { return E_CALL(); }
+        return 0;
+    }
+    let family:u64=formal_family(e,p);
+    if family==0 || family>16 || family==5 || family==6 { return E_CALL(); }
+    if profile==2 && (family!=implicit_family(W(e,p,14)) || W(e,p,21)!=0
+        || (W(e,p,13)&(machine_ir.FLAG_DIR_OUT()+machine_ir.FLAG_DIR_INOUT()))!=0) { return E_CALL(); }
+    return 0;
+}
+fn cell_frame(e:E,family:u64)->u64 { return frame(e,e.cells+family); }
+fn capture_flags(e:E)->u64 {
+    let pf:buf<u8>="pushfq"; op0_owned(e,pf); pop(e,2);
+    return mem(e,1,2,64,5,cell_frame(e,17));
+}
+fn restore_flags(e:E)->u64 {
+    mem(e,0,2,64,5,cell_frame(e,17)); push(e,2);
+    let pf:buf<u8>="popfq"; return op0_owned(e,pf);
+}
+fn un_width(e:E,name:buf<u8>,reg:u64,width:u64)->u64 {
+    let b:buf<u8>=e.enc;
+    return emit_bytes(e,x64_fixed.encode_unary(name,1,reg,width,1,0,b));
+}
+fn un_width_owned(e:E,name:buf<u8>,reg:u64,width:u64)->u64 { let r:u64=un_width(e,name,reg,width); rt_free(runtime(),name); return r; }
+fn emit_cell_read(e:E,r:u64)->u64 {
+    mem(e,0,0,64,5,cell_frame(e,W(e,r,20)));
+    if W(e,r,21)!=0 { let n:buf<u8>="shr"; shift_imm_owned(e,n,0,W(e,r,21)); }
+    normalize(e,0,W(e,r,9),0);
+    return st(e,W(e,r,4),0);
+}
+fn emit_cell_write(e:E,r:u64)->u64 {
+    let family:u64=W(e,r,20); let width:u64=W(e,r,9);
+    let offset:u64=W(e,r,21); let mut value:u64=W(e,r,4);
+    if W(e,r,14)==machine_ir.OP_LOAD() { value=W(e,r,5); }
+    need(e,value); ld(e,0,value);
+    if width==32 { normalize(e,0,32,0); return mem(e,1,0,64,5,cell_frame(e,family)); }
+    return mem(e,1,0,width,5,cell_frame(e,family)+offset/8);
+}
+fn raw_clobbers(e:E,f:u64)->u64 {
+    let mut r:u64=f+1; let end:u64=subtree_end(e,f); let mut mask:u64=0;
+    while r<end { if K(e,r)==2064 && W(e,r,16)==f { mask=mask|W(e,r,5); } r=r+1; }
+    return mask;
+}
+fn output_formal(e:E,f:u64,family:u64)->u64 {
+    let mut p:u64=0;
+    while p<W(e,f,14) {
+        let r:u64=formal(e,f,p);
+        if r!=0 && W(e,r,15)==family && (W(e,r,13)&(machine_ir.FLAG_DIR_OUT()+machine_ir.FLAG_DIR_INOUT()))!=0 { return r; }
+        p=p+1;
+    }
+    return 0;
+}
+fn pass_argument(e:E,p:u64,slot:u64)->u64 {
+    let f:u64=W(e,p,16);
+    if abi_profile(e,f)==2 && W(e,p,14)>=4 {
+        mem(e,0,0,64,5,frame(e,slot));
+        return mem(e,1,0,64,4,32+8*(W(e,p,14)-4));
+    }
+    let family:u64=formal_family(e,p);
+    if W(e,p,21)==0 { return mem(e,0,family-1,transport_width(W(e,p,9)),5,frame(e,slot)); }
+    let bytes:buf<u8>=e.enc; let name:buf<u8>="mov";
+    let rc:u64=emit_bytes(e,x64_fixed.encode_binary(name,2,1,family-1,1,8,3,0,0,8,5,16,1,frame(e,slot),0,0,0,1,0,bytes));
+    rt_free(runtime(),name);
+    return rc;
+}
+
+fn declared_mask(e:E,f:u64)->u64 {
+    let mut r:u64=f+1; let end:u64=subtree_end(e,f); let mut mask:u64=0;
+    while r<end {
+        if K(e,r)==2064 && W(e,r,16)==f { mask=mask|W(e,r,5); }
+        if K(e,r)==2054 && W(e,r,16)==f && (W(e,r,13)&(machine_ir.FLAG_DIR_OUT()+machine_ir.FLAG_DIR_INOUT()))!=0 {
+            let family:u64=W(e,r,15); if family!=0 && family<=16 { mask=mask|(1<<(family-1)); }
+        }
+        r=r+1;
+    }
+    return mask;
+}
+// The immediate's signedness is operand semantics: positive u64 all-ones
+// and literal -1 have identical bits but different encoder legality.
+struct Immediate { present:bool, value:u64, signed:u64 }
+fn immediate_operand(e:E,value:u64,depth:u64)->Immediate {
+    let r:u64=definer(e,value);
+    if r==0 || depth>64 { return Immediate{present:false,value:0,signed:0}; }
+    let kind:u64=K(e,r); let op:u64=W(e,r,14);
+    if kind==2058 { return Immediate{present:true,value:W(e,r,5),signed:0}; }
+    if kind==2069 { return immediate_operand(e,W(e,r,5),depth+1); }
+    if kind==2071 {
+        let inner:Immediate=immediate_operand(e,W(e,r,5),depth+1);
+        if inner.present==false { return inner; }
+        if inner.signed>1 { return inner; }
+        if op==machine_ir.OP_NEG() {
+            if inner.signed!=0 { rt_free(runtime(),inner);return Immediate{present:true,value:0,signed:2}; }
+            let mut sign:u64=0; if inner.value!=0 { sign=1; }
+            // THE CHILD'S VALUE IS TAKEN BEFORE THE CHILD IS FREED.
+            let negated:u64=negate(inner.value);
+            rt_free(runtime(),inner);
+            return Immediate{present:true,value:negated,signed:sign};
+        }
+        if op==machine_ir.OP_NOT() {
+            let mut magnitude:u64=inner.value; if inner.signed==1 { magnitude=negate(magnitude); }
+            rt_free(runtime(),inner);
+            return Immediate{present:true,value:~magnitude,signed:0};
+        }
+        rt_free(runtime(),inner);
+        return Immediate{present:true,value:0,signed:2};
+    }
+    if kind==2070 {
+        let left:Immediate=immediate_operand(e,W(e,r,5),depth+1);
+        let right:Immediate=immediate_operand(e,W(e,r,6),depth+1);
+        if left.present==false || right.present==false { rt_free(runtime(),left);rt_free(runtime(),right);return Immediate{present:false,value:0,signed:0}; }
+        if left.signed!=0 || right.signed!=0 { rt_free(runtime(),left);rt_free(runtime(),right);return Immediate{present:true,value:0,signed:2}; }
+        // THE TWO CHILDREN'S VALUES ARE TAKEN BEFORE THE TWO CHILDREN ARE
+        // FREED: the cells are ours, the values are what the caller gets.
+        let x:u64=left.value; let y:u64=right.value;
+        rt_free(runtime(),left);rt_free(runtime(),right);
+        let mut v:u64=0; let mut sign:u64=0;
+        if op==machine_ir.OP_ADD() { if x>18446744073709551615-y { return Immediate{present:true,value:0,signed:2}; } v=x+y; }
+        else if op==machine_ir.OP_SUB() { v=x-y; if x<y { sign=1; } }
+        else if op==machine_ir.OP_MUL() { if y!=0 && x>18446744073709551615/y { return Immediate{present:true,value:0,signed:2}; } v=x*y; }
+        else if op==machine_ir.OP_DIV() { if y==0 { return Immediate{present:true,value:0,signed:2}; } v=x/y; }
+        else if op==machine_ir.OP_REM() { if y==0 { return Immediate{present:true,value:0,signed:2}; } v=x%y; }
+        else if op==machine_ir.OP_AND() { v=x&y; }
+        else if op==machine_ir.OP_OR() { v=x|y; }
+        else if op==machine_ir.OP_XOR() { v=x^y; }
+        else if op==machine_ir.OP_SHL() { if y>=64 { return Immediate{present:true,value:0,signed:2}; } v=x<<y; }
+        else if op==machine_ir.OP_SHR() || op==machine_ir.OP_SAR() { if y>=64 { return Immediate{present:true,value:0,signed:2}; } v=x>>y; }
+        else if op==machine_ir.OP_EQ() { if x==y { v=1; } }
+        else if op==machine_ir.OP_NE() { if x!=y { v=1; } }
+        else if op==machine_ir.OP_LT_U() || op==machine_ir.OP_LT_S() { if x<y { v=1; } }
+        else if op==machine_ir.OP_LE_U() || op==machine_ir.OP_LE_S() { if x<=y { v=1; } }
+        else if op==machine_ir.OP_GT_U() || op==machine_ir.OP_GT_S() { if x>y { v=1; } }
+        else if op==machine_ir.OP_GE_U() || op==machine_ir.OP_GE_S() { if x>=y { v=1; } }
+        else { return Immediate{present:true,value:0,signed:2}; }
+        return Immediate{present:true,value:v,signed:sign};
+    }
+    return Immediate{present:false,value:0,signed:0};
+}
+fn immediate_legal(e:E,r:u64,op:u64)->u64 {
+    let mut v:u64=W(e,r,6);
+    if op==machine_ir.OP_COPY() && W(e,r,8)==1 { v=W(e,r,5); }
+    let imm:Immediate=immediate_operand(e,v,0);
+    if imm.present==false { rt_free(runtime(),imm);return 0; }
+    if imm.signed>1 { rt_free(runtime(),imm);return fail(e,E_FORM(),r); }
+    // THE SPELLING IS A LITERAL AT EVERY STEP, and the one it replaces is
+    // freed before it is replaced.
+    let mut name:buf<u8>="";
+    if op==machine_ir.OP_COPY() { rt_free(runtime(),name);name="mov"; }
+    else if op==machine_ir.OP_ADD() { rt_free(runtime(),name);name="add"; }
+    else if op==machine_ir.OP_SUB() { rt_free(runtime(),name);name="sub"; }
+    else if op==machine_ir.OP_CMP() { rt_free(runtime(),name);name="cmp"; }
+    else if op==machine_ir.OP_TEST() { rt_free(runtime(),name);name="test"; }
+    else if op==machine_ir.OP_AND() { rt_free(runtime(),name);name="and"; }
+    else if op==machine_ir.OP_OR() { rt_free(runtime(),name);name="or"; }
+    else if op==machine_ir.OP_XOR() { rt_free(runtime(),name);name="xor"; }
+    else if op==machine_ir.OP_SHL() { rt_free(runtime(),name);name="shl"; }
+    else if op==machine_ir.OP_SHR() { rt_free(runtime(),name);name="shr"; }
+    else if op==machine_ir.OP_SAR() { rt_free(runtime(),name);name="sar"; }
+    else { rt_free(runtime(),name);return 0; }
+    let b:buf<u8>=e.enc; let mut code:u64=0;
+    if op==machine_ir.OP_SHL() || op==machine_ir.OP_SHR() || op==machine_ir.OP_SAR() {
+        code=x64_fixed.encode_shift_imm(name,2,0,W(e,r,9),imm.value,1,0,b);
+    } else {
+        code=x64_fixed.encode_binary(name,2,1,0,0,W(e,r,9),2,0,0,0,16,16,1,0,0,imm.value,imm.signed,1,0,b);
+    }
+    // THE ENCODER HAS BORROWED THE SPELLING AND THE IMMEDIATE, and both are
+    // freed now that it has answered.
+    rt_free(runtime(),name);rt_free(runtime(),imm);
+    // This is validation only: arith emits the physical scratch-register form.
+    if code!=0 { return fail(e,E_FORM(),r); }
+    return 0;
+}
+
+// Find a source register access through grouping copies. Values computed
+// from locals, calls or arithmetic are deliberately not register operands.
+fn source_register(e:E,value:u64,depth:u64)->u64 {
+    let r:u64=definer(e,value);
+    if r==0 || depth>64 { return 0; }
+    if K(e,r)==2056 && W(e,r,22)==1 { return r; }
+    if K(e,r)==2069 { return source_register(e,W(e,r,5),depth+1); }
+    return 0;
+}
+fn physical_form_legal(e:E,r:u64,op:u64)->u64 {
+    let mut right:u64=W(e,r,6);
+    if op==machine_ir.OP_COPY() && W(e,r,8)==1 { right=W(e,r,5); }
+    let source:u64=source_register(e,right,0);
+    if source==0 { return 0; }
+    let mut family:u64=W(e,r,20); let mut offset:u64=W(e,r,21);
+    if family==0 {
+        let left:u64=source_register(e,W(e,r,5),0);
+        if left==0 { return 0; }
+        family=W(e,left,20); offset=W(e,left,21);
+    }
+    // THE SPELLING IS A LITERAL AT EVERY STEP, and the one it replaces is
+    // freed before it is replaced.
+    let mut name:buf<u8>="";
+    if op==machine_ir.OP_COPY() { rt_free(runtime(),name);name="mov"; }
+    else if op==machine_ir.OP_ADD() { rt_free(runtime(),name);name="add"; }
+    else if op==machine_ir.OP_SUB() { rt_free(runtime(),name);name="sub"; }
+    else if op==machine_ir.OP_CMP() { rt_free(runtime(),name);name="cmp"; }
+    else if op==machine_ir.OP_TEST() { rt_free(runtime(),name);name="test"; }
+    else if op==machine_ir.OP_AND() { rt_free(runtime(),name);name="and"; }
+    else if op==machine_ir.OP_OR() { rt_free(runtime(),name);name="or"; }
+    else if op==machine_ir.OP_XOR() { rt_free(runtime(),name);name="xor"; }
+    else if op==machine_ir.OP_SHL() { rt_free(runtime(),name);name="shl"; }
+    else if op==machine_ir.OP_SHR() { rt_free(runtime(),name);name="shr"; }
+    else if op==machine_ir.OP_SAR() { rt_free(runtime(),name);name="sar"; }
+    else { rt_free(runtime(),name);return 0; }
+    let enc:buf<u8>=e.enc; let mut code:u64=0;
+    if op==machine_ir.OP_SHL() || op==machine_ir.OP_SHR() || op==machine_ir.OP_SAR() {
+        if W(e,source,21)!=0 || W(e,source,9)!=8 { rt_free(runtime(),name);return fail(e,E_FORM(),r); }
+        code=x64_fixed.encode_shift_cl(name,2,family-1,W(e,r,9),W(e,source,20)-1,offset/8,1,0,enc);
+    } else {
+        code=x64_fixed.encode_binary(name,2,1,family-1,offset/8,W(e,r,9),1,W(e,source,20)-1,W(e,source,21)/8,W(e,source,9),16,16,1,0,0,0,0,1,0,enc);
+    }
+    // THE ENCODER HAS BORROWED THE SPELLING, and it is freed now that it has
+    // answered.
+    rt_free(runtime(),name);
+    if code!=0 { return fail(e,E_FORM(),r); }
+    return 0;
+}
+
+fn emit_call(e:E,r:u64)->u64 {
+    let indirect:bool=K(e,r)==2087;
+    let mut f:u64=0;
+    if indirect { f=W(e,r,15); }else { f=callee(e,W(e,r,5)); }
+    if f==0 || f>e.count || K(e,f)!=2051 { return fail(e,E_CALL(),r); }
+    // The first indirect transport is EFI/ms_abi. Its argument registers never
+    // include r11, which is reserved as the final call-target scratch here.
+    if indirect && abi_profile(e,f)!=2 { return fail(e,E_CALL(),r); }
+    if indirect { e.current=r;need(e,W(e,r,5)); }
+    let mask:u64=W(e,r,23);
+    let mut expected:u64=declared_mask(e,f);
+    if (W(e,f,13)&machine_ir.FLAG_RESULT_TYPED())!=0 && W(e,f,15)!=0 { expected=expected|1; }
+    if mask!=expected { return fail(e,E_IMAGE(),r); }
+    let argc:u64=W(e,r,14);
+    let mut input_count:u64=0; let mut ordinal:u64=0;
+    while ordinal<W(e,f,14) {
+        let p:u64=formal(e,f,ordinal);
+        if p==0 || passable(e,f,p)!=0 { return fail(e,E_CALL(),r); }
+        if (W(e,p,13)&machine_ir.FLAG_DIR_OUT())==0 { input_count=input_count+1; }
+        ordinal=ordinal+1;
+    }
+    if argc!=input_count || argc>64 || W(e,r,8)>3 { return fail(e,E_CALL(),r); }
+    // Every argument is materialized BEFORE any register is loaded: lowering
+    // a later definition uses rax, rcx and rdx, and would overwrite an
+    // argument register already filled.
+    let mut k:u64=0;
+    while k<argc {
+        let value:u64=machine_ir.call_argument(e.words,e.count,r,k);
+        e.current=r;need(e,value);ld(e,0,value);mem(e,1,0,64,5,frame(e,e.args+k));
+        k=k+1;
+    }
+    if abi_profile(e,f)==2 {
+        ordinal=4;
+        while ordinal<W(e,f,14) && e.code==0 {
+            let p:u64=formal(e,f,ordinal);pass_argument(e,p,e.args+ordinal);ordinal=ordinal+1;
+        }
+    }
+    // Supply the entire physical state, then the explicit argument bindings.
+    let mut family:u64=1;
+    while family<=16 {
+        if family!=5 && family!=6 { mem(e,0,family-1,64,5,cell_frame(e,family)); }
+        family=family+1;
+    }
+    restore_flags(e);
+    // restore_flags uses rdx as scratch; its original cell is restored too.
+    mem(e,0,2,64,5,cell_frame(e,3));
+    k=0;
+    ordinal=0;
+    while ordinal<W(e,f,14) && e.code==0 {
+        let p:u64=formal(e,f,ordinal);
+        if (W(e,p,13)&machine_ir.FLAG_DIR_OUT())==0 {
+            if abi_profile(e,f)!=2 || ordinal<4 { pass_argument(e,p,e.args+k); }k=k+1;
+        }
+        ordinal=ordinal+1;
+    }
+    let name:buf<u8>="call";
+    let b:buf<u8>=e.enc;
+    if indirect {
+        // need() and every argument computation ran before register setup.
+        // Loading the immutable target now cannot overwrite any ABI argument.
+        ld(e,11,W(e,r,5));
+        emit_bytes(e,x64_fixed.encode_control(name,1,1,64,11,0,1,0,b));
+    } else {
+        emit_bytes(e,x64_fixed.encode_control(name,1,4,0,0,0,1,0,b));
+        relocate(e,f);
+    }
+    rt_free(runtime(),name);
+    e.last_call=r;
+    family=1;
+    while family<=16 {
+        if family!=5 && family!=6 && (mask&(1<<(family-1)))!=0 { mem(e,1,family-1,64,5,cell_frame(e,family)); }
+        family=family+1;
+    }
+    if (mask&131072)!=0 { capture_flags(e); }
+    if W(e,r,4)!=0 {
+        if (W(e,f,13)&machine_ir.FLAG_RESULT_TYPED())==0 || W(e,f,15)==0 { return fail(e,E_CALL(),r); }
+        // An import's result above its width is the callee's business, not a
+        // promise: the width invariant is restored here.
+        normalize(e,0,W(e,r,9),W(e,r,10));
+        st(e,W(e,r,4),0);
+    }
+    return e.code;
+}
+fn emit_unsigned_mul(e:E,r:u64)->u64 {
+    let source:u64=W(e,r,5); let width:u64=W(e,r,9);
+    if W(e,r,8)!=1 || machine_width(width)==false { return fail(e,E_FORM(),r); }
+    let input:u64=definer(e,source);
+    let reg:u64=source_register(e,source,0);
+    if reg==0 && (input==0 || K(e,input)!=2067) { return fail(e,E_FORM(),r); }
+    need(e,source);ld(e,1,source);mem(e,0,0,64,5,cell_frame(e,1));
+    restore_flags(e);mem(e,0,2,64,5,cell_frame(e,3));
+    let name:buf<u8>="mul";un_width_owned(e,name,1,width);
+    mem(e,1,0,64,5,cell_frame(e,1));
+    if width!=8 { mem(e,1,2,64,5,cell_frame(e,3)); }
+    return capture_flags(e);
+}
+fn emit_signed_mul(e:E,r:u64)->u64 {
+    let width:u64=W(e,r,9); let n:u64=W(e,r,8);
+    if width==8 || (n!=2 && n!=3) || W(e,r,20)==0 { return fail(e,E_FORM(),r); }
+    let mut source:u64=W(e,r,6);let reg:u64=source_register(e,source,0);
+    let input:u64=definer(e,source);
+    if reg==0 && (input==0 || K(e,input)!=2067) { return fail(e,E_FORM(),r); }
+    if reg!=0 && W(e,reg,9)!=width { return fail(e,E_FORM(),r); }
+    if reg==0 && W(e,input,9)!=width { return fail(e,E_FORM(),r); }
+    let name:buf<u8>="imul";let enc:buf<u8>=e.enc;
+    if n==2 {
+        need(e,W(e,r,5));need(e,source);ld(e,0,W(e,r,5));ld(e,1,source);
+        emit_bytes(e,x64_fixed.encode_imul(name,2,0,0,0,1,0,0,width,1,1,0,width,16,16,1,0,0,1,0,enc));
+    } else {
+        let literal:Immediate=immediate_operand(e,W(e,r,7),0);
+        if literal.present==false || literal.signed>1 { rt_free(runtime(),literal);rt_free(runtime(),name);return fail(e,E_FORM(),r); }
+        need(e,source);ld(e,1,source);
+        emit_bytes(e,x64_fixed.encode_imul(name,3,literal.value,literal.signed,0,1,0,0,width,1,1,0,width,16,16,1,0,0,1,0,enc));
+        // THE IMMEDIATE IS A CELL, and its last read is the one above.
+        rt_free(runtime(),literal);
+    }
+    rt_free(runtime(),name);
+    capture_flags(e);normalize(e,0,width,0);return st(e,W(e,r,4),0);
+}
+
+fn emit_asm(e:E,r:u64)->u64 {
+    let op:u64=W(e,r,14);
+    if op==machine_ir.OP_UMUL() { return emit_unsigned_mul(e,r); }
+    if op==machine_ir.OP_MUL() { return emit_signed_mul(e,r); }
+    immediate_legal(e,r,op); if e.code!=0 { return e.code; }
+    physical_form_legal(e,r,op); if e.code!=0 { return e.code; }
+    // A decomposed instruction is a marker: its meaning is in the records
+    // the lowering built for it (a store's address and value records).
+    if W(e,r,15)!=0 { return 0; }
+    if W(e,r,4)==0 {
+        // `load rbx,[x]` names the value its `mir_load` defines: requiring it
+        // HERE keeps the load at the instruction's place in the program.
+        let mut i:u64=0;
+        while i<W(e,r,8) && i<3 { let v:u64=W(e,r,5+i); if v!=0 { need(e,v); } i=i+1; }
+        // Destination and element widths are separate facts.
+        if op==machine_ir.OP_LOAD() {
+            let access:u64=definer(e,W(e,r,5));
+            if access==0 || W(e,access,9)<W(e,r,9) { return fail(e,E_FORM(),r); }
+            // The datum read must be as wide as the register written: the
+            // reference refuses `load rax,[b]:ptr<user,u8>` (E400), the Nova
+            // validation accepted it, and this emitter read eight bytes of a
+            // one-byte datum (fourth review, executed). The `mir_load` carries
+            // 64 there -- machine_ir's access_width reads the annotation's
+            // pointer node, not its element -- so the width compared is the
+            // one the named `data` declares.
+            let lv:u64=definer(e,W(e,r,5));
+            if lv!=0 && K(e,lv)==2067 {
+                let ad:u64=definer(e,W(e,lv,5));
+                if ad!=0 && K(e,ad)==2066 && W(e,ad,7)!=0 {
+                    let datum:u64=named_storage(e,W(e,ad,7));
+                    if datum!=0 && K(e,datum)==2060 && W(e,datum,9)!=0 && W(e,datum,9)<W(e,r,9) { return fail(e,E_FORM(),r); }
+                }
+            }
+            return e.code;
+        }
+        if op==machine_ir.OP_NOP() { return put(e,144); }
+        return fail(e,E_FORM(),r);
+    }
+    // A flags predicate (`cmp`, `test`) is consumed by the conditional jump
+    // that names it, which recomputes it in place: flags do not survive the
+    // slot traffic between here and the jump.
+    if W(e,r,12)==machine_ir.CLASS_PREDICATE() {
+        let literal:Immediate=immediate_operand(e,W(e,r,6),0);
+        need(e,W(e,r,5)); if literal.present==false || literal.signed>1 { need(e,W(e,r,6)); }
+        ld(e,0,W(e,r,5));
+        if literal.present && literal.signed<=1 { let mov:buf<u8>="mov";ri_owned(e,mov,1,64,literal.value); }
+        else { ld(e,1,W(e,r,6)); }
+        // THE IMMEDIATE IS A CELL, and its last read is the one above.
+        rt_free(runtime(),literal);
+        let mut c:buf<u8>="cmp";
+        if op==machine_ir.OP_TEST() { rt_free(runtime(),c);c="test"; }
+        let encoded:buf<u8>=e.enc;
+        emit_bytes(e,x64_fixed.encode_binary(c,2,1,0,0,W(e,r,9),1,1,0,W(e,r,9),16,16,1,0,0,0,0,1,0,encoded));
+        rt_free(runtime(),c);
+        return capture_flags(e);
+    }
+    // Explicit destination width is consumed by the physical operation.
+    if machine_width(W(e,r,9))==false { return fail(e,E_FORM(),r); }
+    // `div` AND `idiv` AS INSTRUCTIONS are refused (fifth review, 7 October
+    // 2026, executed): machine_ir maps both to one OP_DIV, so the signedness
+    // `arith` reads (word 10) is the operand's and not the mnemonic's, and the
+    // two-operand `idiv rax,rcx` the reference refuses (E400) ran unsigned.
+    // A division in an EXPRESSION carries its type's signedness and is kept.
+    if op==machine_ir.OP_DIV() || op==machine_ir.OP_REM() { return fail(e,E_FORM(),r); }
+    if op==machine_ir.OP_NEG() || op==machine_ir.OP_NOT() {
+        need(e,W(e,r,5)); ld(e,0,W(e,r,5));
+        let mut name:buf<u8>="neg"; if op==machine_ir.OP_NOT() { rt_free(runtime(),name);name="not"; }
+        un_width_owned(e,name,0,W(e,r,9));
+        if (W(e,r,22)&4)!=0 { capture_flags(e); }
+        normalize(e,0,W(e,r,9),W(e,r,10)); return st(e,W(e,r,4),0);
+    }
+    return arith(e,r,op,W(e,r,5),W(e,r,6));
+}
+fn lower(e:E,r:u64)->u64 {
+    if e.code!=0 { return e.code; }
+    let done:buf<u64>=e.done;
+    if done[r]!=0 { return 0; }
+    e.current=r;done[r]=1;
+    let kind:u64=K(e,r);
+    if kind==2058 || kind==2057 || kind==2082 || kind==2083 || kind==2084 || kind==2063 || kind==2064 { return 0; }
+    if kind==2056 && W(e,r,22)==1 { return emit_cell_read(e,r); }
+    if kind==2055 || kind==2056 || kind==2062 || kind==2080 { return 0; }
+    if kind==2069 || kind==2070 || kind==2071 {
+        let folded:Immediate=immediate_operand(e,W(e,r,4),0);
+        if folded.present && folded.signed<=1 {
+            let mov:buf<u8>="mov"; ri_owned(e,mov,0,64,folded.value);
+            // THE IMMEDIATE IS A CELL, and its last read is the one above.
+            rt_free(runtime(),folded);
+            normalize(e,0,W(e,r,9),W(e,r,10)); return st(e,W(e,r,4),0);
+        }
+        rt_free(runtime(),folded);
+    }
+    if kind==2069 { return arith(e,r,machine_ir.OP_COPY(),W(e,r,5),0); }
+    // A same-width CONVERT reinterprets the signedness (machine_ir's coerce,
+    // the "Same width" arm). Its bits are the source's; in a slot it is
+    // re-normalized to the new signedness (`emit_convert`).
+    if kind==2073 { return emit_convert(e,r); }
+    if kind==2070 { return arith(e,r,W(e,r,14),W(e,r,5),W(e,r,6)); }
+    if kind==2071 { return emit_unary(e,r); }
+    if kind==2074 { return emit_resize(e,r,true); }
+    if kind==2075 { return emit_resize(e,r,false); }
+    if kind==2086 { return emit_local_cell(e,r); }
+    if kind==2066 { return emit_address(e,r); }
+    if kind==2067 { return emit_load(e,r); }
+    if kind==2068 { return emit_store(e,r); }
+    if kind==2076 || kind==2087 { return emit_call(e,r); }
+    if kind==2065 { emit_asm(e,r); if e.code==0 && (W(e,r,22)&2)!=0 && W(e,r,14)!=machine_ir.OP_UMUL() { emit_cell_write(e,r); } return e.code; }
+    return fail(e,E_FORM(),r);
+}
+
+// ---- frames ------------------------------------------------------------------
+// The registers every function saves, in push order. rax is pushed after them
+// when the function declares no result; rsp and rbp are the frame itself.
+fn saved_register(i:u64)->u64 {
+    if i==0 { return 3; }
+    if i==1 { return 1; }
+    if i==2 { return 2; }
+    if i==3 { return 6; }
+    if i==4 { return 7; }
+    return i+3;
+}
+fn epilogue(e:E)->u64 {
+    let mut index:u64=0; let mut count:u64=13;
+    if e.keep==1 { count=14; }
+    while index<count {
+        let mut reg:u64=saved_register(index); if index==13 { reg=0; }
+        if (e.mask&(1<<reg))!=0 {
+            mem(e,0,1,64,5,cell_frame(e,reg+1));
+            let output:u64=output_formal(e,e.func,reg+1);
+            let mut width:u64=64; let mut offset:u64=0;
+            if (e.raw_mask&(1<<reg))==0 && output!=0 && W(e,output,9)<32 {
+                width=W(e,output,9); offset=W(e,output,21)/8;
+                if offset!=0 { let shift:buf<u8>="shr"; shift_imm_owned(e,shift,1,8); }
+            }
+            mem(e,1,1,width,5,negate(8*(index+1))+offset);
+        }
+        index=index+1;
+    }
+    if (e.mask&131072)!=0 {
+        mem(e,0,1,64,5,cell_frame(e,17)); mem(e,1,1,64,5,negate(e.saved));
+    }
+    let b:buf<u8>=e.enc;
+    emit_bytes(e,x64_fixed.encode_lea(4,64,5,16,1,negate(e.saved),0,1,0,b));
+    let pf:buf<u8>="popfq"; op0_owned(e,pf);
+    if e.keep==1 { pop(e,0); }
+    let mut i:u64=13;
+    while i>0 { i=i-1; pop(e,saved_register(i)); }
+    pop(e,5);
+    let ret:buf<u8>="ret";
+    return op0_owned(e,ret);
+}
+fn jcc_name(code:u64)->buf<u8> {
+    if code==1 { return "je"; }
+    if code==2 { return "jne"; }
+    if code==3 { return "ja"; }
+    if code==4 { return "jae"; }
+    if code==5 { return "jb"; }
+    if code==6 { return "jbe"; }
+    if code==7 { return "jg"; }
+    if code==8 { return "jge"; }
+    if code==9 { return "jl"; }
+    if code==10 { return "jle"; }
+    if code==11 { return "js"; }
+    return "jns";
+}
+fn terminator(e:E,t:u64)->u64 {
+    e.current=t;
+    let done:buf<u64>=e.done;
+    done[t]=1;
+    let kind:u64=K(e,t);
+    if kind==2077 {
+        if W(e,t,8)>=1 && W(e,t,5)!=0 {
+            if e.keep==1 { return fail(e,E_FORM(),t); }
+            need(e,W(e,t,5));ld(e,0,W(e,t,5));
+            normalize(e,0,W(e,e.func,15),W(e,e.func,10));
+        }
+        return epilogue(e);
+    }
+    if kind==2078 { let jmp:buf<u8>="jmp"; return jump_to_owned(e,jmp,false,W(e,t,5)); }
+    if kind==2079 {
+        let jcc:u64=W(e,t,15);
+        if jcc==0 {
+            need(e,W(e,t,5));ld(e,0,W(e,t,5));
+            let c:buf<u8>="cmp"; ri_owned(e,c,0,64,0);
+            let jne:buf<u8>="jne"; jump_to_owned(e,jne,true,W(e,t,6));
+            let jmp:buf<u8>="jmp"; return jump_to_owned(e,jmp,false,W(e,t,7));
+        }
+        if jcc>12 { return fail(e,E_FORM(),t); }
+        restore_flags(e);
+        let name:buf<u8>=jcc_name(jcc);
+        jump_to_owned(e,name,true,W(e,t,6));
+        let jmp:buf<u8>="jmp"; return jump_to_owned(e,jmp,false,W(e,t,7));
+    }
+    if kind==2081 { let u:buf<u8>="ud2"; return op0_owned(e,u); }
+    return fail(e,E_FORM(),t);
+}
+fn lower_block(e:E,blk:u64,bend:u64)->u64 {
+    e.block=blk;e.bend=bend;e.last_call=0;
+    let place:buf<u64>=e.place;
+    place[blk]=e.at+1;
+    let term:u64=W(e,blk,14);
+    if term<=blk || term>=bend { return fail(e,E_IMAGE(),blk); }
+    let mut r:u64=blk+1;
+    while r<bend && e.code==0 { if r!=term { lower(e,r); } r=r+1; }
+    return terminator(e,term);
+}
+fn lower_function(e:E,f:u64)->u64 {
+    let fend:u64=subtree_end(e,f);
+    e.func=f;e.fend=fend;e.block=0;e.bend=0;
+    e.keep=0;
+    if (W(e,f,13)&machine_ir.FLAG_RESULT_TYPED())==0 || W(e,f,15)==0 { e.keep=1; }
+    e.calls=0;let mut max_args:u64=2;let mut stack_args:u64=0;
+    let mut c:u64=f+1;
+    while c<fend {
+        if K(e,c)==2076 || K(e,c)==2087 {
+            e.calls=e.calls+1;let argc:u64=W(e,c,14);if argc>max_args { max_args=argc; }
+            let mut target:u64=0;
+            if K(e,c)==2087 { target=W(e,c,15); }else { target=callee(e,W(e,c,5)); }
+            if target!=0 && abi_profile(e,target)==2 && W(e,target,14)>4 {
+                let stack:u64=W(e,target,14)-4;if stack>stack_args { stack_args=stack; }
+            }
+        }
+        c=c+1;
+    }
+    // One slot per value this function defines; constants and flag
+    // predicates have none (they are rematerialized where they are used).
+    let slots:buf<u64>=e.slots;
+    let mut n:u64=0;
+    let mut r:u64=f+1;
+    while r<fend {
+        let v:u64=W(e,r,4);
+        if v!=0 && K(e,r)!=2058 && (K(e,r)!=2065 || W(e,r,12)!=machine_ir.CLASS_PREDICATE()) {
+            if slots[v]==0 {
+                n=n+1; slots[v]=n;
+                // The next slot is private storage, separate from its address.
+                if K(e,r)==2086 { n=n+1; }
+            }
+        }
+        r=r+1;
+    }
+    e.cells=n; e.args=n+18; n=n+17+max_args;
+    e.mask=declared_mask(e,f); e.raw_mask=raw_clobbers(e,f);
+    let place:buf<u64>=e.place;
+    let extent:buf<u64>=e.extent;
+    let start:u64=e.at;
+    place[f]=start+1;
+    // The prologue: rbp frame, thirteen saved registers, rax when no result,
+    // rflags, then the slots, the 32-byte home area and the pad that makes
+    // rsp a multiple of 16.
+    push(e,5);
+    let mov:buf<u8>="mov"; rr_owned(e,mov,5,4,64);
+    let mut i:u64=0;
+    while i<13 { push(e,saved_register(i)); i=i+1; }
+    if e.keep==1 { push(e,0); }
+    let pf:buf<u8>="pushfq"; op0_owned(e,pf);
+    let pushes:u64=14+e.keep;
+    e.saved=8*pushes;
+    let mut room:u64=8*n+32+8*stack_args;
+    if (8*pushes+room)%16!=0 { room=room+8; }
+    if room>2147483647 { return fail(e,E_LAYOUT(),f); }
+    let sub:buf<u8>="sub"; ri_owned(e,sub,4,64,room);
+    // Capture every incoming family before any scratch computation.
+    let mut family:u64=1;
+    while family<=16 {
+        if family!=5 && family!=6 { mem(e,1,family-1,64,5,cell_frame(e,family)); }
+        family=family+1;
+    }
+    // The formals, from the registers the caller filled, into their slots.
+    let done:buf<u64>=e.done;
+    r=f+1;
+    while r<fend && e.code==0 {
+        if K(e,r)==2054 && W(e,r,16)==f {
+            let why:u64=passable(e,f,r);
+            if why!=0 { return fail(e,why,r); }
+            if abi_profile(e,f)==2 && W(e,r,14)>=4 {
+                mem(e,0,0,64,5,48+8*(W(e,r,14)-4));
+                normalize(e,0,W(e,r,9),W(e,r,10));st(e,W(e,r,4),0);
+            } else {
+                let family:u64=formal_family(e,r);
+                mem(e,0,0,64,5,cell_frame(e,family));
+                if W(e,r,21)!=0 { let shift:buf<u8>="shr";shift_imm_owned(e,shift,0,W(e,r,21)); }
+                normalize(e,0,W(e,r,9),W(e,r,10));st(e,W(e,r,4),0);
+            }
+            done[r]=1;
+        }
+        r=r+1;
+    }
+    mem(e,0,2,64,5,negate(e.saved)); mem(e,1,2,64,5,cell_frame(e,17));
+    let frame_bytes:buf<u8>=e.enc;
+    emit_bytes(e,x64_fixed.encode_lea(2,64,5,16,1,8,0,1,0,frame_bytes));
+    mem(e,1,2,64,5,cell_frame(e,5));
+    mem(e,0,2,64,5,0); mem(e,1,2,64,5,cell_frame(e,6));
+    // The blocks, in image order. The entry block is the function's arg_a
+    // and is normally the first; when it is not, the prologue jumps to it.
+    let mut first:u64=0;
+    r=f+1;
+    while r<fend && first==0 { if K(e,r)==2053 && W(e,r,16)==f { first=r; } r=r+1; }
+    if first==0 { return fail(e,E_IMAGE(),f); }
+    if first!=W(e,f,5) { let jmp:buf<u8>="jmp"; jump_to_owned(e,jmp,false,W(e,f,5)); }
+    r=f+1;
+    while r<fend && e.code==0 {
+        if K(e,r)==2053 && W(e,r,16)==f {
+            let bend:u64=subtree_end(e,r);
+            lower_block(e,r,bend);
+            r=bend;
+        } else { r=r+1; }
+    }
+    extent[f]=e.at-start;
+    return e.code;
+}
+
+// ---- text, for names and contracts -------------------------------------------
+fn tb(t:T,byte:u64)->u64 {
+    if t.at>=t.cap { t.bad=1; return 0; }
+    let b:buf<u8>=t.bytes;
+    b[t.at]=u8(byte&255);
+    t.at=t.at+1;
+    return 0;
+}
+fn ts(t:T,text:buf<u8>)->u64 {
+    let mut i:u64=0;
+    while i<len(text) { let c:u64=text[i]; tb(t,c); i=i+1; }
+    return 0;
+}
+// The text is COPIED into the writer and the writer keeps nothing of it, so
+// this wrapper owns the literal it is given: the copy has happened, the
+// literal is freed, and the writer's own answer is returned. `ts` itself stays
+// the borrowed form for a buffer that belongs to somebody else.
+fn ts_owned(t:T,text:buf<u8>)->u64 { let r:u64=ts(t,text); rt_free(runtime(),text); return r; }
+fn tspan(t:T,source:buf<u8>,start:u64,end:u64)->u64 {
+    if start>end || end>len(source) { t.bad=1; return 0; }
+    let mut i:u64=start;
+    while i<end { let c:u64=source[i]; tb(t,c); i=i+1; }
+    return 0;
+}
+fn tdec(t:T,value:u64)->u64 {
+    if value==0 { return tb(t,48); }
+    let mut digits:u64=0;
+    let mut rest:u64=value;
+    while rest!=0 { rest=rest/10; digits=digits+1; }
+    let mut k:u64=digits;
+    while k>0 {
+        k=k-1;
+        let mut d:u64=value;
+        let mut j:u64=0;
+        while j<k { d=d/10; j=j+1; }
+        tb(t,48+d%10);
+    }
+    return 0;
+}
+fn thex16(t:T,value:u64)->u64 {
+    let alphabet:buf<u8>="0123456789abcdef";
+    let mut i:u64=16;
+    while i>0 {
+        i=i-1;
+        let mut d:u64=value;
+        let mut j:u64=0;
+        while j<i { d=d/16; j=j+1; }
+        let c:u64=alphabet[d%16];
+        tb(t,c);
+    }
+    rt_free(runtime(),alphabet);
+    return 0;
+}
+// object_build.c's type_text for the scalars: u8..u64, i8..i64, bool, never.
+// A pointer or an array answers false: the image keeps a pointer's space but
+// not its element type, so its text cannot be written.
+fn type_text(t:T,width:u64,signedness:u64,space:u64)->bool {
+    if space!=0 { return false; }
+    if width==1 && signedness==0 { let s:buf<u8>="bool"; ts_owned(t,s); return true; }
+    if width==0 && signedness==2 { let s:buf<u8>="never"; ts_owned(t,s); return true; }
+    if machine_width(width)==false || signedness>1 { return false; }
+    if signedness==1 { tb(t,105); } else { tb(t,117); }
+    tdec(t,width);
+    return true;
+}
+fn signature_root(e:E,owner:u64)->u64 {
+    let mut r:u64=1;
+    while r<=e.count { if K(e,r)==2084 && W(e,r,5)==owner && (W(e,r,13)&machine_ir.FLAG_NAMED())!=0 { return r; }r=r+1; }
+    return 0;
+}
+fn type_fact_text(e:E,t:T,r:u64,depth:u64)->bool {
+    if r==0 || r>e.count || K(e,r)!=2084 || depth>64 { return false; }
+    let form:u64=W(e,r,14);
+    if form==0 { return type_text(t,W(e,r,9),W(e,r,10),0); }
+    if form==1 {
+        let bits:u64=W(e,r,11);let mut number:u64=0;let mut bit:u64=1;let mut i:u64=1;
+        while i<=6 { if bits==bit { number=i; }bit=bit*2;i=i+1; }
+        if number==0 { return false; }
+        let ptr:buf<u8>="ptr<";ts_owned(t,ptr);tdec(t,number);tb(t,44);
+        if type_fact_text(e,t,W(e,r,6),depth+1)==false { return false; }tb(t,62);return true;
+    }
+    if form==2 {
+        let array:buf<u8>="array<";ts_owned(t,array);
+        if type_fact_text(e,t,W(e,r,6),depth+1)==false { return false; }tb(t,44);tdec(t,W(e,r,15));tb(t,62);return true;
+    }
+    return false;
+}
+fn declared_type_text(e:E,t:T,owner:u64)->bool {
+    let r:u64=signature_root(e,owner);if r==0 || W(e,r,14)==2 { return false; }
+    return type_fact_text(e,t,r,0);
+}
+fn fnv_text(text:buf<u8>)->u64 {
+    let mut h:u64=14695981039346656037;
+    let mut i:u64=0;
+    while i<len(text) { h=h^(text[i]); h=h*1099511628211; i=i+1; }
+    return h;
+}
+// The effects triple in object_build.c's numbers, from the entries the
+// `mir_effect` record keeps as `mir_symbol` children of the function. The
+// spaces are shifted by one because frontend.c's NTF_SPACE_USER is 1 and
+// effects.nova's user bit is bit 0.
+fn effects_of(e:E,f:u64,out:buf<u64>)->u64 {
+    out[0]=0;out[1]=0;out[2]=0;
+    let end:u64=subtree_end(e,f);
+    let mut eff:u64=0;
+    let mut r:u64=f+1;
+    while r<end && eff==0 { if K(e,r)==2063 && W(e,r,16)==f { eff=r; } r=r+1; }
+    if eff==0 || W(e,eff,8)==0 { return 0; }
+    let last:u64=W(e,eff,5);
+    if last<=eff || last-eff!=W(e,eff,14)+1 { return E_CONTRACT(); }
+    let s:buf<u8>=e.source;
+    let mut i:u64=eff+1;
+    while i<=last {
+        if K(e,i)!=2057 || W(e,i,16)!=f { return E_CONTRACT(); }
+        let a0:u64=W(e,i,5);
+        let a1:u64=W(e,i,6);
+        let atom:u64=effects.atom_of(s,a0,a1);
+        let memory:u64=effects.memory_of(s,a0,a1);
+        if memory!=0 {
+            let mut scope:u64=63;
+            let mut after:u64=a1;
+            while after<len(s) && (s[after]==32 || s[after]==9) { after=after+1; }
+            if after<len(s) && s[after]==40 {
+                if i+1>last { return E_CONTRACT(); }
+                scope=effects.space_of(s,W(e,i+1,5),W(e,i+1,6));
+                if scope==0 { return E_CONTRACT(); }
+                i=i+1;
+            }
+            if memory==1 { out[1]=out[1]|(scope*2); } else { out[2]=out[2]|(scope*2); }
+        } else if atom!=0 {
+            out[0]=out[0]|(1<<(atom-1));
+        } else { return E_CONTRACT(); }
+        i=i+1;
+    }
+    return 0;
+}
+fn clobbers_of(e:E,f:u64)->u64 {
+    let end:u64=subtree_end(e,f);
+    let mut r:u64=f+1;
+    while r<end {
+        if K(e,r)==2064 && W(e,r,16)==f && W(e,r,8)==1 { return W(e,r,5); }
+        r=r+1;
+    }
+    return 0;
+}
+// BOTH SPELLINGS ARE HASHED, and BOTH ARE FREED: one of them is consumed by
+// the comparison and the other is not consumed at all, and a literal that is
+// not consumed is still a literal that is allocated.
+fn profile_digest(digest:u64)->u64 {
+    let nx:buf<u8>="nx64-abi-v0";let ef:buf<u8>="efi-x64-v0";
+    let nx_digest:u64=fnv_text(nx);
+    let ef_digest:u64=fnv_text(ef);
+    rt_free(runtime(),nx);rt_free(runtime(),ef);
+    if digest==nx_digest { return 1; }if digest==ef_digest { return 2; }return 0;
+}
+// THE PROFILE OF THE UNIT, ONCE PER BUILD.
+//
+// This is the loop that was inside `abi_profile`, unchanged: the unit's
+// declarations are read in RECORD ORDER, the profile starts at 1, and the
+// LAST declaration that matches wins -- not the first. It was read again for
+// every call site, and every read walked the whole image; it is read once
+// here and the value is the same value the repeated loop produced. An
+// unknown digest is 0, exactly as `profile_digest` answers it, and the
+// digests are still computed from the two names rather than written down.
+fn unit_profile_of(e:E)->u64 {
+    let mut profile:u64=1;let mut r:u64=1;
+    while r<=e.count {
+        if K(e,r)==2062 && W(e,r,15)==0 && W(e,r,16)==1 { profile=profile_digest(W(e,r,14)); }
+        r=r+1;
+    }
+    return profile;
+}
+// THE PROFILE OF ONE FUNCTION: the unit's profile, then the function's own
+// declarations, read in the same order with the same last-one-wins rule, and
+// the subtree walked is the same subtree.
+//
+// THE CACHE IS LAZY AND PER FUNCTION. The value is stored PLUS ONE, so a
+// stored zero means "not computed yet" and a computed zero -- an unknown
+// digest, which is a real answer -- is stored as one and is not recomputed.
+// The cache holds one entry per record and is allocated and released with the
+// rest of the emitter's state; nothing survives a build.
+fn abi_profile(e:E,f:u64)->u64 {
+    let cache:buf<u64>=e.prof_cache;
+    let cacheable:bool=f!=0&&f<=e.count;
+    if cacheable {
+        let slot:u64=cache[f];
+        if slot!=0 { return slot-1; }
+    }
+    let mut profile:u64=e.unit_profile;
+    let mut r:u64=f+1;let end:u64=subtree_end(e,f);
+    while r<end {
+        if K(e,r)==2062 && W(e,r,15)==f { profile=profile_digest(W(e,r,14)); }
+        r=r+1;
+    }
+    if cacheable { cache[f]=profile+1; }
+    return profile;
+}
+fn abi_ok(e:E,f:u64)->bool { return abi_profile(e,f)!=0; }
+// object_build.c's contract_text for a function, field by field.
+struct Fold {
+    ok: bool,
+    value: u64,
+    negative: u64,
+}
+
+// THE FOLD CELLS ARE OURS. The cell that is RETURNED is the caller's, and
+// every other cell this function creates is freed before it returns: the
+// failure value, the two children and the result. The values never change.
+fn fold_res(res:Fold,fail:Fold)->Fold { rt_free(runtime(),fail); let out:Fold=res; return out; }
+fn contract_fold(e: E, r: u64, depth: u64) -> Fold {
+    let mut fail:Fold=Fold{ok:false,value:0,negative:0};
+    fail.ok = false;
+    fail.value = 0;
+    fail.negative = 0;
+
+    if depth > 64 { return fail; }
+    if r == 0 { return fail; }
+    if r > e.count { return fail; }
+    if K(e, r) != 2085 { return fail; }
+
+    let forme: u64 = W(e, r, 15);
+    if forme == 4 {
+        let mut res:Fold=Fold{ok:false,value:0,negative:0};
+        res.ok = true;
+        res.value = W(e, r, 6);
+        res.negative = W(e, r, 7);
+        return fold_res(res,fail);
+    }
+
+    if forme == 6 {
+        let left_idx: u64 = W(e, r, 6);
+        let right_idx: u64 = W(e, r, 7);
+        let op: u64 = W(e, r, 21);
+
+        let left_f: Fold = contract_fold(e, left_idx, depth + 1);
+        if !left_f.ok { rt_free(runtime(),left_f); return fail; }
+        // THE CHILD'S THREE VALUES ARE READ ONCE AND THE CHILD IS FREED: the
+        // cell is ours, and the values are what the caller gets.
+        let left_negative: u64 = left_f.negative;
+        let left_value: u64 = left_f.value;
+        rt_free(runtime(),left_f);
+
+        let is_unary: bool = (op == 17) || (op == 18) || (op == 19);
+        if is_unary {
+            if right_idx != 0 { return fail; }
+            if op == 17 {
+                if left_negative != 0 { return fail; }
+                let mut res:Fold=Fold{ok:false,value:0,negative:0};
+                res.ok = true;
+                res.value = left_value;
+                if left_value != 0 { res.negative = 1; } else { res.negative = 0; }
+                return fold_res(res,fail);
+            }
+            if op == 18 {
+                let mut res:Fold=Fold{ok:false,value:0,negative:0};
+                res.ok = true;
+                res.value = left_value ^ 18446744073709551615;
+                res.negative = 0;
+                return fold_res(res,fail);
+            }
+            if op == 19 {
+                // THE CHILD WAS THE RESULT: the same three values, in a cell
+                // of ours that the caller owns.
+                let mut res:Fold=Fold{ok:false,value:0,negative:0};
+                res.ok = true;
+                res.value = left_value;
+                res.negative = left_negative;
+                return fold_res(res,fail);
+            }
+            return fail;
+        }
+
+        if right_idx == 0 { return fail; }
+        let right_f: Fold = contract_fold(e, right_idx, depth + 1);
+        if !right_f.ok { rt_free(runtime(),right_f); return fail; }
+        let right_negative: u64 = right_f.negative;
+        let right_value: u64 = right_f.value;
+        rt_free(runtime(),right_f);
+        if left_negative != 0 || right_negative != 0 { return fail; }
+
+        let a: u64 = left_value;
+        let b: u64 = right_value;
+        let mut res:Fold=Fold{ok:false,value:0,negative:0};
+        res.ok = true;
+        res.negative = 0;
+
+        if op == 1 {
+            if 18446744073709551615 - a < b { return fail; }
+            res.value = a + b;
+            return fold_res(res,fail);
+        }
+        if op == 2 {
+            if a >= b {
+                res.value = a - b;
+                res.negative = 0;
+            } else {
+                res.value = b - a;
+                res.negative = 1;
+            }
+            return fold_res(res,fail);
+        }
+        if op == 3 {
+            if a != 0 && b > (18446744073709551615 / a) { return fail; }
+            res.value = a * b;
+            return fold_res(res,fail);
+        }
+        if op == 4 {
+            if b == 0 { return fail; }
+            res.value = a / b;
+            return fold_res(res,fail);
+        }
+        if op == 5 {
+            if b == 0 { return fail; }
+            res.value = a % b;
+            return fold_res(res,fail);
+        }
+        if op == 6 { res.value = a & b; return fold_res(res,fail); }
+        if op == 7 { res.value = a | b; return fold_res(res,fail); }
+        if op == 8 { res.value = a ^ b; return fold_res(res,fail); }
+        if op == 9 {
+            if b >= 64 { return fail; }
+            res.value = a << b;
+            return fold_res(res,fail);
+        }
+        if op == 10 {
+            if b >= 64 { return fail; }
+            res.value = a >> b;
+            return fold_res(res,fail);
+        }
+        if op == 11 { if a == b { res.value = 1; } else { res.value = 0; } return fold_res(res,fail); }
+        if op == 12 { if a != b { res.value = 1; } else { res.value = 0; } return fold_res(res,fail); }
+        if op == 13 { if a < b { res.value = 1; } else { res.value = 0; } return fold_res(res,fail); }
+        if op == 14 { if a <= b { res.value = 1; } else { res.value = 0; } return fold_res(res,fail); }
+        if op == 15 { if a > b { res.value = 1; } else { res.value = 0; } return fold_res(res,fail); }
+        if op == 16 { if a >= b { res.value = 1; } else { res.value = 0; } return fold_res(res,fail); }
+        if op == 20 { if a != 0 && b != 0 { res.value = 1; } else { res.value = 0; } return fold_res(res,fail); }
+        if op == 21 { if a != 0 || b != 0 { res.value = 1; } else { res.value = 0; } return fold_res(res,fail); }
+
+        return fail;
+    }
+
+    return fail;
+}
+
+fn contract_text(e:E,t:T,r:u64,depth:u64)->bool {
+    if r==0 || r>e.count || depth>64 || K(e,r)!=2085 { return false; }
+    let form:u64=W(e,r,15);
+    let folded:Fold=contract_fold(e,r,0);
+    if folded.ok {
+        let lit:buf<u8>="lit(";ts_owned(t,lit);
+        let op:u64=W(e,r,21);let mut width:u64=64;
+        if (form==4 && W(e,r,9)==1) || (form==6 && ((op>=11 && op<=16) || op==20 || op==21)) { width=1; }
+        if type_text(t,width,0,0)==false { rt_free(runtime(),folded);return false; }
+        tb(t,44);thex16(t,folded.value);tb(t,44);tdec(t,folded.negative);tb(t,41);
+        // THE FOLD IS A CELL OF OURS, and the two values above are its last
+        // reads.
+        rt_free(runtime(),folded);
+        return t.bad==0;
+    }
+    // THE FOLD IS A CELL OF OURS, and the flag was its last read.
+    rt_free(runtime(),folded);
+    if form==1 { let feature:buf<u8>="pred(feature)";ts_owned(t,feature);return t.bad==0; }
+    if form==3 { let param:buf<u8>="param(";ts_owned(t,param);tdec(t,W(e,r,6));tb(t,41);return t.bad==0; }
+    if form==5 {
+        let name:buf<u8>="name(";ts_owned(t,name);let sym:u64=W(e,r,6);
+        if sym==0 || sym>e.count || K(e,sym)!=2057 { return false; }
+        tspan(t,e.source,W(e,sym,5),W(e,sym,6));tb(t,41);return t.bad==0;
+    }
+    if form==6 {
+        let op:buf<u8>="op(";ts_owned(t,op);tdec(t,W(e,r,21));tb(t,44);
+        if contract_text(e,t,W(e,r,6),depth+1)==false { return false; }
+        if W(e,r,7)!=0 { tb(t,44);if contract_text(e,t,W(e,r,7),depth+1)==false { return false; } }
+        tb(t,41);return t.bad==0;
+    }
+    if form==2 {
+        let pred:buf<u8>="pred(";ts_owned(t,pred);let sym:u64=W(e,r,6);
+        if sym==0 || sym>e.count || K(e,sym)!=2057 { return false; }
+        tspan(t,e.source,W(e,sym,5),W(e,sym,6));
+        let mut arg:u64=W(e,r,7);let mut seen:u64=0;
+        while arg!=0 && seen<e.count { tb(t,44);if contract_text(e,t,arg,depth+1)==false { return false; }arg=W(e,arg,20);seen=seen+1; }
+        if arg!=0 { return false; }tb(t,41);return t.bad==0;
+    }
+    return false;
+}
+// Lexicographic compare:0equal,1left less,2left greater.
+fn contract_compare(a:T,b:T)->u64 {
+    let mut i:u64=0;
+    while i<a.at && i<b.at { if a.bytes[i]<b.bytes[i] { return 1; }if a.bytes[i]>b.bytes[i] { return 2; }i=i+1; }
+    if a.at<b.at { return 1; }if a.at>b.at { return 2; }return 0;
+}
+fn contract_clause_text(e:E,t:T,f:u64,clause:u64)->u64 {
+    let ids:buf<u64>=alloc(runtime(),e.count);let mut count:u64=0;let mut r:u64=f+1;
+    while r<=e.count {
+        if K(e,r)==2085 && W(e,r,5)==f && W(e,r,14)==clause && (W(e,r,13)&machine_ir.FLAG_NAMED())!=0 { ids[count]=r;count=count+1; }r=r+1;
+    }
+    let ab:buf<u8>=alloc(runtime(),t.cap);let bb:buf<u8>=alloc(runtime(),t.cap);
+    let a:T=T{bytes:ab,at:0,cap:t.cap,bad:0};let b:T=T{bytes:bb,at:0,cap:t.cap,bad:0};
+    let mut code:u64=0;let mut i:u64=1;
+    while i<count && code==0 {
+        let key:u64=ids[i];let mut j:u64=i;
+        a.at=0;a.bad=0;if contract_text(e,a,key,0)==false { code=E_CONTRACT(); }
+        while j>0 && code==0 {
+            b.at=0;b.bad=0;if contract_text(e,b,ids[j-1],0)==false { code=E_CONTRACT(); }
+            if contract_compare(b,a)!=2 { break; }ids[j]=ids[j-1];j=j-1;
+        }
+        ids[j]=key;i=i+1;
+    }
+    tb(t,123);i=0;let mut wrote:bool=false;b.at=0;b.bad=0;
+    while i<count && code==0 {
+        a.at=0;a.bad=0;if contract_text(e,a,ids[i],0)==false { code=E_CONTRACT(); }
+        if code==0 && (wrote==false || contract_compare(a,b)!=0) {
+            if wrote { tb(t,44); }let mut k:u64=0;
+            while k<a.at { tb(t,a.bytes[k]);bb[k]=a.bytes[k];k=k+1; }
+            b.at=a.at;wrote=true;
+        }
+        i=i+1;
+    }
+    tb(t,125);rt_free(runtime(),ab);rt_free(runtime(),bb);rt_free(runtime(),ids);
+    // THE TWO RECORDS ARE OURS TOO. A `T` is a cell and the cell is not the
+    // buffer it writes into: the buffers are freed above and the two cells
+    // that point at them are freed here, once each.
+    rt_free(runtime(),a);rt_free(runtime(),b);
+    if t.bad!=0 { return E_CONTRACT(); }return code;
+}
+fn function_contract(e:E,t:T,f:u64,target:u64,features:u64)->u64 {
+    let flags:u64=W(e,f,13);
+    if (flags&machine_ir.FLAG_RESULT_TYPED())==0 { return E_CONTRACT(); }
+    if abi_ok(e,f)==false { return E_CONTRACT(); }
+    let s:buf<u8>=e.source;
+    // EVERY LITERAL HERE IS FREED RIGHT AFTER ITS LAST USE, so a refusal in
+    // the middle of the contract leaves nothing alive: the text is already in
+    // the writer and the writer keeps none of the literal.
+    let h1:buf<u8>="fn;target="; ts_owned(t,h1);
+    tspan(t,s,W(e,target,5),W(e,target,6));
+    let h2:buf<u8>=";abi=";ts_owned(t,h2);
+    let nx:buf<u8>="nx64-abi-v0";let ef:buf<u8>="efi-x64-v0";
+    if abi_profile(e,f)==2 { ts(t,ef); }else { ts(t,nx); }
+    rt_free(runtime(),nx);rt_free(runtime(),ef);
+    let feature_label:buf<u8>=";features=";ts_owned(t,feature_label);
+    tdec(t,features);
+    let h3:buf<u8>=";section=.text;ret="; ts_owned(t,h3);
+    if declared_type_text(e,t,f)==false { return E_CONTRACT(); }
+    let h4:buf<u8>=";params=("; ts_owned(t,h4);
+    let mut k:u64=0;
+    while k<W(e,f,14) {
+        let p:u64=formal(e,f,k);
+        if p==0 { return E_CONTRACT(); }
+        if k>0 { tb(t,44); }
+        let pf:u64=W(e,p,13);
+        // A direction nobody read cannot be printed.
+        if (pf&machine_ir.FLAG_DIR_UNREAD())!=0 { return E_CONTRACT(); }
+        if (pf&machine_ir.FLAG_DIR_OUT())!=0 { tb(t,49); }
+        else if (pf&machine_ir.FLAG_DIR_INOUT())!=0 { tb(t,50); }
+        else { tb(t,48); }
+        tb(t,58);
+        if declared_type_text(e,t,p)==false { return E_CONTRACT(); }
+        tb(t,64);
+        let family:u64=W(e,p,15);
+        if family==0 { let u:buf<u8>="-1/0/0"; ts_owned(t,u); }
+        else {
+            // MIR/1.0 carries the binding slice explicitly, including high8.
+            let bits:u64=bound_width(e,f,p);
+            if machine_width(bits)==false { return E_CONTRACT(); }
+            tdec(t,family-1); tb(t,47); tdec(t,bits); tb(t,47);
+            if W(e,p,21)==8 { tb(t,49); } else { tb(t,48); }
+        }
+        k=k+1;
+    }
+    let triple:buf<u64>=alloc(runtime(),3);
+    let why:u64=effects_of(e,f,triple);
+    let fl:u64=triple[0];let rd:u64=triple[1];let wr:u64=triple[2];
+    rt_free(runtime(),triple);
+    if why!=0 { return why; }
+    let h5:buf<u8>=");effects="; ts_owned(t,h5);
+    tdec(t,fl); tb(t,47); tdec(t,rd); tb(t,47); tdec(t,wr);
+    let h6:buf<u8>=";clobbers="; ts_owned(t,h6);
+    thex16(t,clobbers_of(e,f));
+    let h7:buf<u8>=";requires=";ts_owned(t,h7);
+    let req:u64=contract_clause_text(e,t,f,1);if req!=0 { return req; }
+    let h8:buf<u8>=";ensures=";ts_owned(t,h8);
+    let ens:u64=contract_clause_text(e,t,f,2);if ens!=0 { return ens; }
+    return 0;
+}
+fn data_contract(e:E,t:T,d:u64,section:u64)->u64 {
+    let h1:buf<u8>="data;type="; ts_owned(t,h1);
+    if type_text(t,W(e,d,9),W(e,d,10),W(e,d,11))==false { return E_CONTRACT(); }
+    let h2:buf<u8>=";section="; ts_owned(t,h2);
+    tdec(t,section);
+    return 0;
+}
+
+// ---- the object --------------------------------------------------------------
+// The module name, from the unit's first `mir_symbol`, whose span is the
+// module declaration: the keyword, blanks, then the dotted name up to the
+// first blank, `;` or end of line.
+fn module_name(e:E,t:T)->u64 {
+    let mut r:u64=2;
+    let mut found:u64=0;
+    while r<=e.count && found==0 { if K(e,r)==2057 && W(e,r,16)==1 { found=r; } r=r+1; }
+    if found==0 { return E_CONTRACT(); }
+    let s:buf<u8>=e.source;
+    let mut at:u64=W(e,found,5);
+    let end:u64=W(e,found,6);
+    if at>end || end>len(s) { return E_CONTRACT(); }
+    if end-at>=7 && s[at]==109 && s[at+1]==111 && s[at+2]==100 && s[at+3]==117
+       && s[at+4]==108 && s[at+5]==101 && (s[at+6]==32 || s[at+6]==9) { at=at+6; }
+    while at<end && (s[at]==32 || s[at]==9) { at=at+1; }
+    let begin:u64=at;
+    while at<end && s[at]!=32 && s[at]!=9 && s[at]!=10 && s[at]!=13 && s[at]!=59 { at=at+1; }
+    if at==begin { return E_CONTRACT(); }
+    tspan(t,s,begin,at);
+    return 0;
+}
+fn name_less(names:buf<u8>,a:u64,al:u64,b:u64,bl:u64)->u64 {
+    let mut i:u64=0;
+    while i<al && i<bl {
+        if names[a+i]!=names[b+i] { if names[a+i]<names[b+i] { return 1; } return 2; }
+        i=i+1;
+    }
+    if al<bl { return 1; }
+    if al>bl { return 2; }
+    return 0;
+}
+
+// The section bytes of every storage `data`, laid out in image order at its
+// own alignment. place[] gets the offset+1, extent[] the size.
+fn data_layout(e:E,rdata:buf<u8>,wdata:buf<u8>,write:bool,sizes:buf<u64>)->u64 {
+    let place:buf<u64>=e.place;
+    let extent:buf<u64>=e.extent;
+    let mut at2:u64=0;
+    let mut at3:u64=0;
+    let mut r:u64=1;
+    while r<=e.count {
+        let flags:u64=W(e,r,13);
+        if K(e,r)==2060 && W(e,r,16)==1 && (flags&(machine_ir.FLAG_RDATA()+machine_ir.FLAG_WDATA()))!=0 {
+            if W(e,r,14)!=0 { return fail(e,E_FORM(),r); }
+            let width:u64=W(e,r,9);
+            let mut size:u64=width/8;
+            if width==1 { size=1; }
+            else if machine_width(width)==false { return fail(e,E_FORM(),r); }
+            let mut align:u64=W(e,r,15);
+            if align==0 { align=1; }
+            let mut value:u64=0;
+            if W(e,r,5)!=0 {
+                let d:u64=definer(e,W(e,r,5));
+                if d==0 || K(e,d)!=2058 { return fail(e,E_FORM(),r); }
+                value=W(e,d,5);
+            }
+            let mut offset:u64=0;
+            if (flags&machine_ir.FLAG_RDATA())!=0 {
+                at2=((at2+align-1)/align)*align; offset=at2; at2=at2+size;
+            } else {
+                at3=((at3+align-1)/align)*align; offset=at3; at3=at3+size;
+            }
+            place[r]=offset+1;
+            extent[r]=size;
+            if write {
+                let mut i:u64=0;
+                while i<size {
+                    let byte:u64=(value>>(8*i))&255;
+                    if (flags&machine_ir.FLAG_RDATA())!=0 { rdata[offset+i]=u8(byte); }
+                    else { wdata[offset+i]=u8(byte); }
+                    i=i+1;
+                }
+            }
+        }
+        r=r+1;
+    }
+    sizes[0]=at2;sizes[1]=at3;
+    return e.code;
+}
+
+// The declarations that become object symbols: every function with a body,
+// every import, every storage `data`. An import is a symbol whether or not a
+// call names it, as codegen.c adds one for every unresolved import: an object
+// that dropped an unused import would link where the reference refuses.
+fn is_symbol(e:E,r:u64)->bool {
+    let kind:u64=K(e,r);
+    if W(e,r,16)!=1 { return false; }
+    if kind==2051 { return true; }
+    if kind==2060 { return (W(e,r,13)&(machine_ir.FLAG_RDATA()+machine_ir.FLAG_WDATA()))!=0; }
+    return false;
+}
+
+fn assemble(e:E,report:buf<u64>)->ntasm_nxo.WriteResult {
+    let empty:buf<u8>=alloc(runtime(),0);
+    // The target, as the object's target id.
+    let mut target:u64=0;
+    let mut r:u64=1;
+    while r<=e.count && target==0 { if K(e,r)==2049 && W(e,r,16)==1 { target=r; } r=r+1; }
+    let mut target_id:u64=0;
+    let triple_uefi:buf<u8>="x86_64-nexora-uefi";
+    let triple_none:buf<u8>="x86_64-nexora-none";
+    if target!=0 && W(e,target,15)==len(triple_uefi) && W(e,target,14)==fnv_text(triple_uefi) { target_id=1; }
+    if target!=0 && W(e,target,15)==len(triple_none) && W(e,target,14)==fnv_text(triple_none) { target_id=2; }
+    rt_free(runtime(),triple_uefi);rt_free(runtime(),triple_none);
+    if target_id==0 { fail(e,E_CONTRACT(),target); return ntasm_nxo.WriteResult{code:e.code,bytes:empty}; }
+    let features:u64=W(e,1,15);
+    // Sections.
+    let sizes:buf<u64>=alloc(runtime(),2);
+    let none:buf<u8>=alloc(runtime(),0);
+    data_layout(e,none,none,false,sizes);
+    let rdata:buf<u8>=alloc(runtime(),sizes[0]);
+    let wdata:buf<u8>=alloc(runtime(),sizes[1]);
+    data_layout(e,rdata,wdata,true,sizes);
+    rt_free(runtime(),none);rt_free(runtime(),sizes);
+    // Names and contracts.
+    let mut n:u64=0;
+    r=1;
+    while r<=e.count { if is_symbol(e,r) { n=n+1; } r=r+1; }
+    let names_buffer:buf<u8>=alloc(runtime(),n*600+600);
+    let names:T=T{bytes:names_buffer,at:0,cap:n*600+600,bad:0};
+    let contracts_buffer:buf<u8>=alloc(runtime(),n*4096+64);
+    let contracts:T=T{bytes:contracts_buffer,at:0,cap:n*4096+64,bad:0};
+    let prefix_bytes:buf<u8>=alloc(runtime(),600);
+    let prefix:T=T{bytes:prefix_bytes,at:0,cap:600,bad:0};
+    let table:buf<u64>=alloc(runtime(),n*5+5);
+    if e.code==0 { let why:u64=module_name(e,prefix); if why!=0 { fail(e,why,1); } }
+    let mut k:u64=0;
+    r=1;
+    while r<=e.count && e.code==0 {
+        if is_symbol(e,r) {
+            let kind:u64=K(e,r);
+            let n0:u64=names.at;
+            let c0:u64=contracts.at;
+            let s:buf<u8>=e.source;
+            let mut why:u64=0;
+            // A name span outside the text is a damaged image, said as one,
+            // before any byte of it is copied.
+            if kind==2051 && W(e,r,5)==0 {
+                let t:u64=import_target(e,r);
+                if t==0 || W(e,t,5)>W(e,t,6) || W(e,t,6)>len(s) { why=E_IMAGE(); }
+                else { tspan(names,s,W(e,t,5),W(e,t,6)); }
+                if why==0 { why=function_contract(e,contracts,r,target,features); }
+            } else if W(e,r,8)<3 || W(e,r,6)>W(e,r,7) || W(e,r,7)>len(s) {
+                why=E_IMAGE();
+            } else {
+                let mb:buf<u8>=prefix.bytes;
+                let mut i:u64=0;
+                while i<prefix.at { let c:u64=mb[i]; tb(names,c); i=i+1; }
+                tb(names,46);
+                tspan(names,s,W(e,r,6),W(e,r,7));
+                if kind==2051 { why=function_contract(e,contracts,r,target,features); }
+                else {
+                    let mut section:u64=3;
+                    if (W(e,r,13)&machine_ir.FLAG_RDATA())!=0 { section=2; }
+                    why=data_contract(e,contracts,r,section);
+                }
+            }
+            if why!=0 { fail(e,why,r); }
+            if why==0 && (names.bad!=0 || contracts.bad!=0 || names.at-n0>512 || names.at==n0) { fail(e,E_LAYOUT(),r); }
+            table[k*5]=r;table[k*5+1]=n0;table[k*5+2]=names.at-n0;
+            table[k*5+3]=c0;table[k*5+4]=contracts.at-c0;
+            k=k+1;
+        }
+        r=r+1;
+    }
+    let order:buf<u64>=alloc(runtime(),n+1);
+    let index:buf<u64>=alloc(runtime(),e.count+1);
+    let mut z:u64=0;
+    while z<=e.count { index[z]=0; z=z+1; }
+    // Canonical name order, which nxo.validate requires strictly increasing:
+    // a selection sort over the table, and an equal pair is a refusal.
+    let nb:buf<u8>=names.bytes;
+    let mut i:u64=0;
+    while i<n { order[i]=i; i=i+1; }
+    i=0;
+    while i<n && e.code==0 {
+        let mut best:u64=i;
+        let mut j:u64=i+1;
+        while j<n {
+            let a:u64=order[j];let b:u64=order[best];
+            if name_less(nb,table[a*5+1],table[a*5+2],table[b*5+1],table[b*5+2])==1 { best=j; }
+            j=j+1;
+        }
+        let swap:u64=order[i];order[i]=order[best];order[best]=swap;
+        if i>0 {
+            let a:u64=order[i-1];let b:u64=order[i];
+            if name_less(nb,table[a*5+1],table[a*5+2],table[b*5+1],table[b*5+2])!=1 { fail(e,E_LAYOUT(),table[b*5]); }
+        }
+        i=i+1;
+    }
+    // The object.
+    let mut total:u64=0;
+    i=0;
+    while i<n { total=total+table[i*5+2]+table[i*5+4]; i=i+1; }
+    let strings:buf<u8>=alloc(runtime(),total);
+    let symbols:buf<u64>=alloc(runtime(),n*8);
+    let cb:buf<u8>=contracts.bytes;
+    let place:buf<u64>=e.place;
+    let extent:buf<u64>=e.extent;
+    let main_text:buf<u8>="main";
+    let mut entry:u64=0;
+    let mut cursor:u64=0;
+    i=0;
+    while i<n && e.code==0 {
+        let row:u64=order[i];
+        let rec:u64=table[row*5];
+        index[rec]=i+1;
+        let name_at:u64=cursor;
+        let mut c:u64=0;
+        while c<table[row*5+2] { strings[cursor]=nb[table[row*5+1]+c]; cursor=cursor+1; c=c+1; }
+        let contract_at:u64=cursor;
+        c=0;
+        while c<table[row*5+4] { strings[cursor]=cb[table[row*5+3]+c]; cursor=cursor+1; c=c+1; }
+        let kind:u64=K(e,rec);
+        let mut flags:u64=0;
+        let mut section:u64=0;
+        let mut offset:u64=0;
+        let mut size:u64=0;
+        if kind==2051 && W(e,rec,5)==0 { flags=10; }
+        else {
+            if kind==2051 { flags=2; section=1; } else { flags=4; section=3; if (W(e,rec,13)&machine_ir.FLAG_RDATA())!=0 { section=2; } }
+            if (W(e,rec,13)&machine_ir.FLAG_EXPORT())!=0 { flags=flags+1; }
+            offset=place[rec]-1; size=extent[rec];
+        }
+        // THE ENTRY is the exported function named `main`, as object_build.c
+        // chooses it; a module without one is a library and has entry 0.
+        let s:buf<u8>=e.source;
+        if kind==2051 && W(e,rec,5)!=0 && (flags&1)!=0 && W(e,rec,7)-W(e,rec,6)==4 {
+            let at:u64=W(e,rec,6);
+            if s[at]==main_text[0] && s[at+1]==main_text[1] && s[at+2]==main_text[2] && s[at+3]==main_text[3] { entry=i+1; }
+        }
+        symbols[i*8]=name_at;symbols[i*8+1]=table[row*5+2];symbols[i*8+2]=section;symbols[i*8+3]=flags;
+        symbols[i*8+4]=offset;symbols[i*8+5]=size;symbols[i*8+6]=contract_at;symbols[i*8+7]=table[row*5+4];
+        i=i+1;
+    }
+    // THE ENTRY'S NAME SPELLING is a literal of ours, and the loop above was
+    // its last use.
+    rt_free(runtime(),main_text);
+    let relocations:buf<u64>=alloc(runtime(),e.rel_count*5);
+    let rl:buf<u64>=e.rels;
+    i=0;
+    while i<e.rel_count {
+        let target_index:u64=index[rl[i*2+1]];
+        if target_index==0 { fail(e,E_LAYOUT(),rl[i*2+1]); }
+        relocations[i*5]=1;relocations[i*5+1]=1;relocations[i*5+2]=rl[i*2];
+        relocations[i*5+3]=target_index;relocations[i*5+4]=0;
+        i=i+1;
+    }
+    let text:buf<u8>=alloc(runtime(),e.at);
+    let tx:buf<u8>=e.text;
+    i=0;
+    while i<e.at { text[i]=tx[i]; i=i+1; }
+    rt_free(runtime(),names_buffer);rt_free(runtime(),contracts_buffer);rt_free(runtime(),prefix_bytes);
+    rt_free(runtime(),names);rt_free(runtime(),contracts);rt_free(runtime(),prefix);
+    rt_free(runtime(),table);rt_free(runtime(),order);rt_free(runtime(),index);
+    let object:ntasm_nxo.Object=ntasm_nxo.Object{target:target_id,entry:entry,text:text,rdata:rdata,
+        data:wdata,symbols:symbols,relocations:relocations,strings:strings};
+    if e.code!=0 {
+        ntasm_nxo.release(object);
+        return ntasm_nxo.WriteResult{code:e.code,bytes:empty};
+    }
+    // The writer validates what it writes (nxo.validate), so an object this
+    // module got wrong comes back as the writer's refusal, not as bytes.
+    let written:ntasm_nxo.WriteResult=ntasm_nxo.emit(object);
+    ntasm_nxo.release(object);
+    report[2]=e.at;report[3]=n;
+    if written.code!=0 {
+        let fault:buf<u8>=written.bytes;
+        // THE WRITER'S OWN CODE IS TAKEN BEFORE THE WRITER'S RECORD IS FREED:
+        // the record is ours here, because it is not the one this module
+        // returns.
+        let writer_code:u64=written.code;
+        rt_free(runtime(),fault);
+        rt_free(runtime(),written);
+        fail(e,writer_code,0);
+        return ntasm_nxo.WriteResult{code:e.code,bytes:empty};
+    }
+    rt_free(runtime(),empty);
+    return written;
+}
+
+// The state's buffers, freed on every path out of `build`.
+fn release_state(e:E)->u64 {
+    let tx:buf<u8>=e.text;let en:buf<u8>=e.enc;let fz:buf<u64>=e.fixes;let rz:buf<u64>=e.rels;
+    let defs:buf<u64>=e.defs;let slots:buf<u64>=e.slots;let done:buf<u64>=e.done;
+    let place:buf<u64>=e.place;let extent:buf<u64>=e.extent;let used:buf<u64>=e.used;
+    let funcs:buf<u64>=e.funcs;let prof_cache:buf<u64>=e.prof_cache;
+    rt_free(runtime(),tx);rt_free(runtime(),en);rt_free(runtime(),fz);rt_free(runtime(),rz);
+    rt_free(runtime(),defs);rt_free(runtime(),slots);rt_free(runtime(),done);rt_free(runtime(),place);
+    rt_free(runtime(),extent);rt_free(runtime(),used);
+    rt_free(runtime(),funcs);rt_free(runtime(),prof_cache);
+    rt_free(runtime(),e);
+    return 0;
+}
+fn finish_report(e:E,report:buf<u64>)->u64 {
+    if e.code!=0 {
+        report[0]=e.record;report[1]=e.code;report[2]=0;report[3]=0;
+        if e.record!=0 && e.record<=e.count { report[2]=K(e,e.record); }
+    } else { report[0]=e.count; }
+    return 0;
+}
+
+// ===========================================================================
+// build -- a verified Machine IR image in, an NXO container out.
+// report[0..3]: on refusal (record, code, kind, 0); on success
+// (records, 0, text bytes, symbols). The caller owns `bytes` either way.
+// ===========================================================================
+export fn build(words:buf<u64>,count:u64,source:buf<u8>,report:buf<u64>)->ntasm_nxo.WriteResult {
+    let nothing:buf<u8>=alloc(runtime(),0);
+    if len(report)<4 { return ntasm_nxo.WriteResult{code:800,bytes:nothing}; }
+    report[0]=0;report[1]=0;report[2]=0;report[3]=0;
+    if count==0 || len(words)<machine_ir.HEADER_WORDS()+count*machine_ir.NODE_WORDS() {
+        report[1]=E_IMAGE();
+        return ntasm_nxo.WriteResult{code:E_IMAGE(),bytes:nothing};
+    }
+    let checked:buf<u64>=alloc(runtime(),8);
+    let verify_code:u64=machine_ir.verify(words,count,checked);
+    if verify_code!=0 {
+        report[0]=checked[3]; report[1]=E_IMAGE(); report[2]=verify_code;
+        rt_free(runtime(),checked);
+        return ntasm_nxo.WriteResult{code:E_IMAGE(),bytes:nothing};
+    }
+    rt_free(runtime(),checked);
+    let values:u64=words[6];
+    let text:buf<u8>=alloc(runtime(),count*256+4096);
+    let defs:buf<u64>=alloc(runtime(),values+1);
+    let slots:buf<u64>=alloc(runtime(),values+1);
+    let done:buf<u64>=alloc(runtime(),count+1);
+    let place:buf<u64>=alloc(runtime(),count+1);
+    let extent:buf<u64>=alloc(runtime(),count+1);
+    let used:buf<u64>=alloc(runtime(),count+1);
+    let fixes:buf<u64>=alloc(runtime(),count*4+4);
+    let rels:buf<u64>=alloc(runtime(),count*4+4);
+    let enc:buf<u8>=alloc(runtime(),32);
+    // THE TWO NEW TABLES, owned by this build like the others: the index of
+    // the unit's function records, and the lazy ABI profile cache.
+    let funcs:buf<u64>=alloc(runtime(),count+1);
+    let prof_cache:buf<u64>=alloc(runtime(),count+1);
+    let e:E=E{words:words,count:count,source:source,values:values,text:text,at:0,
+        defs:defs,slots:slots,done:done,place:place,extent:extent,used:used,
+        fixes:fixes,fix_count:0,rels:rels,rel_count:0,enc:enc,
+        saved:0,keep:0,cells:0,args:0,mask:0,raw_mask:0,func:0,fend:0,block:0,bend:0,code:0,record:0,current:0,last_call:0,calls:0,
+        unit_profile:1,funcs:funcs,func_n:0,prof_cache:prof_cache};
+    let mut i:u64=0;
+    while i<=values { defs[i]=0; slots[i]=0; i=i+1; }
+    i=0;
+    while i<=count { done[i]=0; place[i]=0; extent[i]=0; used[i]=0; prof_cache[i]=0; i=i+1; }
+    // THE FUNCTION INDEX, filled in ONE PASS, in record order. `callee` used
+    // to walk every record of the image to find the function records of the
+    // unit; the index holds exactly those records, in the same order, so the
+    // first match that wins is the one that won before.
+    let mut fn_n:u64=0;
+    let mut q:u64=1;
+    while q<=count {
+        if K(e,q)==2051 && W(e,q,16)==1 { funcs[fn_n]=q; fn_n=fn_n+1; }
+        q=q+1;
+    }
+    e.func_n=fn_n;
+    // THE UNIT PROFILE, read ONCE for this build.
+    e.unit_profile=unit_profile_of(e);
+    // value -> its one defining record. A `mir_vreg` DECLARES a value (a
+    // `let` local, a clobbered register) and the record that computes it is
+    // its definition, so a vreg yields to a computation. Two computations of
+    // one value are an image this emitter cannot read, and it says so rather
+    // than taking either.
+    let mut r:u64=1;
+    while r<=count && e.code==0 {
+        let v:u64=W(e,r,4);
+        if v!=0 {
+            if v>values { fail(e,E_IMAGE(),r); }
+            else if K(e,r)==2056 { if defs[v]==0 { defs[v]=r; } }
+            else if defs[v]!=0 && K(e,defs[v])!=2056 { fail(e,E_IMAGE(),r); }
+            else { defs[v]=r; }
+        }
+        r=r+1;
+    }
+    r=1;
+    while r<=count && e.code==0 {
+        if K(e,r)==2051 && W(e,r,16)==1 && W(e,r,5)!=0 { lower_function(e,r); }
+        r=r+1;
+    }
+    // The block displacements, now that every block has an offset.
+    i=0;
+    while i<e.fix_count && e.code==0 {
+        let site:u64=fixes[i*2];
+        let target:u64=fixes[i*2+1];
+        if target==0 || target>count || place[target]==0 { fail(e,E_IMAGE(),target); }
+        else {
+            let to:u64=place[target]-1;
+            put32_at(e,site,(to+4294967296-site-4)&4294967295);
+        }
+        i=i+1;
+    }
+    if e.code==0 && e.at==0 { fail(e,E_IMAGE(),1); }
+    if e.code==0 {
+        rt_free(runtime(),nothing);
+        let result:ntasm_nxo.WriteResult=assemble(e,report);
+        finish_report(e,report);
+        release_state(e);
+        return result;
+    }
+    finish_report(e,report);
+    let code:u64=e.code;
+    release_state(e);
+    return ntasm_nxo.WriteResult{code:code,bytes:nothing};
+}

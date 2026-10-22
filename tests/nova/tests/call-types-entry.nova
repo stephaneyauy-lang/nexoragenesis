@@ -1,0 +1,11 @@
+module call_types_entry;import ntasm_ast;import ntasm_parser;import semantics;import callable_names;import types;import ntasm_refs;import calls;import call_types;
+// Test shim for the call_types gate. main(source,out) mirrors the validate
+// pipeline prefix through call_types.check and reports the first failing
+// stage into out[0..3]. A five-word out also carries a stage selector in
+// out[4]: 0, or a four-word out, runs the whole prefix; 1 stops after
+// ntasm_refs.resolve so call_types.check runs on its own. calls.check
+// reports every arity mismatch as 311 before call_types.check ever sees the
+// call, so selector 1 is the only way to observe call_types' own arity and
+// direction rules. The module writes out[0..3] only and reads out[4] only
+// when len(out)>=5, so a four-word caller is unaffected.
+export fn main(source:buf<u8>,out:buf<u64>)->u64{if len(out)<4{return 800;}let mut solo:bool=false;if len(out)>=5{solo=out[4]!=0;}let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);if tree.ok==false{ntasm_ast.release(tree);return 800;}let scratch:buf<u64>=alloc(runtime(),4);let mut code:u64=semantics.index(source,tree,scratch);if code==0{code=callable_names.check(source,tree,scratch);}if code==0{code=types.check(source,tree,scratch);}if code==0{code=ntasm_refs.resolve(source,tree,scratch);}if code==0&&solo==false{code=calls.check(source,tree,scratch);}if code==0{code=call_types.check(source,tree,out);}else if code!=800{out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3];}rt_free(runtime(),scratch);ntasm_ast.release(tree);return code;}

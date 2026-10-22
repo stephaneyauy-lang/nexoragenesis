@@ -1,0 +1,25 @@
+module efi.go0
+target x86_64-nexora-uefi
+default_abi efi-x64-v0
+section .text {
+fn f17()->u64
+effects {}
+clobbers {} {
+return 17
+}
+fn f29()->u64
+effects {}
+clobbers {} {
+return 29
+}
+fn leaf(in p1:u64,in p2:u64,in p3:u64,in p4:u64,in p5:u64,in p6:u64)->u64
+effects {}
+clobbers {} {
+return p1+p5+p6
+}
+export fn main()->u64
+effects {}
+clobbers {rax} {
+return leaf(3,2,3,4,f17(),f29())
+}
+}

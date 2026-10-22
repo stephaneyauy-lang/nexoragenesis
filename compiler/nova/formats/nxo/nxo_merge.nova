@@ -1,0 +1,716 @@
+module ntasm_nxo_merge;
+import ntasm_nxo;
+import ntasm_pe;
+// A read NXO views its sections and strings inside the buffer it was given, so
+// merge_list has to keep one borrowed unit alive for the whole call. Nova only
+// frees a buffer that a plain name denotes, hence this wrapper.
+//
+// THE UNIT IS A CELL AND THE CELLS ARE A LIST. A struct value in this dialect
+// is a heap cell carried BY REFERENCE, so a cell can point at the next one:
+// `next` is a handle and not a copy, and the chain is walked from the head.
+// The cell owns the file view and the object, exactly as the two parallel
+// arrays used to own them, and the cell itself is freed once, after its two
+// contents. A self-referential field is not a novelty here: `Tok` in
+// nova_language_parse.nova carries `owned_next:Tok` and `V` in
+// nova_machine_lower.nova carries `owned_next:V`, and a struct field of
+// another module's struct is `b:machine_ir.Builder` in `L`.
+struct Unit { file:buf<u8>, object:ntasm_nxo.Object, next:Unit }
+// Linker phase 1: merge exactly two closed NXO libraries (no symbols,
+// no strings, no entry; imports resolve against exported definitions).
+// Inputs are never modified or freed.
+fn failed()->ntasm_nxo.WriteResult {
+    let empty:buf<u8>=alloc(runtime(),0);
+    return ntasm_nxo.WriteResult{code:800,bytes:empty};
+}
+fn refused(code:u64)->ntasm_nxo.WriteResult {
+    let empty:buf<u8>=alloc(runtime(),0);
+    return ntasm_nxo.WriteResult{code:code,bytes:empty};
+}
+fn bytes_equal(a:buf<u8>,ao:u64,al:u64,b:buf<u8>,bo:u64,bl:u64)->bool {
+    if al!=bl{return false;}
+    let mut i:u64=0;
+    while i<(al){if a[ao+i]!=b[bo+i]{return false;}i=i+1;}
+    return true;
+}
+// The alignment padding in front of the right hand payload is part of the
+// observable layout: the merged section is the two payloads separated by that
+// padding, and the object reader rejects a non-zero pad. It is written here so
+// the merged bytes are a function of the two inputs alone, not of whatever the
+// allocator happened to return.
+fn clear(b:buf<u8>,at:u64,size:u64)->u64 {
+    let mut i:u64=0;while i<(size){b[at+i]=0;i=i+1;}return 0;
+}
+fn name_less(a:buf<u8>,ao:u64,al:u64,b:buf<u8>,bo:u64,bl:u64)->bool {
+    let mut i:u64=0;
+    while i<(al) && i<(bl){
+        if a[ao+i]!=b[bo+i]{return a[ao+i]<b[bo+i];}
+        i=i+1;
+    }
+    return al<bl;
+}
+export fn merge(left:buf<u8>,right:buf<u8>)->ntasm_nxo.WriteResult {
+    let lr:ntasm_nxo.ReadResult=ntasm_nxo.read(left);
+    if lr.code!=0 { return failed(); }
+    let lo:ntasm_nxo.Object=lr.object;
+    let rr:ntasm_nxo.ReadResult=ntasm_nxo.read(right);
+    if rr.code!=0 {
+        ntasm_nxo.release(lo);
+        return failed();
+    }
+    let ro:ntasm_nxo.Object=rr.object;
+    if lo.target!=ro.target {
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(820);
+    }
+    if lo.entry!=0 && ro.entry!=0 {
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(826);
+    }
+    let ls:buf<u64>=lo.symbols;let rs:buf<u64>=ro.symbols;
+    let lst:buf<u8>=lo.strings;let rst:buf<u8>=ro.strings;
+    let ln:u64=len(ls)/8;let rn:u64=len(rs)/8;
+    let lre:buf<u64>=lo.relocations;let rre:buf<u64>=ro.relocations;
+    let lrn:u64=len(lre)/5;let rrn:u64=len(rre)/5;
+    if lrn+rrn>1048576 {
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(821);
+    }
+    let mut j:u64=0;
+    if ln+rn>65536 {
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(821);
+    }
+    let lt:u64=len(lo.text);let lr_:u64=len(lo.rdata);let ld:u64=len(lo.data);
+    let rt:u64=len(ro.text);let rr_:u64=len(ro.rdata);let rd:u64=len(ro.data);
+    // Base layout, oracle-derived from object_link.c:78-84: for each section
+    // the base is align16 of the running total, applied unconditionally to all
+    // three sections. An empty right section therefore still consumes a base
+    // and still rounds its running total up to 16, and the trailing padding is
+    // part of the observable merged object and of the later PE layout. Do not
+    // "optimise" this into an if-size-nonzero guard or an 8 byte alignment for
+    // .rdata and .data: both were tried and both diverge from the oracle. Every
+    // divergent shape is pinned by an object_link.c byte comparison in
+    // tests/c/nova/tests_ntasm_nxo_merge.c, and the rule is the
+    // one written down in spec/formats/nxo-v0.md and spec/ntasm.md.
+    let textBase:u64=ntasm_pe.align(lt,16);
+    let rdataBase:u64=ntasm_pe.align(lr_,16);
+    let dataBase:u64=ntasm_pe.align(ld,16);
+    // Sizes are each capped at 64MiB by validate, so the sums cannot overflow;
+    // only the 64MiB merged limit can trip.
+    if textBase+rt>67108864 || rdataBase+rr_>67108864 || dataBase+rd>67108864 {
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(821);
+    }
+    // object_link.c:86 caps the three merged section payloads together and not
+    // only each one, so a per-section legal trio still cannot overflow the
+    // 64MiB object budget. The comparison is a strict >, so a payload of
+    // exactly 67108864 is accepted and 67108864+1 is refused: the boundary is
+    // not off by one, and both of its sides are pinned by an object_link.c
+    // comparison in tests_ntasm_nxo_merge.c.
+    if textBase+rt+rdataBase+rr_+dataBase+rd>67108864 {
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(821);
+    }
+    // First pass: resolve name collisions, count kept definitions and
+    // measure the exact strings size before any allocation.
+    let mut i:u64=0;
+    let mut k:u64=0;let mut cur:u64=0;
+    while i<(ln) || j<(rn){
+        if i<(ln) && j<(rn) &&
+           bytes_equal(lst,ls[i*8],ls[i*8+1],rst,rs[j*8],rs[j*8+1]) {
+            let lfl:u64=ls[i*8+3];let rfl:u64=rs[j*8+3];
+            if (lfl&8)!=0 && (rfl&8)!=0 {
+                ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                return refused(824);
+            }
+            if (lfl&8)==0 && (rfl&8)==0 {
+                ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                return refused(823);
+            }
+            if (lfl&6)!=(rfl&6) {
+                ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                return refused(825);
+            }
+            if (lfl&8)==0 {
+                if (lfl&1)==0 {
+                    ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                    return refused(824);
+                }
+                if !bytes_equal(lst,ls[i*8+6],ls[i*8+7],rst,rs[j*8+6],rs[j*8+7]) {
+                    ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                    return refused(825);
+                }
+                cur=cur+ls[i*8+1]+ls[i*8+7];
+            } else {
+                if (rfl&1)==0 {
+                    ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                    return refused(824);
+                }
+                if !bytes_equal(rst,rs[j*8+6],rs[j*8+7],lst,ls[i*8+6],ls[i*8+7]) {
+                    ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                    return refused(825);
+                }
+                cur=cur+rs[j*8+1]+rs[j*8+7];
+            }
+            k=k+1;i=i+1;j=j+1;
+        } else if j>=(rn) || (i<(ln) && name_less(lst,ls[i*8],ls[i*8+1],rst,rs[j*8],rs[j*8+1])) {
+            if (ls[i*8+3]&8)!=0 {
+                ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                return refused(824);
+            }
+            cur=cur+ls[i*8+1]+ls[i*8+7];
+            k=k+1;i=i+1;
+        } else {
+            let at:u64=j*8;
+            if (rs[at+3]&8)!=0 {
+                ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                return refused(824);
+            }
+            let sec:u64=rs[at+2];let mut delta:u64=0;
+            if sec==1{delta=textBase;}else if sec==2{delta=rdataBase;}else if sec==3{delta=dataBase;}
+            if rs[at+4]>67108864-delta {
+                ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+                return refused(821);
+            }
+            cur=cur+rs[at+1]+rs[at+7];
+            k=k+1;j=j+1;
+        }
+    }
+    if cur>67108864 {
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(821);
+    }
+    let text:buf<u8>=alloc(runtime(),textBase+rt);
+    let rdata:buf<u8>=alloc(runtime(),rdataBase+rr_);
+    let data:buf<u8>=alloc(runtime(),dataBase+rd);
+    let symbols:buf<u64>=alloc(runtime(),k*8);
+    let maps:buf<u64>=alloc(runtime(),(ln+rn)*8);
+    let strings:buf<u8>=alloc(runtime(),cur);
+    // The three gaps are part of the observable merged layout, so they are
+    // written rather than inherited from the allocator.
+    clear(text,lt,textBase-lt);
+    clear(rdata,lr_,rdataBase-lr_);
+    clear(data,ld,dataBase-ld);
+    ntasm_pe.copy(text,0,lo.text);ntasm_pe.copy(text,textBase,ro.text);
+    ntasm_pe.copy(rdata,0,lo.rdata);ntasm_pe.copy(rdata,rdataBase,ro.rdata);
+    ntasm_pe.copy(data,0,lo.data);ntasm_pe.copy(data,dataBase,ro.data);
+    // Second pass: write kept definitions and strings, fill both index maps
+    // (resolved imports map to the kept definition's new index).
+    i=0;j=0;k=0;cur=0;
+    while i<(ln) || j<(rn){
+        if i<(ln) && j<(rn) &&
+           bytes_equal(lst,ls[i*8],ls[i*8+1],rst,rs[j*8],rs[j*8+1]) {
+            if (ls[i*8+3]&8)==0 {
+                let at:u64=i*8;let to:u64=k*8;
+                let nl:u64=ls[at+1];let cl:u64=ls[at+7];
+                let name:buf<u8>=slice(lst,ls[at],nl);
+                let contract:buf<u8>=slice(lst,ls[at+6],cl);
+                ntasm_pe.copy(strings,cur,name);
+                ntasm_pe.copy(strings,cur+nl,contract);
+                rt_free(runtime(),name);rt_free(runtime(),contract);
+                symbols[to]=cur;symbols[to+1]=nl;symbols[to+2]=ls[at+2];symbols[to+3]=ls[at+3];
+                symbols[to+4]=ls[at+4];symbols[to+5]=ls[at+5];
+                symbols[to+6]=cur+nl;symbols[to+7]=cl;
+                maps[i]=k;maps[ln+j]=k;
+                cur=cur+nl+cl;k=k+1;
+            } else {
+                let at:u64=j*8;let to:u64=k*8;
+                let sec:u64=rs[at+2];let nl:u64=rs[at+1];let cl:u64=rs[at+7];
+                let mut delta:u64=0;
+                if sec==1{delta=textBase;}else if sec==2{delta=rdataBase;}else if sec==3{delta=dataBase;}
+                let name:buf<u8>=slice(rst,rs[at],nl);
+                let contract:buf<u8>=slice(rst,rs[at+6],cl);
+                ntasm_pe.copy(strings,cur,name);
+                ntasm_pe.copy(strings,cur+nl,contract);
+                rt_free(runtime(),name);rt_free(runtime(),contract);
+                symbols[to]=cur;symbols[to+1]=nl;symbols[to+2]=sec;symbols[to+3]=rs[at+3];
+                symbols[to+4]=rs[at+4]+delta;symbols[to+5]=rs[at+5];
+                symbols[to+6]=cur+nl;symbols[to+7]=cl;
+                maps[ln+j]=k;maps[i]=k;
+                cur=cur+nl+cl;k=k+1;
+            }
+            i=i+1;j=j+1;
+        } else if j>=(rn) || (i<(ln) && name_less(lst,ls[i*8],ls[i*8+1],rst,rs[j*8],rs[j*8+1])) {
+            let at:u64=i*8;let to:u64=k*8;
+            let nl:u64=ls[at+1];let cl:u64=ls[at+7];
+            let name:buf<u8>=slice(lst,ls[at],nl);
+            let contract:buf<u8>=slice(lst,ls[at+6],cl);
+            ntasm_pe.copy(strings,cur,name);
+            ntasm_pe.copy(strings,cur+nl,contract);
+            rt_free(runtime(),name);rt_free(runtime(),contract);
+            symbols[to]=cur;symbols[to+1]=nl;symbols[to+2]=ls[at+2];symbols[to+3]=ls[at+3];
+            symbols[to+4]=ls[at+4];symbols[to+5]=ls[at+5];
+            symbols[to+6]=cur+nl;symbols[to+7]=cl;
+            maps[i]=k;
+            cur=cur+nl+cl;k=k+1;i=i+1;
+        } else {
+            let at:u64=j*8;let to:u64=k*8;
+            let sec:u64=rs[at+2];let nl:u64=rs[at+1];let cl:u64=rs[at+7];
+            let mut delta:u64=0;
+            if sec==1{delta=textBase;}else if sec==2{delta=rdataBase;}else if sec==3{delta=dataBase;}
+            let name:buf<u8>=slice(rst,rs[at],nl);
+            let contract:buf<u8>=slice(rst,rs[at+6],cl);
+            ntasm_pe.copy(strings,cur,name);
+            ntasm_pe.copy(strings,cur+nl,contract);
+            rt_free(runtime(),name);rt_free(runtime(),contract);
+            symbols[to]=cur;symbols[to+1]=nl;symbols[to+2]=sec;symbols[to+3]=rs[at+3];
+            symbols[to+4]=rs[at+4]+delta;symbols[to+5]=rs[at+5];
+            symbols[to+6]=cur+nl;symbols[to+7]=cl;
+            maps[ln+j]=k;
+            cur=cur+nl+cl;k=k+1;j=j+1;
+        }
+    }
+    let relocations:buf<u64>=alloc(runtime(),(lrn+rrn)*5);
+    let mut badrel:bool=false;
+    let mut w:u64=0;
+    let mut sec:u64=1;
+    while sec<=3 && !badrel {
+        let mut delta:u64=0;let mut msz:u64=0;
+        if sec==1{delta=textBase;msz=textBase+rt;}else if sec==2{delta=rdataBase;msz=rdataBase+rr_;}else{delta=dataBase;msz=dataBase+rd;}
+        let mut prevoff:u64=0;let mut prevw:u64=0;let mut have:bool=false;
+        j=0;
+        while j<(lrn) && !badrel {
+            let at:u64=j*5;
+            if lre[at]==sec {
+                let kind:u64=lre[at+1];let off:u64=lre[at+2];let tgt:u64=lre[at+3];
+                let mut width:u64=4;if kind==2{width=8;}
+                if tgt<1 || tgt>(ln) {
+                    badrel=true;
+                } else if msz<width || off>(msz-width) || (have && off<(prevoff+prevw)) {
+                    badrel=true;
+                } else {
+                    let to:u64=w*5;
+                    relocations[to]=sec;relocations[to+1]=kind;relocations[to+2]=off;
+                    relocations[to+3]=maps[tgt-1]+1;relocations[to+4]=lre[at+4];
+                    prevoff=off;prevw=width;have=true;w=w+1;
+                }
+            }
+            j=j+1;
+        }
+        j=0;
+        while j<(rrn) && !badrel {
+            let at:u64=j*5;
+            if rre[at]==sec {
+                let kind:u64=rre[at+1];let off:u64=rre[at+2]+delta;let tgt:u64=rre[at+3];
+                let mut width:u64=4;if kind==2{width=8;}
+                if tgt<1 || tgt>(rn) {
+                    badrel=true;
+                } else if msz<width || off>(msz-width) || (have && off<(prevoff+prevw)) {
+                    badrel=true;
+                } else {
+                    let to:u64=w*5;
+                    relocations[to]=sec;relocations[to+1]=kind;relocations[to+2]=off;
+                    relocations[to+3]=maps[ln+tgt-1]+1;relocations[to+4]=rre[at+4];
+                    prevoff=off;prevw=width;have=true;w=w+1;
+                }
+            }
+            j=j+1;
+        }
+        sec=sec+1;
+    }
+    if badrel {
+        rt_free(runtime(),text);rt_free(runtime(),rdata);rt_free(runtime(),data);
+        rt_free(runtime(),symbols);rt_free(runtime(),relocations);
+        rt_free(runtime(),maps);rt_free(runtime(),strings);
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(821);
+    }
+    let mut merged_entry:u64=0;
+    if lo.entry!=0 { merged_entry=maps[lo.entry-1]+1; }
+    else if ro.entry!=0 { merged_entry=maps[ln+ro.entry-1]+1; }
+    if merged_entry>k {
+        rt_free(runtime(),text);rt_free(runtime(),rdata);rt_free(runtime(),data);
+        rt_free(runtime(),symbols);rt_free(runtime(),relocations);
+        rt_free(runtime(),maps);rt_free(runtime(),strings);
+        ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+        return refused(821);
+    }
+    let merged:ntasm_nxo.Object=ntasm_nxo.Object{
+        target:lo.target,entry:merged_entry,
+        text:text,rdata:rdata,data:data,
+        symbols:symbols,relocations:relocations,strings:strings
+    };
+    let result:ntasm_nxo.WriteResult=ntasm_nxo.emit(merged);
+    ntasm_nxo.release(lo);ntasm_nxo.release(ro);
+    rt_free(runtime(),text);rt_free(runtime(),rdata);rt_free(runtime(),data);
+    rt_free(runtime(),symbols);rt_free(runtime(),relocations);rt_free(runtime(),strings);
+    rt_free(runtime(),maps);
+    rt_free(runtime(),merged);
+    return result;
+}
+// The unit at an index of the chain, BORROWED: the cell is reached by walking
+// the chain and its handle is returned, so nothing is copied and nothing is
+// allocated. The walk is bounded by the chain itself and by the index, so it
+// cannot run past the last cell, and the chain holds at most 64 units.
+fn unit_at(head:Unit,index:u64)->Unit {
+    let mut cur:Unit=head;
+    let mut i:u64=0;
+    while cur!=null && i<index { cur=cur.next; i=i+1; }
+    return cur;
+}
+// The object of the unit at an index of the chain, borrowed, for the passes
+// that read a unit by its index and not in chain order.
+fn unit_object(head:Unit,index:u64)->ntasm_nxo.Object {
+    let u:Unit=unit_at(head,index);
+    return u.object;
+}
+// Releases the prefix of units that were read before a refusal: the object
+// goes before the unit view it reads through, so no failure path leaves a live
+// object or a dangling section view behind. The chain is walked once, the
+// next handle is captured BEFORE the cell is freed, and every cell is freed
+// exactly once, after the two things it owns. The caller's arena is borrowed
+// and is never freed here: the file of a unit is the copy `slice` made of it.
+fn release_units(head:Unit,loaded:u64)->u64 {
+    let mut cur:Unit=head;
+    let mut left:u64=loaded;
+    while cur!=null && left>0 {
+        let next:Unit=cur.next;
+        let file:buf<u8>=cur.file;
+        let object:ntasm_nxo.Object=cur.object;
+        ntasm_nxo.release(object);
+        rt_free(runtime(),file);
+        rt_free(runtime(),cur);
+        cur=next;
+        left=left-1;
+    }
+    return 0;
+}
+// Linker phase 1 generalised: merge 1..64 closed NXO libraries in the order
+// given, mirroring compiler/c/ntasm/formats/object_link.c step for step. Imports
+// resolve against exported definitions; inputs are never modified or freed.
+// `inputs` is one arena holding `count` descriptors of 16 bytes
+// (offset,length) followed by the NXO payloads: buf<u8> is the only shape that
+// crosses the Nova boundary, so a variable length link unit is described in
+// band. Every unit receives a 16-byte aligned base for every section, empty
+// sections included, so the trailing padding stays observable. That rule is
+// object_link.c:79 read literally, and every divergent shape is oracle
+// compared in tests_ntasm_nxo_merge_list.c. 800 invalid unit count or arena,
+// 820 mixed target, 821 capacity, 823 duplicate definition, 824 unresolved
+// import, 825 role or contract mismatch, 826 more than one entry. On any code
+// the merged output is left untouched.
+export fn merge_list(inputs:buf<u8>,count:u64)->ntasm_nxo.WriteResult {
+    if count==0 || count>64 { return failed(); }
+    if len(inputs)<count*16 { return failed(); }
+    // THE LIST OF UNITS, and the only list. One cell per unit, appended in
+    // the order the units are read, so the cell at index i is the unit the
+    // old array held at index i. The head owns the chain and the tail is
+    // where the next cell is linked. The four arrays below are the scalars
+    // the algorithm owns and they stay arrays of u64.
+    let mut unit_head:Unit=null;
+    let mut unit_tail:Unit=null;
+    let bases:buf<u64>=alloc(runtime(),count*3);
+    let prefixes:buf<u64>=alloc(runtime(),count+1);
+    let cursor:buf<u64>=alloc(runtime(),count);
+    let group:buf<u64>=alloc(runtime(),count);
+    let mut loaded:u64=0;
+    let mut code:u64=0;
+    let mut target0:u64=0;
+    let mut entries:u64=0;
+    let mut relocations:u64=0;
+    let mut definitions:u64=0;
+    let mut strings_size:u64=0;
+    let mut totals0:u64=0;
+    let mut totals1:u64=0;
+    let mut totals2:u64=0;
+    prefixes[0]=0;
+    let mut i:u64=0;
+    // Pass one is the C preamble: read, compare the target, count entries,
+    // accumulate the symbol and relocation budgets, measure the strings, then
+    // lay out an aligned base for every section of every unit.
+    while i<(count) && code==0 {
+        let slot:u64=i*16;
+        let offset:u64=ntasm_pe.read64(inputs,slot);
+        let length:u64=ntasm_pe.read64(inputs,slot+8);
+        if offset>len(inputs) || length>len(inputs)-offset { code=800;break; }
+        let file:buf<u8>=slice(inputs,offset,length);
+        let read_result:ntasm_nxo.ReadResult=ntasm_nxo.read(file);
+        if read_result.code!=0 { rt_free(runtime(),file);code=800;break; }
+        let object:ntasm_nxo.Object=read_result.object;
+        // THE CELL IS LINKED BEFORE THE PASS USES THE UNIT, so that a
+        // refusal below finds in the chain every unit that was read, and
+        // frees each of them exactly once.
+        let unit:Unit=Unit{file:file,object:object,next:null};
+        if unit_head==null { unit_head=unit; } else { unit_tail.next=unit; }
+        unit_tail=unit;
+        loaded=loaded+1;
+        let symbols:buf<u64>=object.symbols;
+        let relocs:buf<u64>=object.relocations;
+        let ns:u64=len(symbols)/8;
+        let nr:u64=len(relocs)/5;
+        if i==0 { target0=object.target; }
+        else if object.target!=target0 { code=820;break; }
+        if object.entry!=0 { entries=entries+1;if entries>1 { code=826;break; } }
+        if ns>65536-prefixes[i] || nr>1048576-relocations { code=821;break; }
+        prefixes[i+1]=prefixes[i]+ns;
+        relocations=relocations+nr;
+        let mut j:u64=0;
+        while j<(ns) {
+            let word:u64=j*8;
+            if (symbols[word+3]&8)==0 {
+                definitions=definitions+1;
+                strings_size=strings_size+symbols[word+1]+symbols[word+7];
+            }
+            j=j+1;
+        }
+        let mut k:u64=0;
+        while k<3 {
+            let mut total:u64=0;
+            let mut size:u64=0;
+            if k==0 { total=totals0;size=len(object.text); }
+            else if k==1 { total=totals1;size=len(object.rdata); }
+            else { total=totals2;size=len(object.data); }
+            let base:u64=ntasm_pe.align(total,16);
+            if base>67108864 || size>67108864-base { code=821;break; }
+            bases[i*3+k]=base;
+            let next:u64=base+size;
+            if k==0 { totals0=next; }
+            else if k==1 { totals1=next; }
+            else { totals2=next; }
+            k=k+1;
+        }
+        i=i+1;
+    }
+    // object_link.c:86 caps the three merged payloads together and not only
+    // each one, so a per-section legal trio still cannot pass.
+    if code==0 && totals0+totals1+totals2>67108864 { code=821; }
+    if code!=0 {
+        release_units(unit_head,loaded);
+        rt_free(runtime(),bases);
+        rt_free(runtime(),prefixes);rt_free(runtime(),cursor);
+        rt_free(runtime(),group);
+        return refused(code);
+    }
+    let text:buf<u8>=alloc(runtime(),totals0);
+    let rdata:buf<u8>=alloc(runtime(),totals1);
+    let data:buf<u8>=alloc(runtime(),totals2);
+    let kept:buf<u64>=alloc(runtime(),definitions*8);
+    let sites:buf<u64>=alloc(runtime(),relocations*5);
+    let maps:buf<u64>=alloc(runtime(),prefixes[count]*8);
+    let strings:buf<u8>=alloc(runtime(),strings_size);
+    i=0;
+    // THE WALK. The units are read in order and the copy is in the same
+    // order, so the chain is walked with a cursor and the previous unit is
+    // the one the cursor held before it moved.
+    let mut copy_walk:Unit=unit_head;
+    let mut prev_object:ntasm_nxo.Object=null;
+    while i<(count) {
+        let object:ntasm_nxo.Object=copy_walk.object;
+        // The gap between this unit's base and the previous unit's end is
+        // observable merged layout, so it is written here rather than left to
+        // whatever the allocator returned.
+        if i>0 {
+            let t0:u64=bases[i*3-3]+len(prev_object.text);
+            let r0:u64=bases[i*3-2]+len(prev_object.rdata);
+            let d0:u64=bases[i*3-1]+len(prev_object.data);
+            clear(text,t0,bases[i*3]-t0);
+            clear(rdata,r0,bases[i*3+1]-r0);
+            clear(data,d0,bases[i*3+2]-d0);
+        }
+        ntasm_pe.copy(text,bases[i*3],object.text);
+        ntasm_pe.copy(rdata,bases[i*3+1],object.rdata);
+        ntasm_pe.copy(data,bases[i*3+2],object.data);
+        prev_object=object;
+        copy_walk=copy_walk.next;
+        i=i+1;
+    }
+    // Pass two is a k-way merge on the name bytes. Every unit is already
+    // strictly sorted, so only the heads matter: each step takes the smallest
+    // name and gathers the whole equal-name group, which is the pairwise
+    // collision ladder of merge widened to `count` units. The group ladder
+    // runs in name order, so at count 2 it reports exactly what merge does.
+    i=0;
+    while i<(count) { cursor[i]=0;i=i+1; }
+    let mut written:u64=0;
+    let mut at_strings:u64=0;
+    let mut more:bool=true;
+    while more {
+        more=false;
+        let mut members:u64=0;
+        // THE LEAD OF THE GROUP, as a cell. The group holds indices, because
+        // the index maps are indexed by unit, but the lead is read on every
+        // step of the scan and the cell is one link of the chain away.
+        let mut lead_unit:Unit=null;
+        i=0;
+        let mut scan:Unit=unit_head;
+        while i<(count) {
+            let object:ntasm_nxo.Object=scan.object;
+            let symbols:buf<u64>=object.symbols;
+            let text_strings:buf<u8>=object.strings;
+            if cursor[i]<len(symbols)/8 {
+                let head:u64=cursor[i]*8;
+                if members==0 { group[0]=i;lead_unit=scan;members=1;more=true; }
+                else {
+                    let lead_object:ntasm_nxo.Object=lead_unit.object;
+                    let lead_symbols:buf<u64>=lead_object.symbols;
+                    let lead_strings:buf<u8>=lead_object.strings;
+                    let lead:u64=cursor[group[0]]*8;
+                    if bytes_equal(text_strings,symbols[head],symbols[head+1],
+                                   lead_strings,lead_symbols[lead],lead_symbols[lead+1]) {
+                        group[members]=i;members=members+1;
+                    } else if name_less(text_strings,symbols[head],symbols[head+1],
+                                        lead_strings,lead_symbols[lead],lead_symbols[lead+1]) {
+                        group[0]=i;lead_unit=scan;members=1;
+                    }
+                }
+            }
+            scan=scan.next;
+            i=i+1;
+        }
+        if members==0 { break; }
+        // Collision ladder over the whole group, the same one merge walks at
+        // count 2: a name without a definition is unresolved (824), a name with
+        // two definitions is a duplicate (823), and every import of the name
+        // must match the role, the export flag and the contract of the single
+        // definition (825, 824, 825). Several units may import one name: only
+        // the definition is kept, as object_link.c does, so the group ladder
+        // keeps walking the imports instead of refusing the second one.
+        let mut def_unit:u64=0;
+        let mut defs:u64=0;
+        let mut imps:u64=0;
+        let mut m:u64=0;
+        while m<(members) {
+            let unit:u64=group[m];
+            let object:ntasm_nxo.Object=unit_object(unit_head,unit);
+            let symbols:buf<u64>=object.symbols;
+            if (symbols[cursor[unit]*8+3]&8)==0 { defs=defs+1;def_unit=unit; }
+            else { imps=imps+1; }
+            m=m+1;
+        }
+        if defs>1 { code=823;break; }
+        if defs==0 { code=824;break; }
+        let owner:ntasm_nxo.Object=unit_object(unit_head,def_unit);
+        let owner_symbols:buf<u64>=owner.symbols;
+        let owner_at:u64=cursor[def_unit]*8;
+        let owner_strings:buf<u8>=owner.strings;
+        if imps>0 {
+            m=0;
+            while m<(members) && code==0 {
+                let unit:u64=group[m];
+                let object:ntasm_nxo.Object=unit_object(unit_head,unit);
+                let symbols:buf<u64>=object.symbols;
+                let at:u64=cursor[unit]*8;
+                if (symbols[at+3]&8)!=0 {
+                    if (owner_symbols[owner_at+3]&6)!=(symbols[at+3]&6) { code=825; }
+                    else if (owner_symbols[owner_at+3]&1)==0 { code=824; }
+                    else {
+                        let seeker_strings:buf<u8>=object.strings;
+                        if !bytes_equal(owner_strings,owner_symbols[owner_at+6],owner_symbols[owner_at+7],
+                                        seeker_strings,symbols[at+6],symbols[at+7]) { code=825; }
+                    }
+                }
+                m=m+1;
+            }
+            if code!=0 { break; }
+        }
+        // object_link.c copies the definition record and only rebases its
+        // offset, so an import never contributes a symbol of its own.
+        let nl:u64=owner_symbols[owner_at+1];
+        let cl:u64=owner_symbols[owner_at+7];
+        let sec:u64=owner_symbols[owner_at+2];
+        let to:u64=written*8;
+        let name:buf<u8>=slice(owner_strings,owner_symbols[owner_at],nl);
+        let contract:buf<u8>=slice(owner_strings,owner_symbols[owner_at+6],cl);
+        ntasm_pe.copy(strings,at_strings,name);
+        ntasm_pe.copy(strings,at_strings+nl,contract);
+        rt_free(runtime(),name);rt_free(runtime(),contract);
+        kept[to]=at_strings;kept[to+1]=nl;kept[to+2]=sec;kept[to+3]=owner_symbols[owner_at+3];
+        kept[to+4]=owner_symbols[owner_at+4]+bases[def_unit*3+sec-1];
+        kept[to+5]=owner_symbols[owner_at+5];
+        kept[to+6]=at_strings+nl;kept[to+7]=cl;
+        maps[prefixes[def_unit]+cursor[def_unit]]=written;
+        m=0;
+        while m<(members) {
+            let unit:u64=group[m];
+            let object:ntasm_nxo.Object=unit_object(unit_head,unit);
+            let symbols:buf<u64>=object.symbols;
+            if (symbols[cursor[unit]*8+3]&8)!=0 { maps[prefixes[unit]+cursor[unit]]=written; }
+            m=m+1;
+        }
+        at_strings=at_strings+nl+cl;
+        written=written+1;
+        m=0;
+        while m<(members) { cursor[group[m]]=cursor[group[m]]+1;m=m+1; }
+    }
+    // Pass three rebases every site and resolves it through the index maps.
+    // Bases grow monotonically and each unit is internally sorted, so the
+    // per-section stream is already globally ordered exactly as the C qsort
+    // leaves it; the overlap guard therefore only rejects malformed input.
+    let mut w:u64=0;
+    let mut section:u64=1;
+    while section<=3 && code==0 {
+        let mut msz:u64=0;
+        if section==1 { msz=totals0; }
+        else if section==2 { msz=totals1; }
+        else { msz=totals2; }
+        let mut prevoff:u64=0;
+        let mut prevw:u64=0;
+        let mut have:bool=false;
+        i=0;
+        let mut reloc_walk:Unit=unit_head;
+        while i<(count) && code==0 {
+            let object:ntasm_nxo.Object=reloc_walk.object;
+            let relocs:buf<u64>=object.relocations;
+            let nr:u64=len(relocs)/5;
+            let ns:u64=len(object.symbols)/8;
+            let delta:u64=bases[i*3+section-1];
+            let mut j:u64=0;
+            while j<(nr) && code==0 {
+                let site:u64=j*5;
+                if relocs[site]==section {
+                    let kind:u64=relocs[site+1];
+                    let off:u64=relocs[site+2]+delta;
+                    let tgt:u64=relocs[site+3];
+                    let mut width:u64=4;
+                    if kind==2 { width=8; }
+                    if tgt<1 || tgt>(ns) { code=821; }
+                    else if msz<width || off>(msz-width) || (have && off<(prevoff+prevw)) { code=821; }
+                    else {
+                        let at5:u64=w*5;
+                        sites[at5]=section;sites[at5+1]=kind;sites[at5+2]=off;
+                        sites[at5+3]=maps[prefixes[i]+tgt-1]+1;sites[at5+4]=relocs[site+4];
+                        prevoff=off;prevw=width;have=true;w=w+1;
+                    }
+                }
+                j=j+1;
+            }
+            reloc_walk=reloc_walk.next;
+            i=i+1;
+        }
+        section=section+1;
+    }
+    let mut merged_entry:u64=0;
+    i=0;
+    let mut entry_walk:Unit=unit_head;
+    while i<(count) && code==0 {
+        let object:ntasm_nxo.Object=entry_walk.object;
+        if object.entry!=0 { merged_entry=maps[prefixes[i]+object.entry-1]+1; }
+        entry_walk=entry_walk.next;
+        i=i+1;
+    }
+    if code==0 && merged_entry>(written) { code=821; }
+    if code!=0 {
+        rt_free(runtime(),text);rt_free(runtime(),rdata);rt_free(runtime(),data);
+        rt_free(runtime(),kept);rt_free(runtime(),sites);
+        rt_free(runtime(),maps);rt_free(runtime(),strings);
+        release_units(unit_head,loaded);
+        rt_free(runtime(),bases);
+        rt_free(runtime(),prefixes);rt_free(runtime(),cursor);
+        rt_free(runtime(),group);
+        return refused(code);
+    }
+    let merged:ntasm_nxo.Object=ntasm_nxo.Object{
+        target:target0,entry:merged_entry,
+        text:text,rdata:rdata,data:data,
+        symbols:kept,relocations:sites,strings:strings
+    };
+    let result:ntasm_nxo.WriteResult=ntasm_nxo.emit(merged);
+    release_units(unit_head,loaded);
+    rt_free(runtime(),text);rt_free(runtime(),rdata);rt_free(runtime(),data);
+    rt_free(runtime(),kept);rt_free(runtime(),sites);
+    rt_free(runtime(),strings);rt_free(runtime(),maps);
+    rt_free(runtime(),bases);
+    rt_free(runtime(),prefixes);rt_free(runtime(),cursor);
+    rt_free(runtime(),group);
+    rt_free(runtime(),merged);
+    return result;
+}

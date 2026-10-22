@@ -1,0 +1,650 @@
+module nova_source_emit;
+
+// Error codes for report[1] in this emitter's domain
+fn ERR_UNSUPPORTED()->u64 { return 1; }
+fn ERR_BOUND()->u64 { return 2; }
+fn ERR_DAMAGED_AST()->u64 { return 3; }
+
+// AST stride 16 field offsets
+fn F_KIND()->u64 { return 0; }
+fn F_PARENT()->u64 { return 1; }
+fn F_FIRST_CHILD()->u64 { return 2; }
+fn F_LAST_CHILD()->u64 { return 3; }
+fn F_NEXT_SIBLING()->u64 { return 4; }
+fn F_NAME_START()->u64 { return 5; }
+fn F_NAME_END()->u64 { return 6; }
+fn F_SCOPE()->u64 { return 7; }
+fn F_RESOLVED_SCOPE()->u64 { return 8; }
+fn F_WIDTH()->u64 { return 9; }
+fn F_CLASS()->u64 { return 10; }
+fn F_LINE()->u64 { return 11; }
+fn F_COL()->u64 { return 12; }
+fn F_AUX()->u64 { return 13; }
+fn F_TYPE()->u64 { return 14; }
+fn F_VALUE()->u64 { return 15; }
+
+// AST node kinds
+fn K_MODULE()->u64 { return 1; }
+fn K_FN()->u64 { return 5; }
+fn K_PARAM()->u64 { return 6; }
+fn K_RETURN()->u64 { return 7; }
+fn K_BLOCK()->u64 { return 8; }
+fn K_LET()->u64 { return 9; }
+fn K_RETURN_STMT()->u64 { return 11; }
+fn K_IF()->u64 { return 13; }
+fn K_NAME()->u64 { return 14; }
+fn K_LITERAL()->u64 { return 15; }
+fn K_CALL()->u64 { return 17; }
+fn K_BINARY()->u64 { return 18; }
+fn K_UNARY()->u64 { return 24; }
+
+struct W {
+    source: buf<u8>,
+    nodes: buf<u64>,
+    count: u64,
+    out: buf<u8>,
+    at: u64,
+    code: u64,
+    node: u64,
+    depth: u64
+}
+
+fn get(w: W, node: u64, field: u64) -> u64 {
+    if node == 0 || node > w.count || field >= 16 {
+        fail(w, node, ERR_DAMAGED_AST());
+        return 0;
+    }
+    let idx: u64 = (node - 1) * 16 + field;
+    if idx >= len(w.nodes) {
+        fail(w, node, ERR_DAMAGED_AST());
+        return 0;
+    }
+    return w.nodes[idx];
+}
+
+fn fail(w: W, node: u64, code: u64) -> u64 {
+    if w.code == 0 {
+        w.code = code;
+        w.node = node;
+    }
+    return code;
+}
+
+fn put_byte(w: W, b: u64) -> u64 {
+    if w.code != 0 { return w.code; }
+    if w.at >= len(w.out) {
+        return fail(w, w.node, ERR_BOUND());
+    }
+    w.out[w.at] = u8(b & 255);
+    w.at = w.at + 1;
+    return 0;
+}
+
+fn put_literal(w: W, text: buf<u8>) -> u64 {
+    let n: u64 = len(text);
+    if w.code != 0 {
+        rt_free(runtime(), text);
+        return w.code;
+    }
+    let mut i: u64 = 0;
+    while i < n && w.code == 0 {
+        put_byte(w, u64(text[i]));
+        i = i + 1;
+    }
+    rt_free(runtime(), text);
+    return w.code;
+}
+
+fn is_ident_start(c: u64) -> bool {
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 { return true; }
+    return false;
+}
+
+fn is_ident_part(c: u64) -> bool {
+    if is_ident_start(c) || (c >= 48 && c <= 57) { return true; }
+    return false;
+}
+
+fn is_valid_ident(source: buf<u8>, start: u64, end: u64) -> bool {
+    if start >= end || end > len(source) { return false; }
+    if !is_ident_start(u64(source[start])) { return false; }
+    let mut i: u64 = start + 1;
+    while i < end {
+        if !is_ident_part(u64(source[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn is_valid_dotted_ident(source: buf<u8>, start: u64, end: u64) -> bool {
+    if start >= end || end > len(source) { return false; }
+    let mut segment_start: bool = true;
+    let mut i: u64 = start;
+    while i < end {
+        let c: u64 = u64(source[i]);
+        if c == 46 { // '.'
+            if segment_start { return false; }
+            segment_start = true;
+        } else if segment_start {
+            if !is_ident_start(c) { return false; }
+            segment_start = false;
+        } else {
+            if !is_ident_part(c) { return false; }
+        }
+        i = i + 1;
+    }
+    if segment_start { return false; }
+    return true;
+}
+
+
+
+fn put_span(w: W, start: u64, end: u64) -> u64 {
+    if w.code != 0 { return w.code; }
+    if start > end || end > len(w.source) {
+        return fail(w, w.node, ERR_DAMAGED_AST());
+    }
+    let mut i: u64 = start;
+    while i < end && w.code == 0 {
+        put_byte(w, u64(w.source[i]));
+        i = i + 1;
+    }
+    return w.code;
+}
+
+fn put_u64(w: W, val: u64) -> u64 {
+    if w.code != 0 { return w.code; }
+    if val == 0 {
+        return put_byte(w, 48);
+    }
+    let mut digits: u64 = 0;
+    let mut temp: u64 = val;
+    while temp > 0 {
+        digits = digits + 1;
+        temp = temp / 10;
+    }
+    let mut i: u64 = digits;
+    while i > 0 {
+        i = i - 1;
+        let mut dval: u64 = val;
+        let mut j: u64 = 0;
+        while j < i {
+            dval = dval / 10;
+            j = j + 1;
+        }
+        put_byte(w, 48 + (dval % 10));
+    }
+    return w.code;
+}
+
+fn emit_type_id(w: W, node: u64, type_id: u64) -> u64 {
+    if type_id == 1 { let __emit_lit_0:buf<u8>="u8"; return put_literal(w,__emit_lit_0); }
+    if type_id == 2 { let __emit_lit_1:buf<u8>="u16"; return put_literal(w,__emit_lit_1); }
+    if type_id == 3 { let __emit_lit_2:buf<u8>="u32"; return put_literal(w,__emit_lit_2); }
+    if type_id == 4 { let __emit_lit_3:buf<u8>="u64"; return put_literal(w,__emit_lit_3); }
+    if type_id == 5 { let __emit_lit_4:buf<u8>="i8"; return put_literal(w,__emit_lit_4); }
+    if type_id == 6 { let __emit_lit_5:buf<u8>="i16"; return put_literal(w,__emit_lit_5); }
+    if type_id == 7 { let __emit_lit_6:buf<u8>="i32"; return put_literal(w,__emit_lit_6); }
+    if type_id == 8 { let __emit_lit_7:buf<u8>="i64"; return put_literal(w,__emit_lit_7); }
+    if type_id == 9 { let __emit_lit_8:buf<u8>="bool"; return put_literal(w,__emit_lit_8); }
+    return fail(w, node, ERR_UNSUPPORTED());
+}
+
+fn emit_binary_op(w: W, node: u64, op: u64) -> u64 {
+    if op == 43 { let __emit_lit_9:buf<u8>="+"; return put_literal(w,__emit_lit_9); }
+    if op == 45 { let __emit_lit_10:buf<u8>="-"; return put_literal(w,__emit_lit_10); }
+    if op == 42 { let __emit_lit_11:buf<u8>="*"; return put_literal(w,__emit_lit_11); }
+    if op == 47 { let __emit_lit_12:buf<u8>="/"; return put_literal(w,__emit_lit_12); }
+    if op == 37 { let __emit_lit_13:buf<u8>="%"; return put_literal(w,__emit_lit_13); }
+    if op == 38 { let __emit_lit_14:buf<u8>="&"; return put_literal(w,__emit_lit_14); }
+    if op == 124 { let __emit_lit_15:buf<u8>="|"; return put_literal(w,__emit_lit_15); }
+    if op == 94 { let __emit_lit_16:buf<u8>="^"; return put_literal(w,__emit_lit_16); }
+    if op == 60 { let __emit_lit_17:buf<u8>="<"; return put_literal(w,__emit_lit_17); }
+    if op == 62 { let __emit_lit_18:buf<u8>=">"; return put_literal(w,__emit_lit_18); }
+    if op == 15677 { let __emit_lit_19:buf<u8>="=="; return put_literal(w,__emit_lit_19); } // 61*256+61
+    if op == 8509  { let __emit_lit_20:buf<u8>="!="; return put_literal(w,__emit_lit_20); } // 33*256+61
+    if op == 15421 { let __emit_lit_21:buf<u8>="<="; return put_literal(w,__emit_lit_21); } // 60*256+61
+    if op == 15933 { let __emit_lit_22:buf<u8>=">="; return put_literal(w,__emit_lit_22); } // 62*256+61
+    if op == 15420 { let __emit_lit_23:buf<u8>="<<"; return put_literal(w,__emit_lit_23); } // 60*256+60
+    if op == 15934 { let __emit_lit_24:buf<u8>=">>"; return put_literal(w,__emit_lit_24); } // 62*256+62
+    if op == 9766  { let __emit_lit_25:buf<u8>="&&"; return put_literal(w,__emit_lit_25); } // 38*256+38
+    if op == 31868 { let __emit_lit_26:buf<u8>="||"; return put_literal(w,__emit_lit_26); } // 124*256+124
+    return fail(w, node, ERR_UNSUPPORTED());
+}
+
+fn emit_expr(w: W, node: u64) -> u64 {
+    if w.code != 0 { return w.code; }
+    if node == 0 || node > w.count { return fail(w, node, ERR_DAMAGED_AST()); }
+    if w.depth > 128 { return fail(w, node, ERR_DAMAGED_AST()); }
+    w.depth = w.depth + 1;
+    let kind: u64 = get(w, node, F_KIND());
+
+    if kind == K_LITERAL() {
+        if get(w, node, F_FIRST_CHILD()) != 0 || get(w, node, F_LAST_CHILD()) != 0 {
+            fail(w, node, ERR_DAMAGED_AST());
+        } else {
+            let aux: u64 = get(w, node, F_AUX());
+            if aux == 0 || aux == 1 {
+                put_u64(w, get(w, node, F_VALUE()));
+            } else if aux == 2 {
+                let __emit_lit_27:buf<u8>="true"; put_literal(w,__emit_lit_27);
+            } else if aux == 3 {
+                let __emit_lit_28:buf<u8>="false"; put_literal(w,__emit_lit_28);
+            } else {
+                fail(w, node, ERR_UNSUPPORTED());
+            }
+        }
+    } else if kind == K_NAME() {
+        if get(w, node, F_FIRST_CHILD()) != 0 || get(w, node, F_LAST_CHILD()) != 0 {
+            fail(w, node, ERR_DAMAGED_AST());
+        } else {
+            let s: u64 = get(w, node, F_NAME_START());
+            let e: u64 = get(w, node, F_NAME_END());
+            if !is_valid_ident(w.source, s, e) {
+                fail(w, node, ERR_DAMAGED_AST());
+            } else {
+                put_span(w, s, e);
+            }
+        }
+    } else if kind == K_BINARY() {
+        let left: u64 = get(w, node, F_FIRST_CHILD());
+        if left == 0 || get(w, left, F_PARENT()) != node { fail(w, node, ERR_DAMAGED_AST()); }
+        else {
+            let right: u64 = get(w, left, F_NEXT_SIBLING());
+            let last: u64 = get(w, node, F_LAST_CHILD());
+            if right == 0 || get(w, right, F_PARENT()) != node || last != right || get(w, right, F_NEXT_SIBLING()) != 0 {
+                fail(w, node, ERR_DAMAGED_AST());
+            } else {
+                put_byte(w, 40); // '('
+                emit_expr(w, left);
+                put_byte(w, 32);
+                emit_binary_op(w, node, get(w, node, F_AUX()));
+                put_byte(w, 32);
+                emit_expr(w, right);
+                put_byte(w, 41); // ')'
+            }
+        }
+    } else if kind == K_CALL() {
+        let aux: u64 = get(w, node, F_AUX());
+        let fn_ord: u64 = get(w, node, F_VALUE());
+        if aux != 0 || fn_ord == 0 { fail(w, node, ERR_UNSUPPORTED()); }
+        else {
+            let decl_node: u64 = find_fn_by_ordinal(w, fn_ord);
+            if decl_node == 0 { fail(w, node, ERR_DAMAGED_AST()); }
+            else {
+                let cs: u64 = get(w, node, F_NAME_START());
+                let ce: u64 = get(w, node, F_NAME_END());
+                let ds: u64 = get(w, decl_node, F_NAME_START());
+                let de: u64 = get(w, decl_node, F_NAME_END());
+                if !is_valid_ident(w.source, cs, ce) || !is_valid_ident(w.source, ds, de) || (ce - cs) != (de - ds) || get(w, node, F_TYPE()) != get(w, decl_node, F_TYPE()) {
+                    fail(w, node, ERR_DAMAGED_AST());
+                } else {
+                    let mut same_name: bool = true;
+                    let mut mi: u64 = 0;
+                    while mi < (ce - cs) && same_name {
+                        if w.source[cs + mi] != w.source[ds + mi] { same_name = false; }
+                        mi = mi + 1;
+                    }
+                    if !same_name {
+                        fail(w, node, ERR_DAMAGED_AST());
+                    } else {
+                        put_span(w, cs, ce);
+                        put_byte(w, 40); // '('
+                        let mut arg: u64 = get(w, node, F_FIRST_CHILD());
+                        let last: u64 = get(w, node, F_LAST_CHILD());
+                        let mut first: bool = true;
+                        let mut seen_args: u64 = 0;
+                        let mut last_seen: u64 = 0;
+                        while arg != 0 && seen_args <= w.count && w.code == 0 {
+                            if get(w, arg, F_PARENT()) != node { fail(w, arg, ERR_DAMAGED_AST()); }
+                            if !first { let __emit_lit_29:buf<u8>=", "; put_literal(w,__emit_lit_29); }
+                            emit_expr(w, arg);
+                            first = false;
+                            seen_args = seen_args + 1;
+                            last_seen = arg;
+                            arg = get(w, arg, F_NEXT_SIBLING());
+                        }
+                        if seen_args > w.count || (seen_args > 0 && last_seen != last) || (seen_args == 0 && last != 0) {
+                            fail(w, node, ERR_DAMAGED_AST());
+                        }
+                        put_byte(w, 41); // ')'
+                    }
+                }
+            }
+        }
+    } else if kind == K_UNARY() {
+        let child: u64 = get(w, node, F_FIRST_CHILD());
+        let last: u64 = get(w, node, F_LAST_CHILD());
+        if child == 0 || last != child || get(w, child, F_PARENT()) != node || get(w, child, F_NEXT_SIBLING()) != 0 {
+            fail(w, node, ERR_DAMAGED_AST());
+        } else {
+            let op: u64 = get(w, node, F_AUX());
+            if op != 33 && op != 126 && op != 45 {
+                fail(w, node, ERR_UNSUPPORTED());
+            } else if op == 45 { // '-'
+                let ty: u64 = get(w, node, F_TYPE());
+                if ty >= 1 && ty <= 4 { // unsigned u8..u64
+                    put_byte(w, 40); // '('
+                    put_byte(w, 48); // '0'
+                    put_byte(w, 32); // ' '
+                    put_byte(w, 45); // '-'
+                    put_byte(w, 32); // ' '
+                    emit_expr(w, child);
+                    put_byte(w, 41); // ')'
+                } else {
+                    put_byte(w, 40); // '('
+                    put_byte(w, 45); // '-'
+                    emit_expr(w, child);
+                    put_byte(w, 41); // ')'
+                }
+            } else {
+                put_byte(w, 40); // '('
+                put_byte(w, op);
+                emit_expr(w, child);
+                put_byte(w, 41); // ')'
+            }
+        }
+    } else {
+        fail(w, node, ERR_UNSUPPORTED());
+    }
+
+    w.depth = w.depth - 1;
+    return w.code;
+}
+
+fn emit_stmt(w: W, node: u64) -> u64 {
+    if w.code != 0 { return w.code; }
+    if node == 0 || node > w.count { return fail(w, node, ERR_DAMAGED_AST()); }
+    if w.depth > 128 { return fail(w, node, ERR_DAMAGED_AST()); }
+    w.depth = w.depth + 1;
+    let kind: u64 = get(w, node, F_KIND());
+
+    if kind == K_RETURN_STMT() {
+        let val: u64 = get(w, node, F_FIRST_CHILD());
+        let last: u64 = get(w, node, F_LAST_CHILD());
+        if val == 0 || last != val || get(w, val, F_PARENT()) != node || get(w, val, F_NEXT_SIBLING()) != 0 {
+            fail(w, node, ERR_DAMAGED_AST());
+        } else {
+            let __emit_lit_30:buf<u8>="  return "; put_literal(w,__emit_lit_30);
+            emit_expr(w, val);
+            let __emit_lit_31:buf<u8>=";\n"; put_literal(w,__emit_lit_31);
+        }
+    } else if kind == K_CALL() {
+        let __emit_lit_32:buf<u8>="  call "; put_literal(w,__emit_lit_32);
+        emit_expr(w, node);
+        let __emit_lit_33:buf<u8>=";\n"; put_literal(w,__emit_lit_33);
+    } else if kind == K_LET() {
+        let aux: u64 = get(w, node, F_AUX());
+        if aux != 3 {
+            fail(w, node, ERR_UNSUPPORTED());
+        } else {
+            let s: u64 = get(w, node, F_NAME_START());
+            let e: u64 = get(w, node, F_NAME_END());
+            if !is_valid_ident(w.source, s, e) {
+                fail(w, node, ERR_DAMAGED_AST());
+            } else {
+                let val: u64 = get(w, node, F_FIRST_CHILD());
+                let last: u64 = get(w, node, F_LAST_CHILD());
+                if val == 0 || last != val || get(w, val, F_PARENT()) != node || get(w, val, F_NEXT_SIBLING()) != 0 {
+                    fail(w, node, ERR_DAMAGED_AST());
+                } else {
+                    let __emit_lit_34:buf<u8>="  let "; put_literal(w,__emit_lit_34);
+                    put_span(w, s, e);
+                    let __emit_lit_35:buf<u8>=":"; put_literal(w,__emit_lit_35);
+                    emit_type_id(w, node, get(w, node, F_TYPE()));
+                    let __emit_lit_36:buf<u8>=" = "; put_literal(w,__emit_lit_36);
+                    emit_expr(w, val);
+                    let __emit_lit_37:buf<u8>=";\n"; put_literal(w,__emit_lit_37);
+                }
+            }
+        }
+    } else if kind == K_IF() {
+        let cond: u64 = get(w, node, F_FIRST_CHILD());
+        if cond == 0 || get(w, cond, F_PARENT()) != node {
+            fail(w, node, ERR_DAMAGED_AST());
+        } else {
+            let then_blk: u64 = get(w, cond, F_NEXT_SIBLING());
+            if then_blk == 0 || get(w, then_blk, F_PARENT()) != node || get(w, then_blk, F_KIND()) != K_BLOCK() {
+                fail(w, node, ERR_DAMAGED_AST());
+            } else {
+                let else_branch: u64 = get(w, then_blk, F_NEXT_SIBLING());
+                let last: u64 = get(w, node, F_LAST_CHILD());
+                if else_branch != 0 {
+                    let ek: u64 = get(w, else_branch, F_KIND());
+                    if get(w, else_branch, F_PARENT()) != node || (ek != K_BLOCK() && ek != K_IF()) || get(w, else_branch, F_NEXT_SIBLING()) != 0 || last != else_branch {
+                        fail(w, node, ERR_DAMAGED_AST());
+                    }
+                } else {
+                    if last != then_blk {
+                        fail(w, node, ERR_DAMAGED_AST());
+                    }
+                }
+                if w.code == 0 {
+                    let __emit_lit_38:buf<u8>="  if "; put_literal(w,__emit_lit_38);
+                    emit_expr(w, cond);
+                    let __emit_lit_39:buf<u8>=" {\n"; put_literal(w,__emit_lit_39);
+                    emit_block_stmts(w, then_blk);
+                    let __emit_lit_40:buf<u8>="  }"; put_literal(w,__emit_lit_40);
+                    if else_branch != 0 {
+                        let __emit_lit_41:buf<u8>=" else {\n"; put_literal(w,__emit_lit_41);
+                        if get(w, else_branch, F_KIND()) == K_BLOCK() {
+                            emit_block_stmts(w, else_branch);
+                        } else {
+                            emit_stmt(w, else_branch);
+                        }
+                        let __emit_lit_42:buf<u8>="  }"; put_literal(w,__emit_lit_42);
+                    }
+                    let __emit_lit_43:buf<u8>="\n"; put_literal(w,__emit_lit_43);
+                }
+            }
+        }
+    } else {
+        fail(w, node, ERR_UNSUPPORTED());
+    }
+
+    w.depth = w.depth - 1;
+    return w.code;
+}
+
+fn emit_block_stmts(w: W, blk: u64) -> u64 {
+    if blk == 0 || blk > w.count || get(w, blk, F_KIND()) != K_BLOCK() {
+        return fail(w, blk, ERR_DAMAGED_AST());
+    }
+    let mut stmt: u64 = get(w, blk, F_FIRST_CHILD());
+    let last: u64 = get(w, blk, F_LAST_CHILD());
+    let mut seen: u64 = 0;
+    let mut last_seen: u64 = 0;
+    while stmt != 0 && seen <= w.count && w.code == 0 {
+        if get(w, stmt, F_PARENT()) != blk { fail(w, stmt, ERR_DAMAGED_AST()); }
+        emit_stmt(w, stmt);
+        seen = seen + 1;
+        last_seen = stmt;
+        stmt = get(w, stmt, F_NEXT_SIBLING());
+    }
+    if seen > w.count || (seen > 0 && last_seen != last) || (seen == 0 && last != 0) {
+        fail(w, blk, ERR_DAMAGED_AST());
+    }
+    return w.code;
+}
+
+fn emit_fn(w: W, node: u64) -> u64 {
+    if w.code != 0 { return w.code; }
+    if node == 0 || node > w.count { return fail(w, node, ERR_DAMAGED_AST()); }
+    let fn_ord: u64 = get(w, node, F_VALUE());
+    if fn_ord == 0 { return fail(w, node, ERR_DAMAGED_AST()); }
+    let s: u64 = get(w, node, F_NAME_START());
+    let e: u64 = get(w, node, F_NAME_END());
+    if !is_valid_ident(w.source, s, e) { return fail(w, node, ERR_DAMAGED_AST()); }
+
+    let is_main: bool = is_main_fn(w.source, s, e);
+    let aux: u64 = get(w, node, F_AUX());
+    if is_main || aux == 1 {
+        let __emit_lit_44:buf<u8>=" export fn "; put_literal(w,__emit_lit_44);
+    } else {
+        let __emit_lit_45:buf<u8>=" fn "; put_literal(w,__emit_lit_45);
+    }
+    put_span(w, s, e);
+    put_byte(w, 40); // '('
+
+    let mut child: u64 = get(w, node, F_FIRST_CHILD());
+    let mut first_param: bool = true;
+    let mut ret_count: u64 = 0;
+    let mut ret_node: u64 = 0;
+    let mut body_count: u64 = 0;
+    let mut body_node: u64 = 0;
+    let mut seen: u64 = 0;
+    let mut last_child: u64 = 0;
+
+    while child != 0 && seen <= w.count && w.code == 0 {
+        if get(w, child, F_PARENT()) != node { fail(w, child, ERR_DAMAGED_AST()); }
+        let k: u64 = get(w, child, F_KIND());
+        if k == K_PARAM() {
+            if ret_count != 0 || body_count != 0 { fail(w, child, ERR_DAMAGED_AST()); }
+            let ps: u64 = get(w, child, F_NAME_START());
+            let pe: u64 = get(w, child, F_NAME_END());
+            if !is_valid_ident(w.source, ps, pe) { fail(w, child, ERR_DAMAGED_AST()); }
+            else {
+                if !first_param { let __emit_lit_46:buf<u8>=", "; put_literal(w,__emit_lit_46); }
+                let __emit_lit_47:buf<u8>="in "; put_literal(w,__emit_lit_47);
+                put_span(w, ps, pe);
+                put_byte(w, 58); // ':'
+                emit_type_id(w, child, get(w, child, F_TYPE()));
+                first_param = false;
+            }
+        } else if k == K_RETURN() {
+            if ret_count != 0 || body_count != 0 { fail(w, child, ERR_DAMAGED_AST()); }
+            ret_count = ret_count + 1;
+            ret_node = child;
+        } else if k == K_BLOCK() {
+            if ret_count != 1 || body_count != 0 { fail(w, child, ERR_DAMAGED_AST()); }
+            body_count = body_count + 1;
+            body_node = child;
+        } else {
+            fail(w, child, ERR_UNSUPPORTED());
+        }
+        seen = seen + 1;
+        last_child = child;
+        child = get(w, child, F_NEXT_SIBLING());
+    }
+
+    if seen > w.count || ret_count != 1 || body_count != 1 || last_child != get(w, node, F_LAST_CHILD()) {
+        return fail(w, node, ERR_DAMAGED_AST());
+    }
+
+    let __emit_lit_48:buf<u8>=")->"; put_literal(w,__emit_lit_48);
+    emit_type_id(w, ret_node, get(w, ret_node, F_TYPE()));
+
+    let __emit_lit_49:buf<u8>="\n effects {}\n clobbers {rax} {\n"; put_literal(w,__emit_lit_49);
+    emit_block_stmts(w, body_node);
+    let __emit_lit_50:buf<u8>=" }\n"; put_literal(w,__emit_lit_50);
+    return w.code;
+}
+
+export fn emit(source: buf<u8>, nodes: buf<u64>, count: u64,
+               out: buf<u8>, length: buf<u64>, report: buf<u64>) -> u64 {
+    if len(length) >= 1 { length[0] = 0; }
+    if len(length) < 1 || len(report) < 4 { return ERR_BOUND(); }
+    report[0] = 0;
+    report[1] = 0;
+    report[2] = 0;
+    report[3] = 0;
+
+    if count == 0 || count > len(nodes) / 16 {
+        report[1] = ERR_DAMAGED_AST();
+        return ERR_DAMAGED_AST();
+    }
+
+    let root_kind: u64 = nodes[F_KIND()];
+    if root_kind != K_MODULE() {
+        report[0] = 1;
+        report[1] = ERR_DAMAGED_AST();
+        return ERR_DAMAGED_AST();
+    }
+
+    let ms: u64 = nodes[F_NAME_START()];
+    let me: u64 = nodes[F_NAME_END()];
+    if !is_valid_dotted_ident(source, ms, me) {
+        report[0] = 1;
+        report[1] = ERR_DAMAGED_AST();
+        return ERR_DAMAGED_AST();
+    }
+
+    let w: W = W{
+        source: source,
+        nodes: nodes,
+        count: count,
+        out: out,
+        at: 0,
+        code: 0,
+        node: 0,
+        depth: 0
+    };
+
+    let __emit_lit_51:buf<u8>="module "; put_literal(w,__emit_lit_51);
+    put_span(w, ms, me);
+    let __emit_lit_52:buf<u8>="\ntarget x86_64-nexora-uefi\ndefault_abi efi-x64-v0\nsection .text {\n"; put_literal(w,__emit_lit_52);
+
+    let mut child: u64 = get(w, 1, F_FIRST_CHILD());
+    let mut seen_top: u64 = 0;
+    let mut last_top: u64 = 0;
+    while child != 0 && seen_top <= count && w.code == 0 {
+        if get(w, child, F_PARENT()) != 1 { fail(w, child, ERR_DAMAGED_AST()); }
+        let k: u64 = get(w, child, F_KIND());
+        if k == K_FN() {
+            emit_fn(w, child);
+        } else {
+            fail(w, child, ERR_UNSUPPORTED());
+        }
+        seen_top = seen_top + 1;
+        last_top = child;
+        child = get(w, child, F_NEXT_SIBLING());
+    }
+
+    if seen_top > count || (seen_top > 0 && last_top != get(w, 1, F_LAST_CHILD())) {
+        fail(w, 1, ERR_DAMAGED_AST());
+    }
+    let __emit_lit_53:buf<u8>="}\n"; put_literal(w,__emit_lit_53);
+
+    let res_code: u64 = w.code;
+    let res_node: u64 = w.node;
+    let res_at: u64 = w.at;
+    rt_free(runtime(), w);
+
+    if res_code != 0 {
+        report[0] = res_node;
+        report[1] = res_code;
+        report[2] = 0;
+        report[3] = 0;
+        return res_code;
+    }
+
+    length[0] = res_at;
+    report[0] = 0;
+    report[1] = 0;
+    report[2] = res_at;
+    report[3] = 0;
+    return 0;
+}
+
+fn is_main_fn(source: buf<u8>, start: u64, end: u64) -> bool {
+    if end < start || (end - start) != 4 || end > len(source) { return false; }
+    if source[start] == 109 && source[start + 1] == 97 && source[start + 2] == 105 && source[start + 3] == 110 { return true; }
+    return false;
+}
+
+fn find_fn_by_ordinal(w: W, ordinal: u64) -> u64 {
+    if ordinal == 0 { return 0; }
+    let mut i: u64 = 1;
+    let mut match_count: u64 = 0;
+    let mut found_node: u64 = 0;
+    while i <= w.count {
+        let k: u64 = get(w, i, F_KIND());
+        if k == K_FN() && get(w, i, F_PARENT()) == 1 && get(w, i, F_VALUE()) == ordinal {
+            match_count = match_count + 1;
+            found_node = i;
+        }
+        i = i + 1;
+    }
+    if match_count == 1 { return found_node; }
+    return 0;
+}

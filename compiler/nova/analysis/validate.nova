@@ -1,0 +1,501 @@
+module validate;
+
+import ntasm_ast;
+// ntasm_macro_expand is no longer imported here: this module no longer names
+// the expander. The expansion is stage 1 and it now lives in
+// ntasm_macro_splice, which imports the expander itself. See the note where
+// the splice used to be.
+import ntasm_macro_splice;
+import semantics;
+import targets;
+import versions;
+import features;
+import callable_names;
+import symbol_names;
+import types;
+import constant_types;
+import literal_initializers;
+import condition_types;
+import parameters;
+import locals;
+import bindings;
+import register_bindings;
+import register_widths;
+import abi;
+import pointer_spaces;
+import effects;
+import body_effects;
+import body_intrinsics;
+import body_clobbers;
+import control_flow;
+import return_types;
+import contracts;
+import feature_requirements;
+import clobbers;
+import ntasm_refs;
+import calls;
+import call_types;
+import initializer_types;
+import call_effects;
+import call_clobbers;
+import call_contracts;
+import ntir;
+import machine_ir;
+
+fn clear(words:buf<u64>)->u64 {
+    words[0]=0;words[1]=0;words[2]=0;words[3]=0;words[4]=0;words[5]=0;return 0;
+}
+
+// Six scratch words, not four. calls.check owns the arity verdict of this
+// pipeline and publishes the too many / too few reason in out[4] and its
+// index in out[5]; a four word scratch dropped both on the floor, so the
+// shipped pipeline answered a bare 311 with no reason at all and 354
+// reasons 4 and 5 were unreachable from it. Six is enough and no wider is
+// needed: every stage of stages() is preceded by clear(scratch), so the
+// only words a caller can ever read past out[3] are the ones the failing
+// stage wrote, and the only pass of this pipeline that writes past out[3] at
+// all is calls.check. types.check writes four more counters, into out[4..7],
+// but only for a caller of eight words or more, and the stage that follows
+// it clears the scratch before anything can read them; the validate gate
+// pins that with an eight word caller on a module that itself carries a $T
+// splice type. The width is written out here rather than named by a
+// function because every function and every local of this module is charged
+// to the same program wide budget the forty module diagnostics gate
+// compiles, and that budget is the next wall the tree is on.
+
+
+// ------------------------------------------------- where the splice went
+// Everything that used to be here is ntasm_macro_splice now: the Splice
+// record, blank_splice, splice_release, the kind and field ordinals,
+// region_words, prod_get and its five wrappers, node_get, node_put, pull,
+// unit_of, build_text, collect, mark_children, compact, respan_types,
+// relink_list, substitute, prune, and expand_stage itself. The text moved
+// verbatim; five `export` keywords were added and nothing else.
+//
+// It moved because the expander does not mutate the caller's tree: it fills a
+// region of its own, and those passes are the only things in this tree that
+// read that region back into a tree. A producer that builds objects cannot
+// reach this module -- its closure is forty one modules and one Nova program
+// has one function budget of 1024 shared by all of them -- so the splice,
+// whose own closure is three modules, was the part that could move, and it
+// moved. The measured closure and function count of the arrangement that
+// replaces this one, and of the producer image it makes reachable, are in
+// out/c-bootstrap/nova/evidence/W18SpliceReach/closure.run.log.
+//
+// What did not change: expand_stage is still stage 1, it still runs before
+// stages() sees a tree, the first thirty four rows of spec/ntasm/ntasm.md 17.7 run
+// in the order that section froze them, the codes and the scratch words are
+// the same, and the same buffers are released. What the move did NOT change
+// is how the expansion is reached. What it DID change is the count: stage 35,
+// machine_ir, now runs after call_contracts, and the published table and
+// out[0] carry 35 where they carried 34.
+// This module still reaches the expansion through the same four entry points
+// it always had.
+
+// Run the semantic pipeline over a parsed NTASM tree, in this order, which is
+// the order of the rows of spec/ntasm/ntasm.md 17.7 plus the lowering, as stages()
+// executes it: 1 expansion, 2 semantics.index, 3 targets.check,
+// 4 versions.check, 5 features.check, 6 callable_names.check,
+// 7 symbol_names.check, 8 types.check, 9 constant_types.check,
+// 10 literal_initializers.check, 11 parameters.check, 12 locals.check,
+// 13 bindings.check, 14 register_bindings.check, 15 register_widths.check,
+// 16 clobbers.check, 17 abi.check, 18 pointer_spaces.check, 19 effects.check,
+// 20 body_effects.check, 21 body_intrinsics.check, 22 body_clobbers.check,
+// 23 control_flow.check, 24 return_types.check, 25 contracts.check,
+// 26 feature_requirements.check, 27 ntasm_refs.resolve, 28 calls.check,
+// 29 call_types.check, 30 initializer_types.check, 31 condition_types.check,
+// 32 call_effects.check, 33 call_clobbers.check, 34 call_contracts.check,
+// 35 machine_ir_stage -- ntir.build, machine_ir.lower, machine_ir.verify.
+// The expansion is stage 1 and is run by the caller of this function, through
+// ntasm_macro_splice.expand_stage, so the first clear(scratch) below is
+// stage 2. condition_types is stage 31, between initializer_types and
+// call_effects, which is where the code runs it and where stage_table() and
+// the validate gate now read it. Returns 0 and leaves the six word scratch
+// zeroed, so the caller can publish its own counters.
+fn stages(text:buf<u8>,tree:ntasm_ast.Tree,scratch:buf<u64>)->u64 {
+    let mut code:u64=0;
+    clear(scratch);code=semantics.index(text,tree,scratch);
+    if code==0 {
+        clear(scratch);code=targets.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=versions.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=features.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=callable_names.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=symbol_names.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=types.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=constant_types.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=literal_initializers.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=parameters.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=locals.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=bindings.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=register_bindings.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=register_widths.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=clobbers.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=abi.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=pointer_spaces.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=effects.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=body_effects.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=body_intrinsics.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=body_clobbers.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=control_flow.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=return_types.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=contracts.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=feature_requirements.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=ntasm_refs.resolve(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=calls.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=call_types.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=initializer_types.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=condition_types.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=call_effects.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=call_clobbers.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=call_contracts.check(text,tree,scratch);
+    }
+    if code==0 {
+        clear(scratch);code=machine_ir_stage(text,tree,scratch);
+    }
+    return code;
+}
+
+// STAGE 35, machine_ir. The last stage, and the first one that PRODUCES
+// anything: stages 1 to 34 all answer questions about a tree and hand the
+// same tree back, and this one builds a second image out of it. It runs after
+// call_contracts because that is the last semantic stage, and it runs on the
+// EXPANDED tree stages() already receives, not on the tree the caller handed
+// in -- the same object every other stage above sees, so a module reached
+// through a macro invocation is lowered the way it is validated.
+//
+// The order inside is the module's own: ntir.build, then machine_ir.lower,
+// then machine_ir.verify. The verify is not a belt and not a duplicate --
+// lower builds and verify judges, and an image that was built and never
+// judged has had nothing checked.
+//
+// WHY IT REFUSES, which is the whole of its being a stage. A stage that could
+// not say no would be a report, and the project's own rule for that shape is
+// abi.obligations and stub_table: built, reachable, and not in the pipeline.
+// So the refusal travels in the six word scratch exactly as every other
+// stage's does -- out[0] line, out[1] column, out[2] the code, out[3] the
+// node -- and validate's own error branch republishes it unchanged.
+//
+// WHAT IT COSTS. One NTIR image of HEADER_WORDS + node_count*NODE_WORDS
+// words, and on a module that survives the lowering one Machine IR image of
+// HEADER_WORDS + (records*8+64)*NODE_WORDS. Both are allocated here and both
+// are released here on every path, including the refusing ones; a stage that
+// leaked its scratch would make the next call's refusal a function of how
+// many calls came before it.
+fn machine_ir_stage(text:buf<u8>,tree:ntasm_ast.Tree,scratch:buf<u64>)->u64 {
+    let nodes:u64=tree.node_count;
+    if nodes==0 { scratch[0]=0;scratch[1]=0;scratch[2]=800;scratch[3]=0;return 800; }
+    let cap:u64=ntir.HEADER_WORDS()+nodes*ntir.NODE_WORDS();
+    let ntir_words:buf<u64>=alloc(runtime(),cap);
+    let mut code:u64=ntir.build(text,tree,ntir_words,cap);
+    if code!=0 {
+        scratch[0]=0;scratch[1]=0;scratch[2]=code;scratch[3]=0;
+        rt_free(runtime(),ntir_words);
+        return code;
+    }
+    let records:u64=ntir_words[3];
+    let need:u64=machine_ir.HEADER_WORDS()+(records*8+64)*machine_ir.NODE_WORDS();
+    let mir:buf<u64>=alloc(runtime(),need);
+    // A6 (13 October 2026): the AST says which expressions are calls; a grafted
+    // stub call has no parenthesis in the text (machine_ir.lower_with_calls).
+    let marks:buf<u64>=machine_ir.ast_call_marks(tree);
+    code=machine_ir.lower_with_calls(text,tree,ntir_words,records,mir,need,scratch,marks);
+    rt_free(runtime(),marks);
+    if code==0 { code=machine_ir.verify(mir,mir[3],scratch); }
+    rt_free(runtime(),mir);
+    rt_free(runtime(),ntir_words);
+    return code;
+}
+
+// ------------------------------------- the order, as a machine checkable
+// table. spec/ntasm/ntasm.md 17.7 froze the thirty four SEMANTIC stages of this
+// pipeline; stage 35, machine_ir, is the lowering that runs after them and
+// is published here beside them because it is a stage of the same run and
+// not a side report. The count is machine checked in two places that have to
+// agree -- out[0] below, and the byte length of this table -- and the order
+// itself was an assertion of review. The table is NUL separated and its
+// length is the check on the count, so a name added or dropped shows up as a
+// different byte length and the harness comparing the bytes fails. One
+// function and three locals: this module shares a program wide budget with
+// the thirty nine other modules the diagnostics gate compiles, and that
+// budget is the next wall.
+export fn stage_table(dst:buf<u8>)->u64 {
+    let words:buf<u8>="expand\0index\0targets\0versions\0features\0callable_names\0symbol_names\0types\0constant_types\0literal_initializers\0parameters\0locals\0bindings\0register_bindings\0register_widths\0clobbers\0abi\0pointer_spaces\0effects\0body_effects\0body_intrinsics\0body_clobbers\0control_flow\0return_types\0contracts\0feature_requirements\0refs\0calls\0call_types\0initializer_types\0condition_types\0call_effects\0call_clobbers\0call_contracts\0machine_ir\0";
+    let size:u64=len(words);
+    if len(dst)<size { return 0; }
+    let mut i:u64=0;
+    while i<size { dst[i]=words[i];i=i+1; }
+    return size;
+}
+
+// ------------------------------------------------- the arity diagnostic
+// One scheme, chosen and stated once: 311 stays the verdict this pipeline
+// returns for an arity mismatch, and the too many / too few distinction
+// travels additively in out[4] and out[5].
+//
+// Why 311 and not 354 reason 4 or reason 5. spec/ntasm/ntasm.md 5 orders the two
+// checks on purpose, "la resolution et l'arite des calls sont controlees
+// avant ce test de type afin de conserver leur diagnostic propre", and
+// spec/ntasm/ntasm.md 17.7 freezes calls.check as stage 28 and call_types.check as
+// stage 29. Letting 354/4 and 354/5 answer would then mean either reordering
+// two frozen stages, which the precedence table gives no reason to allow, or
+// minting a second verdict for one defect and splitting its gate cases across
+// two codes. The trade off is real and is why the duplication is documented
+// instead of hidden: call_types.check carries reasons 4 and 5 so that it is
+// sound on a tree no calls.check has seen, and that standalone reachability
+// is the whole point of them. Under this scheme they stay reachable exactly
+// there, and the pipeline republishes the same two facts, under the same
+// numbering, on its own 311. Nothing is lost and nothing is gained twice: a
+// caller that lends four words still reads expected and received arity in
+// out[2] and out[3] exactly as before, and a caller that lends six also
+// learns which of the two mismatches it is and at which argument.
+
+// Expand every macro of a parsed NTASM tree, then run the semantic pipeline
+// over the expanded tree, in the order of the rows of spec/ntasm/ntasm.md 17.7 and
+// the lowering after them, as stages() executes it and stage_table()
+// publishes:
+// ntasm_macro_splice.expand_stage, semantics.index, targets.check,
+// versions.check, features.check, callable_names.check, symbol_names.check,
+// constant_types.check, literal_initializers.check, parameters.check,
+// locals.check, bindings.check, register_bindings.check,
+// register_widths.check, clobbers.check, abi.check, pointer_spaces.check,
+// effects.check, body_effects.check, body_intrinsics.check,
+// body_clobbers.check, control_flow.check, return_types.check,
+// contracts.check, feature_requirements.check, ntasm_refs.resolve,
+// calls.check, call_types.check, initializer_types.check,
+// condition_types.check, call_effects.check, call_clobbers.check,
+// call_contracts.check, machine_ir_stage.
+// Returns 0 after writing out[0]=35, out[1]=tree.token_count,
+// out[2]=the expanded node count, which is the number of nodes the expanded
+// tree really has: ntasm_macro_splice.prune retires every id the root cannot
+// reach before this word is written, so the count is the length of the id
+// space and every id in it names a node. out[3]=0, and, when the caller lends
+// six words or more, out[4]=0 and out[5]=0: a module that passed every stage
+// carries no arity reason and says so rather than leaving a stage scratch
+// behind. Returns the first nonzero stage code and copies its six-word
+// scratch output into out[0..5], the last two words only when the caller
+// supplied them, so a four-word caller is byte for byte what it was.
+// Returns 800 with no write to out on an invalid tree or an output buffer
+// shorter than four words. The scratch buffer is always freed, and so is
+// every buffer the expansion allocated; neither source, tree nor out is
+// owned or released by this module.
+export fn validate(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false { return 800; }
+    if len(out)<4 { return 800; }
+
+    let scratch:buf<u64>=alloc(runtime(),6);
+    let s:ntasm_macro_splice.Splice=ntasm_macro_splice.blank_splice(source,tree);
+    clear(scratch);
+
+    // The expansion is the first stage, so every index and every check below
+    // sees the expanded module. A template that no invocation developed is
+    // still in the tree, which is why callable_names and ntasm_refs exclude
+    // the template subtrees themselves.
+    let mut code:u64=ntasm_macro_splice.expand_stage(s,scratch);
+    let mut unit:ntasm_ast.Tree=ntasm_macro_splice.unit_of(s);
+    if code==0 {
+        code=stages(s.text,unit,scratch);
+    }
+
+    if code==0 {
+        out[0]=35;
+        out[1]=tree.token_count;
+        out[2]=unit.node_count;
+        out[3]=0;
+        if len(out)>4 { out[4]=0; }
+        if len(out)>5 { out[5]=0; }
+    } else {
+        out[0]=scratch[0];
+        out[1]=scratch[1];
+        out[2]=scratch[2];
+        out[3]=scratch[3];
+        // The arity reason and its index, propagated verbatim from the stage
+        // that wrote them. calls.check is the only pass of this pipeline
+        // that writes these two words, and only on a 311, so every other
+        // verdict republishes the zero the scratch was cleared to.
+        if len(out)>4 { out[4]=scratch[4]; }
+        if len(out)>5 { out[5]=scratch[5]; }
+    }
+    ntasm_macro_splice.splice_release(s);
+    rt_free(runtime(),scratch);
+    return code;
+}
+
+// The shape of the tree the expansion stage hands the later passes, measured
+// instead of asserted. The semantic passes read whatever
+// ntasm_macro_splice.unit_of builds and neither know nor care whether it is
+// a tree a reader can walk: a pass that dispatches on kind never sees a
+// retired slot, because a retired slot has kind 0, and a pass that walks from the root never arrives at one. So
+// nothing in the pipeline can witness its own id space, and an id inside
+// 1..node_count that the root does not reach is a hole only an outside
+// reader can see. ntir is that reader: its count is the length of the image
+// and its verifier walks the image for reachability.
+//
+// This export runs the expansion stage and then reports, for the tree
+// ntasm_macro_splice.unit_of hands stages 2 to 35:
+//
+//   out[0]  the expansion stage code
+//   out[1]  that tree's node_count, which is what validate publishes in
+//           out[2] on success
+//   out[2]  the caller's own node_count, equal to out[1] whenever the module
+//           has no invocation and the caller's tree stands untouched
+//   out[3]  ids inside 1..out[1] whose kind is 0
+//   out[4]  ids inside 1..out[1] the root does not reach
+//   out[5]  ntir.build on that tree
+//   out[6]  ntir.verify on the image build produced
+//   out[7]  the node id verify refused at
+//   out[8]  the code verify refused with
+//   out[9]  ids the root does reach, out[1] minus out[4]
+//
+// out[3] and out[4] are the two halves of the same defect and they are not
+// equal in general: a spent head slot has kind 0 and an invocation replaced
+// along with its children does not, so a reader that counts holes by kind
+// alone sees one per expansion invocation and misses the rest. Both are 0 on
+// a tree the expansion stage built, and both are what the gate asserts.
+//
+// Returns 800 without writing when out is shorter than ten words. Nothing is
+// owned: source, tree and out belong to the caller, and every buffer this
+// allocates, including the one the expansion stage allocates, is released
+// before it returns. It never returns the expansion code, because a caller
+// that wants the verdict reads it from validate.
+export fn spliced_shape(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if len(out)<10 { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),6);
+    let s:ntasm_macro_splice.Splice=ntasm_macro_splice.blank_splice(source,tree);
+    clear(scratch);
+    let mut i:u64=0;
+    while i<10 { out[i]=0; i=i+1; }
+    out[0]=ntasm_macro_splice.expand_stage(s,scratch);
+    out[2]=tree.node_count;
+    let unit:ntasm_ast.Tree=ntasm_macro_splice.unit_of(s);
+    let n:u64=unit.node_count;
+    out[1]=n;
+    if n>0 {
+        let keep:buf<u64>=alloc(runtime(),n+1);
+        let stack:buf<u64>=alloc(runtime(),n+1);
+        i=0;
+        while i<n+1 { keep[i]=0; i=i+1; }
+        let mut size:u64=1;
+        keep[0]=1;stack[0]=1;
+        while size>0 {
+            size=size-1;
+            let id:u64=stack[size];
+            let mut child:u64=ntasm_ast.node_at(unit,id).first_child;
+            while child!=0 && child<=n {
+                if keep[child-1]==0 { keep[child-1]=1;stack[size]=child;size=size+1; }
+                child=ntasm_ast.node_at(unit,child).next_sibling;
+            }
+        }
+        // The two counts are separate sweeps and they must be: a slot the
+        // root cannot reach is exactly the slot a walk would never visit, so
+        // counting kind 0 from inside the walk would report zero on the very
+        // tree the count exists to expose. The flat scan is the reader the
+        // semantic passes are, and it is the one that has to see this.
+        i=1;
+        while i<=n {
+            if ntasm_ast.node_at(unit,i).kind==0 { out[3]=out[3]+1; }
+            i=i+1;
+        }
+        i=1;
+        while i<=n {
+            if keep[i-1]==0 { out[4]=out[4]+1; }
+            i=i+1;
+        }
+        out[9]=n-out[4];
+        rt_free(runtime(),stack);
+        rt_free(runtime(),keep);
+    }
+    if n>0 {
+        let cap:u64=ntir.HEADER_WORDS()+n*ntir.NODE_WORDS();
+        let words:buf<u64>=alloc(runtime(),cap);
+        let report:buf<u64>=alloc(runtime(),4);
+        out[5]=ntir.build(s.text,unit,words,cap);
+        if out[5]==0 {
+            out[6]=ntir.verify(words,n,report);
+            out[7]=report[3];
+            out[8]=report[2];
+        }
+        rt_free(runtime(),report);
+        rt_free(runtime(),words);
+    }
+    ntasm_macro_splice.splice_release(s);
+    rt_free(runtime(),scratch);
+    return 0;
+}
+
+// Validate an already-expanded tree without taking ownership or expanding twice.
+export fn validate_expanded(text:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false||len(out)<4{return 800;}
+    let scratch:buf<u64>=alloc(runtime(),6);
+    clear(scratch);
+    let code:u64=stages(text,tree,scratch);
+    if code==0 {
+        out[0]=35;out[1]=tree.token_count;out[2]=tree.node_count;out[3]=0;
+        if len(out)>4{out[4]=0;}if len(out)>5{out[5]=0;}
+    } else {
+        out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3];
+        if len(out)>4{out[4]=scratch[4];}if len(out)>5{out[5]=scratch[5];}
+    }
+    rt_free(runtime(),scratch);return code;
+}

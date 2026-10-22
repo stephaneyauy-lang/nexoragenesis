@@ -1,0 +1,277 @@
+module body_effects;
+
+import ntasm_ast;
+import effects;
+
+fn same_word(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    if start>end || end>len(source) || (end-start)!=len(text){return false;}
+    let mut i:u64=0;while i<len(text){if source[start+i]!=text[i]{return false;}i=i+1;}return true;
+}
+// Byte-wise membership of the span source[start..end] in a pipe separated
+// closed list. It is the same shape as member() in the x86_64 conformance
+// oracle, compiler/c/ntasm/backend/x64.c, so the groups below read like the
+// oracle branches they were read out of.
+fn member(source:buf<u8>,start:u64,end:u64,list:buf<u8>)->bool {
+    if start>end || end>len(source){return false;}
+    let span:u64=end-start;let mut begin:u64=0;let mut at:u64=0;
+    while at<=len(list){
+        if at==len(list) || list[at]==124 {
+            if at-begin==span {
+                let mut i:u64=0;let mut equal:bool=true;
+                while i<span {
+                    if source[start+i]!=list[begin+i]{equal=false;i=span;}
+                    i=i+1;
+                }
+                if equal{return true;}
+            }
+            begin=at+1;
+        }
+        at=at+1;
+    }
+    return false;
+}
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64{
+    if parent==0||parent>tree.node_count{return 0;}let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);
+    let mut id:u64=p.first_child;let mut index:u64=0;while id!=0&&index<ordinal{
+        if id>tree.node_count{return 0;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;index=index+1;}if id>tree.node_count{return 0;}return id;
+}
+fn effect_set_id(tree:ntasm_ast.Tree,id:u64)->u64{
+    let fn_:ntasm_ast.Node=ntasm_ast.node_at(tree,id);let mut child_id:u64=fn_.first_child;let mut found:u64=0;
+    while child_id!=0{if child_id>tree.node_count{return 0;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+        if n.kind==20{if found!=0{return 0;}found=child_id;}child_id=n.next_sibling;}return found;
+}
+fn space_bit(source:buf<u8>,node:ntasm_ast.Node)->u64{
+    let a:buf<u8>="user";if same_word(source,node.start,node.end,a){return 1;}
+    let b:buf<u8>="kernel";if same_word(source,node.start,node.end,b){return 2;}
+    let c:buf<u8>="physical";if same_word(source,node.start,node.end,c){return 4;}
+    let d:buf<u8>="mmio";if same_word(source,node.start,node.end,d){return 8;}
+    let e:buf<u8>="device";if same_word(source,node.start,node.end,e){return 16;}
+    let f:buf<u8>="firmware";if same_word(source,node.start,node.end,f){return 32;}
+    return 0;
+}
+// The closed scalar catalogue of spec/ntasm/ntasm.md 6. It is the only set of names a
+// ptr<espace,T> annotation may carry as its element, so an element outside it
+// is not a pointer this pass can read a space out of.
+fn scalar(source:buf<u8>,name:ntasm_ast.Node)->bool{
+    let a:buf<u8>="u8|u16|u32|u64|i8|i16|i32|i64|bool|never";
+    return member(source,name.start,name.end,a);
+}
+// The space bit of the ptr<espace,T> annotation carried by one memory operand,
+// or 0 when the annotation names something outside the closed catalogues. at
+// is a one word buffer that receives the id of the node to blame, so the
+// diagnostic can name it: the memory operand itself when the annotation is not
+// a pointer at all, the space name when the space is alien, the element name
+// when the element is not a name of the scalar catalogue. A composite element
+// is a type node of its own aux value, a nested pointer or an array or a macro
+// type variable, and is left alone: what this pass charges is the space, and
+// the space does not depend on the width of the access.
+fn memory_space(source:buf<u8>,tree:ntasm_ast.Tree,memory_id:u64,at:buf<u64>)->u64{
+    at[0]=0;
+    if memory_id==0||memory_id>tree.node_count{return 0;}
+    let memory:ntasm_ast.Node=ntasm_ast.node_at(tree,memory_id);
+    if memory.kind!=34||memory.last_child==0||memory.last_child>tree.node_count{at[0]=memory_id;return 0;}
+    let type_:ntasm_ast.Node=ntasm_ast.node_at(tree,memory.last_child);
+    if type_.kind!=36||type_.aux!=1||type_.first_child==0||type_.first_child>tree.node_count
+       ||type_.last_child==0||type_.last_child>tree.node_count||type_.first_child==type_.last_child{
+        at[0]=memory_id;return 0;}
+    let space:ntasm_ast.Node=ntasm_ast.node_at(tree,type_.first_child);
+    if space.kind!=90||space.start>space.end||space.end>len(source){at[0]=type_.first_child;return 0;}
+    let bit:u64=space_bit(source,space);
+    if bit==0{at[0]=type_.first_child;return 0;}
+    let element:ntasm_ast.Node=ntasm_ast.node_at(tree,type_.last_child);
+    if element.kind==36&&element.aux==0{
+        if element.first_child==0||element.first_child>tree.node_count{at[0]=memory_id;return 0;}
+        let name:ntasm_ast.Node=ntasm_ast.node_at(tree,element.first_child);
+        if name.kind!=90||name.start>name.end||name.end>len(source){at[0]=element.first_child;return 0;}
+        if scalar(source,name)==false{at[0]=element.first_child;return 0;}
+    }
+    return bit;
+}
+fn missing(required:u64,available:u64)->u64{if (required&available)==required{return 0;}return required;}
+// The category of one operand position of one mnemonic: first is the category
+// at position 1, second the category at position 2, other every further
+// position.
+fn at_position(position:u64,first:u64,second:u64,other:u64)->u64{
+    if position==1{return first;}if position==2{return second;}return other;}
+// load and store are the two mnemonics the specification defines as memory
+// intrinsics, so one of them with no memory operand is a malformed module and
+// not a module that touches no memory.
+fn memory_intrinsic(source:buf<u8>,name:ntasm_ast.Node)->bool{
+    let a:buf<u8>="load|store";return member(source,name.start,name.end,a);}
+// The memory effect of one operand of one instruction, exactly as the x86_64
+// conformance oracle publishes it in compiler/c/ntasm/backend/x64.c,
+// nt_x64_effects, through its memory_read and memory_write members:
+//   0 the operand is an address and no memory is accessed, lea only;
+//   1 a read;
+//   2 a write;
+//   3 a read and a write, the read modify write forms;
+//   4 nothing is anchored, so the form is refused and never accepted for
+//     free. That covers a position nt_x64_effects itself refuses because
+//     nt_x64_encode refuses the form, and a mnemonic outside the closed
+//     catalogue below. A refusal is the honest answer only where the oracle
+//     really is silent, so the rule is stated against the oracle and not
+//     against intuition: where nt_x64_effects publishes a shape, this table
+//     publishes the same shape, and a refusal there would reject a form the
+//     oracle answers and cost an accepted proof for nothing.
+// The groups are the closed catalogue: every mnemonic nt_x64_encode admits
+// with a memory operand, and nothing else. A mnemonic absent from every group
+// is refused with 4, so widening the grammar never widens what is free. A
+// call statement is not an instruction and a call with a memory operand is not
+// a form the NTASM grammar admits, so call and call_indirect are absent and
+// fall in the refusal rather than in a row nothing reaches.
+fn form(source:buf<u8>,name:ntasm_ast.Node,position:u64)->u64{
+    if name.start>name.end||name.end>len(source){return 4;}
+    let start:u64=name.start;let end:u64=name.end;
+    // A memory destination is a write and a memory source is a read: mov and
+    // store read their source and write their destination, so a two memory
+    // form writes the first and reads the second.
+    let a:buf<u8>="mov|store";if member(source,start,end,a){return at_position(position,2,1,4);}
+    // A memory destination is a write and no memory source is a form they
+    // admit: sgdt and sidt store the descriptor they read, the sixteen setcc
+    // write their byte operand, and pop writes its operand.
+    let b:buf<u8>="sgdt|sidt|pop|sete|setne|setb|setae|setbe|seta|sets|setns|setp|setnp|setl|setge|setle|setg|seto|setno";
+    if member(source,start,end,b){return at_position(position,2,4,4);}
+    // A memory source is a read and the destination must be a register: load,
+    // the three extending moves, imul, the two bit scans and the sixteen
+    // conditional moves all read their source and write a register.
+    let c:buf<u8>="load|movzx|movsx|movsxd|imul|bsf|bsr|cmove|cmovne|cmovb|cmovae|cmovbe|cmova|cmovs|cmovns|cmovp|cmovnp|cmovl|cmovge|cmovle|cmovg|cmovo|cmovno";
+    if member(source,start,end,c){return at_position(position,4,1,4);}
+    // xchg is the one form that reads and writes both of its operands, so a
+    // memory operand in the position the encoder admits is a read modify
+    // write and the space it wrote is charged as a write. The encoder requires
+    // a register in first position, so a memory operand anywhere else is a
+    // form it refuses.
+    let d:buf<u8>="xchg";if member(source,start,end,d){return at_position(position,4,3,4);}
+    // lea computes an address: the bracket operand is not an access.
+    let e:buf<u8>="lea";if member(source,start,end,e){return at_position(position,4,0,4);}
+    // lgdt, lidt and ltr read the descriptor the x86_64 architecture takes
+    // from memory, and the oracle says so: the descriptor group at x64.c:1050
+    // reaches read_operand for every member of it except invlpg, so
+    // nt_x64_effects publishes memory_read 1 for these three. They are
+    // charged that read, the same one the single operand read group below
+    // charges, and a declared reads_mem covers them.
+    let f:buf<u8>="lgdt|lidt|ltr";if member(source,start,end,f){return at_position(position,1,4,4);}
+    // The arithmetic and logic group reads both operands and writes the first,
+    // so a memory destination is a read modify write and a memory source is a
+    // read. The encoder admits a memory source only with a register
+    // destination, so the two rows cannot be read as one.
+    let g:buf<u8>="add|adc|sub|sbb|and|or|xor";if member(source,start,end,g){return at_position(position,3,1,4);}
+    // bts, btr and btc set the bit, so a memory first operand is a read modify
+    // write while a memory second operand is the bit index and is only read.
+    let h:buf<u8>="bts|btr|btc";if member(source,start,end,h){return at_position(position,3,1,4);}
+    // The one operand forms that read and write it, and the shifts and
+    // rotations whose second operand is an immediate or cl and never memory.
+    let i:buf<u8>="inc|dec|neg|not|shl|shr|sar|rol|ror";if member(source,start,end,i){return at_position(position,3,4,4);}
+    // cmp and bt read both operands and write neither, so either position
+    // reads. bt is here and not with the bit setters because it never writes
+    // its first operand.
+    let j:buf<u8>="cmp|bt";if member(source,start,end,j){return at_position(position,1,1,4);}
+    // The forms whose only memory operand is a read: test of its first
+    // operand, the multiply and divide group, push, the indirect jmp, and
+    // invlpg reading the page address out of memory.
+    let k:buf<u8>="test|mul|div|idiv|push|jmp|invlpg";if member(source,start,end,k){return at_position(position,1,4,4);}
+    return 4;
+}
+// Check the real memory effects of a body against their owning function
+// contract. Success writes functions, memory accesses, verified accesses,0.
+// Error332 writes instruction position, category 2 reads / 3 writes and the
+// missing space bit. Error333 writes the position of the node the pointer
+// annotation blames: the memory operand, the space name, or the element name.
+// Error336 writes the position of a memory operand in a position or under a
+// mnemonic the oracle does not anchor, which is 336, the diagnostic
+// spec/ntasm/ntasm.md 17.4 already gives a body pass for a destination that is not
+// a register. Error800 is transactional.
+// A read is charged to reads_mem, a write to writes_mem, and a read modify
+// write to both: the read is checked first, so the category a refusal reports
+// is the first atom the declaration does not cover. A memory operand the
+// oracle charges nothing for, lea, is not an access and is not counted.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64{
+    if tree.ok==false||tree.node_count==0||len(out)<4{return 800;}
+    let summary:buf<u64>=alloc(runtime(),4);
+    let at:buf<u64>=alloc(runtime(),1);
+    let mut functions:u64=0;let mut accesses:u64=0;let mut verified:u64=0;
+    let mut code:u64=0;let mut line:u64=0;let mut column:u64=0;
+    let mut category:u64=0;let mut missing_bit:u64=0;let mut id:u64=1;
+    while id<=tree.node_count{
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==18{functions=functions+1;}id=id+1;
+    }
+    id=1;
+    while id<=tree.node_count&&code==0{
+        let instruction:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        // aux 1 marks a label definition, which shares kind 32 but is a branch
+        // target, not an instruction: it accesses no memory.
+        if instruction.kind==32&&instruction.aux==0{
+            let name_id:u64=child(tree,id,0);
+            if name_id==0{code=800;}
+            else{
+                let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                let mut operand_id:u64=instruction.first_child;
+                let mut position:u64=0;let mut found:u64=0;
+                let mut owner:u64=0;let mut set_id:u64=0;let mut summarized:u64=0;
+                while operand_id!=0&&code==0{
+                    let operand:ntasm_ast.Node=ntasm_ast.node_at(tree,operand_id);
+                    if operand.kind==34{
+                        let shape:u64=form(source,name,position);
+                        if shape==4{code=336;line=operand.line;column=operand.column;}
+                        else if shape!=0{
+                            found=found+1;
+                            let bit:u64=memory_space(source,tree,operand_id,at);
+                            if bit==0{
+                                code=333;
+                                let blame:u64=at[0];
+                                if blame!=0&&blame<=tree.node_count{
+                                    let node:ntasm_ast.Node=ntasm_ast.node_at(tree,blame);
+                                    line=node.line;column=node.column;
+                                }else{line=operand.line;column=operand.column;}
+                            }else{
+                                if summarized==0{
+                                    let mut scan:u64=1;
+                                    while scan<=tree.node_count{
+                                        let fn_:ntasm_ast.Node=ntasm_ast.node_at(tree,scan);
+                                        if fn_.kind==18&&fn_.start<=instruction.start
+                                           &&instruction.end<=fn_.end{owner=scan;}
+                                        scan=scan+1;
+                                    }
+                                    if owner==0{code=800;}
+                                    else{
+                                        set_id=effect_set_id(tree,owner);
+                                        if set_id==0{code=800;}
+                                        else{code=effects.summarize(source,tree,set_id,summary);summarized=1;}
+                                    }
+                                }
+                                if code==0{
+                                    accesses=accesses+1;
+                                    let mut available:u64=0;
+                                    if (shape&1)!=0{
+                                        category=2;available=summary[1];
+                                        missing_bit=missing(bit,available);
+                                        if missing_bit!=0{code=332;
+                                            line=instruction.line;column=instruction.column;}
+                                    }
+                                    if code==0&&(shape&2)!=0{
+                                        category=3;available=summary[2];
+                                        missing_bit=missing(bit,available);
+                                        if missing_bit!=0{code=332;
+                                            line=instruction.line;column=instruction.column;}
+                                    }
+                                    if code==0{verified=verified+1;}
+                                }
+                            }
+                        }
+                    }
+                    if operand_id>tree.node_count{code=800;}
+                    else{operand_id=operand.next_sibling;}
+                    position=position+1;
+                }
+                if code==0&&found==0&&memory_intrinsic(source,name)==true{code=800;}
+            }
+        }
+        id=id+1;
+    }
+    if code==0{out[0]=functions;out[1]=accesses;out[2]=verified;out[3]=0;}
+    else if code==332{out[0]=line;out[1]=column;out[2]=category;out[3]=missing_bit;}
+    else if code==333||code==336{out[0]=line;out[1]=column;out[2]=0;out[3]=0;}
+    rt_free(runtime(),at);rt_free(runtime(),summary);return code;
+}

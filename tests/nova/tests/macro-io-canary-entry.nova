@@ -1,0 +1,53 @@
+module macro_io_canary_entry;
+
+// The READ half of the A5 absence-of-I/O positive control. Wave 12.
+//
+// This module is not part of the expander, and nothing depends on its result
+// except proving that the campaign is pointed at a surface that is OPEN.
+//
+// The campaign asserts that macro_expand.nova cannot reach the filesystem, the
+// clock, the environment or a process. Read on its own, that assertion is
+// "the file does not call fopen", and a file not calling fopen is a statement
+// about the file, not about the machine. What the campaign needs is the
+// opposite statement: the channel EXISTS, is reachable from a Nova module of
+// the same compiler, the same runtime and the same host image, and its effect
+// is observable from the gate. This module is that measurement. It was
+// measured to do so: with a canary file of sixteen 'A' bytes it returns
+// out = [1, 16, 65, ...], and with sixteen 'B' bytes it returns 66.
+//
+// main(path,out):
+//   out[0] = 1 when the read happened
+//   out[1] = the byte count rt_read returned
+//   out[2] = the first byte read, 0 when nothing was read
+// A return of 8 is the runtime NV2_IO error, so a path that does not exist is
+// distinguishable from one that does. That distinction is the negative proof
+// of this probe: a detector that answers 65 for an absent file would be
+// reading nothing, and the campaign would then be measuring its own stub.
+//
+// The gate rewrites the canary between two rounds. A different first byte
+// proves the channel is live and observable, and the expansion corpus
+// answering the same bytes for both contents is therefore a measurement of the
+// expander rather than of an inert probe.
+//
+// The write half of the same channel is macro_io_write_entry, because one
+// artifact has exactly one main.
+
+export fn main(path:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<3 { return 800; }
+    out[0]=0; out[1]=0; out[2]=0;
+    let reader:u64=rt_open_read(runtime(),path);
+    if reader==0 { return 8; }
+    let bytes:buf<u8>=alloc(runtime(),16);
+    if len(bytes)!=16 {
+        rt_close(runtime(),reader);
+        rt_free(runtime(),bytes);
+        return 900;
+    }
+    let got:u64=rt_read(runtime(),reader,bytes);
+    rt_close(runtime(),reader);
+    out[0]=1; out[1]=got;
+    if got>0 { out[2]=u64(bytes[0]); }
+    rt_free(runtime(),bytes);
+    if got==0 { return 12; }
+    return 0;
+}

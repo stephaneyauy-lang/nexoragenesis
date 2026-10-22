@@ -8,12 +8,12 @@ les EOL et les limites de taille, de longueur de ligne et de nombre de lignes.
 
 Statut au 2 septembre 2026 : **tracer B1.2 GREEN, Gate B1 RED**. Le candidat
 vérifié est le PE externe quarantainé produit depuis
-`bootstrap/quarantine/nasm/seed-b1.2-r1.asm`. Ce GREEN ne prouve ni le lexer
+`legacy/nasm/seed-b1.2-r1.asm`. Ce GREEN ne prouve ni le lexer
 complet, ni les deux passes, ni le writer PE32+, ni la Gate B1.
 
-Autorités : `spec/ntasm-s0.md`, `docs/bootstrap/b1-implementation-map.md`, le
+Autorités : `spec/ntasm/ntasm-s0.md`, `legacy/docs/bootstrap/b1-implementation-map.md`, le
 protocole B1.1 `docs/testing/b1-test-protocol.md`, le manifeste byte-exact
-`bootstrap/ntasm-s0/b1-2-fixtures.md` et l'exception de provenance ADR 0009.
+`legacy/ntasm-s0/b1-2-fixtures.md` et l'exception de provenance ADR 0009.
 
 ## Contrat observable
 

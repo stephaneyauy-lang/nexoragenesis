@@ -1,0 +1,16 @@
+module efi.c0
+target x86_64-nexora-uefi
+default_abi efi-x64-v0
+section .text {
+fn leaf()->u64
+effects {}
+clobbers {} {
+return 42
+}
+export fn main()->u64
+effects {}
+clobbers {rax} {
+let answer:u64 = leaf();
+return answer
+}
+}

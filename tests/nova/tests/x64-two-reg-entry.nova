@@ -1,0 +1,15 @@
+// Gate entry for the two-register-operand family: xchg, cmov*, bsf/bsr,
+// movzx/movsx/movsxd and test. One entry dispatches on a mode word so the five
+// families share the native operand-order description: operand 0 and operand 1
+// are the two NtX64Operand descriptors in their native order, each as
+// kind/register/high8/width, plus the memory descriptor of whichever operand is
+// a memory. kind1 is a register and kind3 is memory, the native numbering.
+module x64_two_reg_entry;import x64_fixed;
+export fn main(mode:u64,name:buf<u8>,operand_count:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if mode==0{return x64_fixed.encode_xchg(name,operand_count,a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment,features,cpl,out);}
+    if mode==1{return x64_fixed.encode_cmov(name,operand_count,a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment,features,cpl,out);}
+    if mode==2{return x64_fixed.encode_bit_scan(name,operand_count,a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment,features,cpl,out);}
+    if mode==3{return x64_fixed.encode_move_convert(name,operand_count,a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment,features,cpl,out);}
+    if mode==4{return x64_fixed.encode_test_two(name,operand_count,a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment,features,cpl,out);}
+    return 800;
+}

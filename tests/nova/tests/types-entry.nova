@@ -1,0 +1,38 @@
+module types_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import types;
+
+// Gate entry for the NTASM type checker.
+//
+// types.check writes four counters, and eight when the buffer carries them, so
+// a case that reads out[4..6] passes an eight word buffer and a case that reads
+// only the original four passes four.
+//
+// out[4] nonzero on input selects the raw tree mode, where out[5] is a node
+// count and the twelve word node records follow at out[6]. The raw mode lets a
+// case drive a structural branch the parser cannot spell; the source stays the
+// caller string, so a name node still resolves against real bytes.
+//
+// The parsed tree is released on every path. A raw tree borrows the caller
+// buffer and is never released here, so no case can free a node record it does
+// not own.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    if len(out)>=6 && out[4]!=0 {
+        let count:u64=out[5];
+        if count>0 && len(out)<6+count*12 { return 800; }
+        let words:buf<u64>=slice(out,6,count*12);
+        let none:buf<u64>=slice(out,0,0);
+        let tree:ntasm_ast.Tree=ntasm_ast.Tree{ok:true,token_words:none,
+            token_count:0,node_words:words,node_count:count,code:0,reason:0,
+            source:0,line:0,column:0,start:0,end:0};
+        return types.check(source,tree,out);
+    }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree);return 800; }
+    let code:u64=types.check(source,tree,out);
+    ntasm_ast.release(tree);
+    return code;
+}

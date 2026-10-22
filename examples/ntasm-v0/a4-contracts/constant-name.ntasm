@@ -1,0 +1,16 @@
+module a4.constant_name
+target x86_64-nexora-uefi
+const alignment:u64 = 16
+section .text {
+fn leaf()->u64
+effects {}
+clobbers {}
+requires {stack_aligned(alignment)} {
+return 42
+}
+export fn main()->u64
+effects {}
+clobbers {} {
+return 42
+}
+}

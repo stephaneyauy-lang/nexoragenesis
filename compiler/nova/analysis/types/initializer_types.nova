@@ -1,0 +1,480 @@
+module initializer_types;
+import ntasm_ast;
+import register_widths;
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64{if parent==0||parent>tree.node_count{return 0;}let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);let mut id:u64=p.first_child;let mut index:u64=0;while id!=0&&index<ordinal{if id>tree.node_count{return 0;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);id=n.next_sibling;index=index+1;}if id>tree.node_count{return 0;}return id;}
+fn same(source:buf<u8>,a:ntasm_ast.Node,b:ntasm_ast.Node)->bool{if a.start>a.end||b.start>b.end||a.end>len(source)||b.end>len(source)||(a.end-a.start)!=(b.end-b.start){return false;}let mut i:u64=0;while i<(a.end-a.start){if source[a.start+i]!=source[b.start+i]{return false;}i=i+1;}return true;}
+fn word(source:buf<u8>,node:ntasm_ast.Node,text:buf<u8>)->bool{if node.start>node.end||node.end>len(source)||(node.end-node.start)!=len(text){return false;}let mut i:u64=0;while i<len(text){if source[node.start+i]!=text[i]{return false;}i=i+1;}return true;}
+fn simple_name_id(tree:ntasm_ast.Tree,expr_id:u64)->u64{if expr_id==0||expr_id>tree.node_count{return 0;}let expression:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);if expression.kind!=35||expression.aux!=0||expression.first_child==0||expression.first_child!=expression.last_child||expression.first_child>tree.node_count{return 0;}let qualified:ntasm_ast.Node=ntasm_ast.node_at(tree,expression.first_child);if qualified.kind!=91||qualified.first_child==0||qualified.first_child!=qualified.last_child||qualified.last_child>tree.node_count{return 0;}return qualified.last_child;}
+// Visibility of one name at one use, the resolver shared by return_types,
+// call_types, condition_types and this module.
+//
+// The rule, read from spec/ntasm/ntasm.md section 5: "Pour un `let`, le profil
+// initial prouve ensuite les initialiseurs qui sont un paramètre/local
+// visible ou un call local/importé de type retour exact."
+//   - A let is visible only when its direct parent block encloses the use
+//     and the declaration has ended at or before the use. A sibling block,
+//     a later declaration and a use inside the let own initializer are
+//     therefore not visible.
+//   - The innermost enclosing block answers for the name, and inside that
+//     block the latest declaration answers. A nested let may shadow an
+//     outer let of the same function, and the type it declares is the one
+//     proved here; the reference frontend resolves the same way
+//     (compiler/c/ntasm/frontend/frontend.c find_variable).
+//   - A parameter is the fallback, reached only when no enclosing block
+//     declares the name, because bindings refuses with 316 any let of the
+//     function that takes the name of one of its parameters, in the body
+//     block and in every nested block. The fallback can therefore never
+//     compete with a let for the same name.
+// The parameter fallback on its own, so the two searches below can be asked
+// independently and the caller can keep the old precedence exactly.
+fn parameter_type_of(source:buf<u8>,tree:ntasm_ast.Tree,fn_id:u64,name:ntasm_ast.Node)->u64{
+    let mut parameter_type:u64=0;
+    let mut member_id:u64=ntasm_ast.node_at(tree,fn_id).first_child;
+    while member_id!=0 {
+        if member_id>tree.node_count{return 0;}
+        let member:ntasm_ast.Node=ntasm_ast.node_at(tree,member_id);
+        if member.kind==19 {
+            let name_id:u64=child(tree,member_id,0);
+            let type_id:u64=child(tree,member_id,1);
+            if name_id!=0&&type_id!=0 {
+                let candidate:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                if same(source,candidate,name){parameter_type=type_id;}
+            }
+        }
+        member_id=member.next_sibling;
+    }
+    return parameter_type;
+}
+// The position ordered search, unchanged: the blocks that lexically enclose
+// the use, the innermost by span, and inside it the latest declaration by
+// span. Returns 0 when no let answers, so the caller can fall back.
+fn visible_type_scan(source:buf<u8>,tree:ntasm_ast.Tree,fn_id:u64,name:ntasm_ast.Node,use_start:u64)->u64{
+    let fn_:ntasm_ast.Node=ntasm_ast.node_at(tree,fn_id);
+    let mut best_type:u64=0;
+    let mut best_span:u64=18446744073709551615;
+    let mut best_end:u64=0;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let block:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if block.kind==25&&fn_.start<=block.start&&block.end<=fn_.end&&
+           block.start<=use_start&&use_start<block.end {
+            let span:u64=block.end-block.start;
+            let mut let_id:u64=block.first_child;
+            while let_id!=0 {
+                if let_id>tree.node_count{return 0;}
+                let local:ntasm_ast.Node=ntasm_ast.node_at(tree,let_id);
+                if local.kind==27&&local.end<=use_start {
+                    let name_id:u64=child(tree,let_id,0);
+                    let type_id:u64=child(tree,let_id,1);
+                    if name_id!=0&&type_id!=0 {
+                        let candidate:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                        if same(source,candidate,name)&&
+                           (span<best_span||(span==best_span&&local.end>best_end)){
+                            best_type=type_id;best_span=span;best_end=local.end;
+                        }
+                    }
+                }
+                let_id=local.next_sibling;
+            }
+        }
+        id=id+1;
+    }
+    return best_type;
+}
+// Visibility of one name at one use, by position. Unchanged: it is the entry
+// of the resolver for a caller that has a position and no node, and the
+// structural entry below is additive to it and never replaces it.
+export fn visible_type_id(source:buf<u8>,tree:ntasm_ast.Tree,fn_id:u64,name:ntasm_ast.Node,use_start:u64)->u64{
+    if fn_id==0||fn_id>tree.node_count{return 0;}
+    let fn_:ntasm_ast.Node=ntasm_ast.node_at(tree,fn_id);
+    if fn_.kind!=18||use_start<fn_.start||use_start>=fn_.end{return 0;}
+    let parameter_type:u64=parameter_type_of(source,tree,fn_id,name);
+    let scanned:u64=visible_type_scan(source,tree,fn_id,name,use_start);
+    if scanned!=0{return scanned;}
+    return parameter_type;
+}
+// The nesting bound of the structural walks, the same compiler bound the
+// parser and validate.nova use. A tree deeper than this answers false, so an
+// over deep shape is refused rather than proved.
+fn walk_cap()->u64{return 64;}
+// Is target somewhere in the subtree rooted at root. Siblings are walked in a
+// loop, so the depth is the nesting depth of the tree and not the width of any
+// statement list.
+fn subtree_contains(tree:ntasm_ast.Tree,root:u64,target:u64,depth:u64)->bool{
+    if depth>walk_cap(){return false;}
+    let mut at:u64=root;
+    while at!=0 {
+        if at>tree.node_count{return false;}
+        if at==target{return true;}
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,at);
+        if subtree_contains(tree,node.first_child,target,depth+1){return true;}
+        at=node.next_sibling;
+    }
+    return false;
+}
+// Is target a DESCENDANT of root, the root's own following siblings excluded.
+// subtree_contains above answers a wider question, and the whole difference
+// is the declaration clause below: a let is a sibling of the statement that
+// reads it, so the wider walk says a read of a sibling is inside the
+// declaration and would hide every let from every use after it.
+fn is_descendant(tree:ntasm_ast.Tree,root:u64,target:u64,depth:u64)->bool{
+    if root==0||root>tree.node_count||depth>walk_cap(){return false;}
+    let node:ntasm_ast.Node=ntasm_ast.node_at(tree,root);
+    return subtree_contains(tree,node.first_child,target,depth+1);
+}
+// Visibility of one name at one use, by structure. A macro produced node
+// carries the invocation span, so every node of one expansion shares it and no
+// two of them can be ordered by position; the C oracle has the same collapse,
+// frontend.c stamps the invocation span on every node it produces, so the
+// position is not something the expander can supply. The tree is what is
+// left, and it is ordered: validate publishes produced nodes in production
+// order and the parser allocates in source order, so a lower node id is an
+// earlier declaration in both trees. This asks the rule the header above
+// already states, with the structure answered instead of the position: the
+// block that owns the declaration encloses the use, the declaration is earlier
+// than the use, the declaration does not itself contain the use, the
+// innermost enclosing block answers and inside it the latest declaration
+// answers. Returns 0 when no let answers.
+//
+// The third clause is the one the position ordered search gets for free and
+// the tree has to be told: a let is a parent of its own initializer, so a
+// self reference sits in the declaration's subtree and is after it in the
+// tree, and only the subtree says the two are the same declaration. Without
+// it this pass would answer a name for `let x:u64=x`, which the oracle
+// refuses, and a self reference nested in an expression would be the one
+// shape the two orders disagree on.
+fn structural_type(source:buf<u8>,tree:ntasm_ast.Tree,fn_id:u64,name:ntasm_ast.Node,use_id:u64)->u64{
+    let mut order:u64=tree.node_count;
+    while order>0 {
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,order);
+        if node.kind==25 {
+            // A block nested inside another is allocated after it and a
+            // descendant has a greater id, so the enclosing blocks in
+            // descending id order are the innermost first.
+            if subtree_contains(tree,order,use_id,0)==true {
+                let mut best:u64=0;
+                let mut at:u64=node.first_child;
+                while at!=0 {
+                    if at>tree.node_count{return 0;}
+                    let local:ntasm_ast.Node=ntasm_ast.node_at(tree,at);
+                    if local.kind==27&&at<use_id&&is_descendant(tree,at,use_id,0)==false {
+                        let name_id:u64=child(tree,at,0);
+                        let type_id:u64=child(tree,at,1);
+                        if name_id!=0&&type_id!=0 {
+                            let candidate:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                            if same(source,candidate,name){best=type_id;}
+                        }
+                    }
+                    at=local.next_sibling;
+                }
+                if best!=0{return best;}
+            }
+        }
+        order=order-1;
+    }
+    return 0;
+}
+// Visibility of one name at one node. The position ordered search runs first
+// and its answer is kept, so this is a superset of visible_type_id: it can
+// only add an answer where the position ordered search had none. Only then does
+// the structural search run, and the parameter fallback is still last.
+export fn visible_type_at(source:buf<u8>,tree:ntasm_ast.Tree,fn_id:u64,name:ntasm_ast.Node,use_id:u64)->u64{
+    if fn_id==0||fn_id>tree.node_count||use_id==0||use_id>tree.node_count{return 0;}
+    let fn_:ntasm_ast.Node=ntasm_ast.node_at(tree,fn_id);
+    if fn_.kind!=18{return 0;}
+    if is_descendant(tree,fn_id,use_id,0)==false{return 0;}
+    let parameter_type:u64=parameter_type_of(source,tree,fn_id,name);
+    let use_start:u64=ntasm_ast.node_at(tree,use_id).start;
+    if use_start>=fn_.start&&use_start<fn_.end {
+        let scanned:u64=visible_type_scan(source,tree,fn_id,name,use_start);
+        if scanned!=0{return scanned;}
+    }
+    let structural:u64=structural_type(source,tree,fn_id,name,use_id);
+    if structural!=0{return structural;}
+    return parameter_type;
+}
+// The resolver every name in this module is read through, whether the name is
+// the whole expression or sits under an operator. `before` is the caller's own
+// position and drives the position ordered search exactly as it always did, so
+// nothing that answered before stops answering; `use_id` is the node the name
+// is read at, and only when the position ordered search had no answer does the
+// structural search run on it. The parameter fallback is still last, so a name
+// that is neither a visible let nor a parameter is still unproved.
+// Wave 7 added the structural search for the one caller that hands it a node,
+// return_types' bare name, and left every other name on the position only:
+// the arithmetic walk, the anchor a comparison asks, the bool walk and the
+// let initializer of check. That is why a produced `let` was visible to a
+// produced `return` that read it and invisible to the same `return` that read
+// it through one operator. The four now ask here, with the node they are
+// standing on, and the five answers are the same five in the same order.
+fn named_type_at(source:buf<u8>,tree:ntasm_ast.Tree,fn_id:u64,name:ntasm_ast.Node,before:u64,use_id:u64)->u64{
+    if fn_id==0||fn_id>tree.node_count{return 0;}
+    let fn_:ntasm_ast.Node=ntasm_ast.node_at(tree,fn_id);
+    if fn_.kind!=18{return 0;}
+    let owned:bool=use_id!=0&&use_id<=tree.node_count&&is_descendant(tree,fn_id,use_id,0)==true;
+    if owned==false&&(before<fn_.start||before>=fn_.end){return 0;}
+    if before>=fn_.start&&before<fn_.end {
+        let scanned:u64=visible_type_scan(source,tree,fn_id,name,before);
+        if scanned!=0{return scanned;}
+    }
+    if owned {
+        let structural:u64=structural_type(source,tree,fn_id,name,use_id);
+        if structural!=0{return structural;}
+    }
+    return parameter_type_of(source,tree,fn_id,name);
+}
+fn return_type_id(tree:ntasm_ast.Tree,decl_id:u64)->u64{let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,decl_id);let mut id:u64=declaration.first_child;while id!=0{if id>tree.node_count{return 0;}let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if n.kind==36{return id;}id=n.next_sibling;}return 0;}
+fn decl_name_id(tree:ntasm_ast.Tree,id:u64)->u64{let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if declaration.kind==18{return child(tree,id,0);}if declaration.kind==9{return child(tree,id,1);}return 0;}
+fn call_type(source:buf<u8>,tree:ntasm_ast.Tree,expr_id:u64)->u64{let expression:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);if expression.kind!=35||expression.aux!=1||expression.first_child==0||expression.first_child>tree.node_count{return 0;}let qualified:ntasm_ast.Node=ntasm_ast.node_at(tree,expression.first_child);if qualified.kind!=91||qualified.last_child==0||qualified.last_child>tree.node_count{return 0;}let called:ntasm_ast.Node=ntasm_ast.node_at(tree,qualified.last_child);let mut id:u64=1;while id<=tree.node_count{let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if declaration.kind==18||declaration.kind==9{let name_id:u64=decl_name_id(tree,id);if name_id!=0{let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);if same(source,name,called){return return_type_id(tree,id);}}}id=id+1;}return 0;}
+fn integer_type(source:buf<u8>,type_:ntasm_ast.Node)->bool{let a:buf<u8>="u8";if word(source,type_,a){return true;}let b:buf<u8>="i8";if word(source,type_,b){return true;}let c:buf<u8>="u16";if word(source,type_,c){return true;}let d:buf<u8>="i16";if word(source,type_,d){return true;}let e:buf<u8>="u32";if word(source,type_,e){return true;}let f:buf<u8>="i32";if word(source,type_,f){return true;}let g:buf<u8>="u64";if word(source,type_,g){return true;}let h:buf<u8>="i64";return word(source,type_,h);}
+fn signed_integer_type(source:buf<u8>,type_:ntasm_ast.Node)->bool{let a:buf<u8>="i8";if word(source,type_,a){return true;}let b:buf<u8>="i16";if word(source,type_,b){return true;}let c:buf<u8>="i32";if word(source,type_,c){return true;}let d:buf<u8>="i64";return word(source,type_,d);}
+fn negative_literal_status(source:buf<u8>,expected:ntasm_ast.Node,literal:ntasm_ast.Node)->u64{if signed_integer_type(source,expected)==false{return 0;}let true_:buf<u8>="true";let false_:buf<u8>="false";if word(source,literal,true_)||word(source,literal,false_){return 0;}let value:u64=literal.aux;let a:buf<u8>="i8";if word(source,expected,a){if value<=128{return 1;}return 2;}let b:buf<u8>="i16";if word(source,expected,b){if value<=32768{return 1;}return 2;}let c:buf<u8>="i32";if word(source,expected,c){if value<=2147483648{return 1;}return 2;}if value<=9223372036854775808{return 1;}return 2;}
+fn literal_status(source:buf<u8>,expected:ntasm_ast.Node,literal:ntasm_ast.Node)->u64{if integer_type(source,expected)==false{return 0;}let true_:buf<u8>="true";let false_:buf<u8>="false";if word(source,literal,true_)||word(source,literal,false_){return 0;}let value:u64=literal.aux;let a:buf<u8>="u8";if word(source,expected,a){if value<=255{return 1;}return 0;}let b:buf<u8>="i8";if word(source,expected,b){if value<=127{return 1;}return 0;}let c:buf<u8>="u16";if word(source,expected,c){if value<=65535{return 1;}return 0;}let d:buf<u8>="i16";if word(source,expected,d){if value<=32767{return 1;}return 0;}let e:buf<u8>="u32";if word(source,expected,e){if value<=4294967295{return 1;}return 0;}let f:buf<u8>="i32";if word(source,expected,f){if value<=2147483647{return 1;}return 0;}let g:buf<u8>="u64";if word(source,expected,g){return 1;}if value<=9223372036854775807{return 1;}return 0;}
+fn arithmetic(operation:u64)->bool{return operation==43||operation==45||operation==42||operation==47||operation==37||operation==38||operation==94||operation==124;}
+// The DECLARED width of an integer type, in bits, or 0 for a spelling this
+// module does not measure. `bool` is deliberately among the zeros: a bool is
+// not a width, and the one caller that must reason about it -- the register arm
+// in `integer_status_depth` -- tests for the name itself.
+fn type_bits(source:buf<u8>,type_:ntasm_ast.Node)->u64{
+    let u8_:buf<u8>="u8";if word(source,type_,u8_){return 8;}
+    let i8_:buf<u8>="i8";if word(source,type_,i8_){return 8;}
+    let u16_:buf<u8>="u16";if word(source,type_,u16_){return 16;}
+    let i16_:buf<u8>="i16";if word(source,type_,i16_){return 16;}
+    let u32_:buf<u8>="u32";if word(source,type_,u32_){return 32;}
+    let i32_:buf<u8>="i32";if word(source,type_,i32_){return 32;}
+    let u64_:buf<u8>="u64";if word(source,type_,u64_){return 64;}
+    let i64_:buf<u8>="i64";if word(source,type_,i64_){return 64;}
+    return 0;
+}
+// The WIDTH OF A REGISTER SPELLING, in bits, or 0 for a name that is not one.
+// Exported so that the one caller which resolves a name on its own -- return_types'
+// bare-name path -- reads the SAME sixteen-register vocabulary this module reads
+// instead of learning a second one, and so that a future seventeenth register is
+// added in one place.
+export fn register_bits(source:buf<u8>,name:ntasm_ast.Node)->u64{
+    return register_widths.width(source,name.start,name.end);
+}
+// The DECLARED width of an integer type, exported under the name the caller
+// thinks in. `type_bits` above is the same function; two spellings would be two
+// chances to disagree about zero.
+export fn declared_bits(source:buf<u8>,type_:ntasm_ast.Node)->u64{
+    return type_bits(source,type_);
+}
+// Status: 0 mismatch, 1 exact, 2 literal out of range, 3 unsupported.
+// A depth limit keeps a deeply nested source fail-closed.
+fn integer_status_depth(source:buf<u8>,tree:ntasm_ast.Tree,expr_id:u64,owner:u64,before:u64,expected:ntasm_ast.Node,depth:u64)->u64{
+    if integer_type(source,expected)==false{return 0;}
+    if expr_id==0||expr_id>tree.node_count||depth>=64{return 3;}
+    let expression:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);
+    let true_:buf<u8>="true";let false_:buf<u8>="false";
+    if word(source,expression,true_)||word(source,expression,false_){return 0;}
+    if expression.kind==94{if literal_status(source,expected,expression)==1{return 1;}return 2;}
+    let name_id:u64=simple_name_id(tree,expr_id);
+    let mut actual_id:u64=0;
+    if name_id!=0{let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);actual_id=named_type_at(source,tree,owner,name,before,expr_id);}
+    else if expression.kind==35&&expression.aux==1{actual_id=call_type(source,tree,expr_id);}
+    if actual_id!=0{let actual:ntasm_ast.Node=ntasm_ast.node_at(tree,actual_id);if same(source,expected,actual){return 1;}return 0;}
+    // A REGISTER IS A VALUE WITH A WIDTH, and `register_widths` publishes that
+    // width for the sixteen GPR spellings. This arm is what a bare `return rax`
+    // was missing: the name search above resolves lets and parameters and
+    // nothing else, so an undeclared name falls through to `arithmetic(0)` --
+    // false -- and answers 3, "unsupported expression", which `return_types`
+    // turns into 353. The C reference accepts that program.
+    //
+    // THE RULE IS THE REFERENCE'S, not a new one. frontend.c:1645-1690,
+    // `case NTF_X_REGISTER:` keeps the EXPECTED type and refuses the program when
+    // `TY(p,expected).bits != x->reg.bits && !(bool && bits==8)`. So the
+    // register's width is compared with the declared width, and a bool accepts
+    // an EIGHT-bit register and nothing else.
+    //
+    // THE TWO NEGATIVES THIS ARM MUST NOT SWALLOW, both measured rather than
+    // argued. A name that is NOT a register spelling keeps the refusal that was
+    // already there, because `register_widths.width` answers 0 for it and the
+    // code falls straight through -- so `return zzz`, which the C reference
+    // refuses, is still refused here. And a register of the WRONG width answers
+    // 0, which `return_types` reports as 352, a proved mismatch, rather than as
+    // the 353 this arm replaces -- so `->u32` with `return rax`, which the C
+    // reference refuses, is still refused here too.
+    if name_id!=0{
+        let register:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+        let bits:u64=register_widths.width(source,register.start,register.end);
+        if bits!=0 {
+            let bool_:buf<u8>="bool";
+            if word(source,expected,bool_)==true {
+                if bits==8{return 1;}
+                return 0;
+            }
+            let declared:u64=type_bits(source,expected);
+            if declared==0{return 3;}
+            if bits==declared{return 1;}
+            return 0;
+        }
+    }
+    if expression.kind!=35{return 3;}
+    let left_id:u64=child(tree,expr_id,0);
+    if left_id==0{return 3;}
+    if expression.aux==40{
+        let inner:ntasm_ast.Node=ntasm_ast.node_at(tree,left_id);
+        if inner.next_sibling!=0{return 3;}
+        return integer_status_depth(source,tree,left_id,owner,before,expected,depth+1);
+    }
+    if expression.aux==43||expression.aux==45||expression.aux==126{
+        let left:ntasm_ast.Node=ntasm_ast.node_at(tree,left_id);
+        if left.next_sibling==0{
+            if expression.aux==45{
+                if signed_integer_type(source,expected)==false{return 0;}
+                if left.kind==94{return negative_literal_status(source,expected,left);}
+            }
+            return integer_status_depth(source,tree,left_id,owner,before,expected,depth+1);
+        }
+        if expression.aux==126{return 3;}
+    }
+    if arithmetic(expression.aux)==false{return 3;}
+    let right_id:u64=child(tree,expr_id,1);
+    if right_id==0{return 3;}
+    let right:ntasm_ast.Node=ntasm_ast.node_at(tree,right_id);
+    if right.next_sibling!=0{return 3;}
+    let left_status:u64=integer_status_depth(source,tree,left_id,owner,before,expected,depth+1);
+    let right_status:u64=integer_status_depth(source,tree,right_id,owner,before,expected,depth+1);
+    if left_status==0||right_status==0{return 0;}
+    if left_status==2||right_status==2{return 2;}
+    if left_status==3||right_status==3{return 3;}
+    return 1;
+}
+export fn integer_status(source:buf<u8>,tree:ntasm_ast.Tree,expr_id:u64,owner:u64,before:u64,expected:ntasm_ast.Node)->u64{
+    return integer_status_depth(source,tree,expr_id,owner,before,expected,0);
+}
+fn comparison(operation:u64)->bool{return operation==262||operation==263||operation==264||operation==265||operation==60||operation==62;}
+fn needs_proof(tree:ntasm_ast.Tree,expr_id:u64)->bool{if expr_id==0||expr_id>tree.node_count{return false;}let expr:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);return expr.kind==35&&(expr.aux==40||arithmetic(expr.aux));}
+// The type node an arithmetic or comparison operand is anchored on. Names and
+// call results answer directly; grouping and integer forms walk inward under
+// the same depth bound.
+fn anchor_type(source:buf<u8>,tree:ntasm_ast.Tree,expr_id:u64,owner:u64,before:u64,depth:u64)->u64{
+    if expr_id==0||expr_id>tree.node_count||depth>=64{return 0;}
+    let expr:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);
+    let name_id:u64=simple_name_id(tree,expr_id);
+    if name_id!=0{let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);return named_type_at(source,tree,owner,name,before,expr_id);}
+    if expr.kind==35&&expr.aux==1{return call_type(source,tree,expr_id);}
+    if needs_proof(tree,expr_id)==false{return 0;}
+    let left_id:u64=child(tree,expr_id,0);
+    let left_type:u64=anchor_type(source,tree,left_id,owner,before,depth+1);
+    if left_type!=0{return left_type;}
+    if expr.aux==40{return 0;}
+    return anchor_type(source,tree,child(tree,expr_id,1),owner,before,depth+1);
+}
+// 1 exact comparison, 0 proved mismatch, 2 insufficient type evidence.
+fn exact_noninteger(source:buf<u8>,tree:ntasm_ast.Tree,expr_id:u64,owner:u64,before:u64,expected:ntasm_ast.Node,depth:u64)->u64{
+    if expr_id==0||expr_id>tree.node_count||depth>=64{return 2;}
+    let expr:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);
+    let true_:buf<u8>="true";let false_:buf<u8>="false";let bool_:buf<u8>="bool";
+    if word(source,expr,true_)||word(source,expr,false_){if word(source,expected,bool_){return 1;}return 0;}
+    if expr.kind==94{return 0;}
+    if expr.kind==35&&expr.aux==40{
+        let inner_id:u64=child(tree,expr_id,0);
+        if inner_id==0{return 2;}
+        let inner:ntasm_ast.Node=ntasm_ast.node_at(tree,inner_id);
+        if inner.next_sibling!=0{return 2;}
+        return exact_noninteger(source,tree,inner_id,owner,before,expected,depth+1);
+    }
+    if simple_name_id(tree,expr_id)==0&&(expr.kind!=35||expr.aux!=1){return 2;}
+    let type_id:u64=anchor_type(source,tree,expr_id,owner,before,0);
+    if type_id==0{return 2;}
+    let actual:ntasm_ast.Node=ntasm_ast.node_at(tree,type_id);
+    if same(source,expected,actual){return 1;}
+    return 0;
+}
+fn comparison_status(source:buf<u8>,tree:ntasm_ast.Tree,condition_id:u64,owner:u64,before:u64)->u64{
+    let left_id:u64=child(tree,condition_id,0);
+    let right_id:u64=child(tree,condition_id,1);
+    if left_id==0||right_id==0{return 2;}
+    let condition:ntasm_ast.Node=ntasm_ast.node_at(tree,condition_id);
+    let left:ntasm_ast.Node=ntasm_ast.node_at(tree,left_id);
+    let right:ntasm_ast.Node=ntasm_ast.node_at(tree,right_id);
+    if right.next_sibling!=0{return 2;}
+    let true_:buf<u8>="true";let false_:buf<u8>="false";
+    let left_bool:bool=word(source,left,true_)||word(source,left,false_);
+    let right_bool:bool=word(source,right,true_)||word(source,right,false_);
+    if left_bool&&right_bool{if condition.aux==262||condition.aux==263{return 1;}return 0;}
+    if left.kind==94&&right.kind==94{return 1;}
+    if (left_bool&&right.kind==94)||(right_bool&&left.kind==94){return 0;}
+    let mut type_id:u64=anchor_type(source,tree,left_id,owner,before,0);
+    if type_id==0{type_id=anchor_type(source,tree,right_id,owner,before,0);}
+    if type_id==0{return 2;}
+    let expected:ntasm_ast.Node=ntasm_ast.node_at(tree,type_id);
+    if integer_type(source,expected){
+        let left_status:u64=integer_status(source,tree,left_id,owner,before,expected);
+        let right_status:u64=integer_status(source,tree,right_id,owner,before,expected);
+        if left_status==1&&right_status==1{return 1;}
+        if left_status==0||left_status==2||right_status==0||right_status==2{return 0;}
+        return 2;
+    }
+    if condition.aux!=262&&condition.aux!=263{return 0;}
+    let left_status:u64=exact_noninteger(source,tree,left_id,owner,before,expected,0);
+    let right_status:u64=exact_noninteger(source,tree,right_id,owner,before,expected,0);
+    if left_status==1&&right_status==1{return 1;}
+    if left_status==0||right_status==0{return 0;}
+    return 2;
+}
+fn feature_test(source:buf<u8>,tree:ntasm_ast.Tree,expr_id:u64)->bool{let expr:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);if expr.kind!=35||expr.aux!=1||expr.first_child==0||expr.first_child>tree.node_count{return false;}let qualified:ntasm_ast.Node=ntasm_ast.node_at(tree,expr.first_child);if qualified.kind!=91||qualified.first_child==0||qualified.first_child!=qualified.last_child||qualified.last_child>tree.node_count{return false;}let name:ntasm_ast.Node=ntasm_ast.node_at(tree,qualified.last_child);let feature:buf<u8>="feature";if word(source,name,feature)==false{return false;}let argument_id:u64=qualified.next_sibling;if argument_id==0||argument_id>tree.node_count{return false;}let argument:ntasm_ast.Node=ntasm_ast.node_at(tree,argument_id);return argument.next_sibling==0;}
+// The single boolean expression proof shared by the bool valued let
+// initializer, return, call argument and if condition consumers. It proves
+// bool literals, visible bool names, bool returning local or import calls,
+// feature(...), comparisons, groups, !, && and ||, and reuses integer_status
+// for arithmetic comparison operands.
+// Encoded result: 1 is a proved bool, 100+reason a proved non-bool and
+// 200+reason insufficient evidence. Proved non-bool reasons are 1 integer
+// literal, 2 non-bool type and 3 comparison mismatch. Insufficient reasons
+// are 1 name not visible, 2 unsupported form or exhausted depth, and 3 unknown
+// call. The depth bound of 64 keeps a deeply nested source fail-closed.
+export fn bool_status(source:buf<u8>,tree:ntasm_ast.Tree,expr_id:u64,owner:u64,before:u64,depth:u64)->u64{
+    if expr_id==0||expr_id>tree.node_count||depth>=64{return 202;}
+    let expr:ntasm_ast.Node=ntasm_ast.node_at(tree,expr_id);
+    let true_:buf<u8>="true";let false_:buf<u8>="false";
+    if word(source,expr,true_)||word(source,expr,false_){return 1;}
+    if expr.kind==94{return 101;}
+    if expr.kind==35&&(expr.aux==33||expr.aux==40){
+        let inner_id:u64=child(tree,expr_id,0);
+        if inner_id==0{return 202;}
+        let inner:ntasm_ast.Node=ntasm_ast.node_at(tree,inner_id);
+        if inner.next_sibling!=0{return 202;}
+        return bool_status(source,tree,inner_id,owner,before,depth+1);
+    }
+    if expr.kind==35&&(expr.aux==268||expr.aux==269){
+        let left_id:u64=child(tree,expr_id,0);let right_id:u64=child(tree,expr_id,1);
+        if left_id==0||right_id==0{return 202;}
+        let left:ntasm_ast.Node=ntasm_ast.node_at(tree,left_id);
+        let right:ntasm_ast.Node=ntasm_ast.node_at(tree,right_id);
+        if left.next_sibling!=right_id||right.next_sibling!=0{return 202;}
+        let left_status:u64=bool_status(source,tree,left_id,owner,before,depth+1);
+        let right_status:u64=bool_status(source,tree,right_id,owner,before,depth+1);
+        if left_status!=1&&left_status<200{return left_status;}
+        if right_status!=1&&right_status<200{return right_status;}
+        if left_status==1&&right_status==1{return 1;}
+        if left_status>=200{return left_status;}return right_status;
+    }
+    if expr.kind==35&&comparison(expr.aux){
+        let status:u64=comparison_status(source,tree,expr_id,owner,before);
+        if status==1{return 1;}if status==0{return 103;}return 202;
+    }
+    if feature_test(source,tree,expr_id){return 1;}
+    if expr.kind==35&&expr.aux==1{
+        let type_id:u64=call_type(source,tree,expr_id);
+        if type_id==0{return 203;}
+        let type_:ntasm_ast.Node=ntasm_ast.node_at(tree,type_id);let bool_:buf<u8>="bool";
+        if word(source,type_,bool_){return 1;}return 102;
+    }
+    let name_id:u64=simple_name_id(tree,expr_id);
+    if name_id==0{return 202;}
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+    let type_id:u64=named_type_at(source,tree,owner,name,before,expr_id);
+    if type_id==0{return 201;}
+    let type_:ntasm_ast.Node=ntasm_ast.node_at(tree,type_id);let bool_:buf<u8>="bool";
+    if word(source,type_,bool_){return 1;}return 102;
+}
+// Type nonliteral let initializers after names and calls have been resolved.
+// 359 is an exact type mismatch;360 is a form whose type is not yet proved.
+// Scalar literals/bool are owned by literal_initializers. One binary integer
+// expression is accepted when both operands are exact names, calls or bounded
+// literals of the declared type. Grouping and nested binary arithmetic are
+// checked recursively; unproved forms remain fail-closed.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64{if tree.ok==false||tree.node_count==0||len(out)<4{return 800;}let mut locals:u64=0;let mut names:u64=0;let mut calls:u64=0;let mut delegated_or_expression:u64=0;let mut code:u64=0;let mut line:u64=0;let mut column:u64=0;let mut reason:u64=0;let mut id:u64=1;while id<=tree.node_count&&code==0{let local:ntasm_ast.Node=ntasm_ast.node_at(tree,id);if local.kind==27{locals=locals+1;let expected_id:u64=child(tree,id,1);let initializer_id:u64=child(tree,id,2);if expected_id==0||initializer_id==0{code=800;}else{let expected:ntasm_ast.Node=ntasm_ast.node_at(tree,expected_id);let initializer:ntasm_ast.Node=ntasm_ast.node_at(tree,initializer_id);let true_:buf<u8>="true";let false_:buf<u8>="false";if initializer.kind==94||word(source,initializer,true_)||word(source,initializer,false_){delegated_or_expression=delegated_or_expression+1;}else{let mut owner:u64=0;let mut fn_id:u64=1;while fn_id<=tree.node_count{if ntasm_ast.node_kind(tree,fn_id)==18&&ntasm_ast.node_start(tree,fn_id)<=local.start&&local.end<=ntasm_ast.node_end(tree,fn_id){owner=fn_id;}fn_id=fn_id+1;}if owner==0{code=800;}else{let mut actual_id:u64=0;let name_id:u64=simple_name_id(tree,initializer_id);if name_id!=0{let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);actual_id=named_type_at(source,tree,owner,name,local.start,initializer_id);if actual_id==0{code=360;reason=1;}else{names=names+1;}}else if initializer.kind==35&&initializer.aux==1{actual_id=call_type(source,tree,initializer_id);if actual_id==0{code=360;reason=2;}else{calls=calls+1;}}else{let bool_expected:buf<u8>="bool";if word(source,expected,bool_expected){let bstatus:u64=bool_status(source,tree,initializer_id,owner,local.start,0);if bstatus==1{delegated_or_expression=delegated_or_expression+1;}else if bstatus<200{code=359;reason=1;}else{code=360;reason=3;}}else{let status:u64=integer_status(source,tree,initializer_id,owner,local.start,expected);if status==1{delegated_or_expression=delegated_or_expression+1;}else if status==0||status==2{code=359;reason=2;}else{code=360;reason=3;}}}if code==0&&actual_id!=0{let actual:ntasm_ast.Node=ntasm_ast.node_at(tree,actual_id);if same(source,expected,actual)==false{code=359;reason=1;}}}if code!=0{line=initializer.line;column=initializer.column;}}}}id=id+1;}if code==0{out[0]=locals;out[1]=names;out[2]=calls;out[3]=delegated_or_expression;}else if code==359||code==360{out[0]=line;out[1]=column;out[2]=reason;out[3]=0;}return code;}

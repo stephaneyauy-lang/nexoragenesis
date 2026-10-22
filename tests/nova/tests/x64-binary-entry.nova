@@ -1,0 +1,4 @@
+module x64_binary_entry;import x64_fixed;
+export fn main(name:buf<u8>,count:u64,a0_kind:u64,a0_reg:u64,a0_high8:u64,a0_width:u64,a1_kind:u64,a1_reg:u64,a1_high8:u64,a1_width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,immediate:u64,immediate_is_signed:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    return x64_fixed.encode_binary(name,count,a0_kind,a0_reg,a0_high8,a0_width,a1_kind,a1_reg,a1_high8,a1_width,base,index,scale,displacement,segment,immediate,immediate_is_signed,features,cpl,out);
+}

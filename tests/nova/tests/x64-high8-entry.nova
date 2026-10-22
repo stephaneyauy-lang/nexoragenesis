@@ -1,0 +1,22 @@
+// Gate entry for the one-operand x64_fixed forms that a plain register number
+// cannot express: the high8 alias ah/ch/dh/bh and the memory direction of
+// inc/dec/not/neg, of the sixteen setcc conditions and of push/pop. One entry
+// dispatches on a family word so the three exports share the native operand
+// description. kind1 is a register and kind3 is memory, the native numbering;
+// the memory descriptor is base 0..15 with 16 no base and 17 RIP, index 0..15
+// with 16 none, scale, the displacement bits and segment 0/1/2, exactly as the
+// two-register entry passes it. The register and setcc exports read the
+// descriptor only for a memory operand and the stack export has no register or
+// immediate word at all, because the register and immediate directions of
+// push/pop already belong to encode_stack.
+module x64_high8_entry;
+import x64_fixed;
+export fn main(family:u64,name:buf<u8>,operand_count:u64,kind:u64,register:u64,high8:u64,width:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    // 0 inc/dec/not/neg over a register or a memory.
+    if family==0{return x64_fixed.encode_unary_operand(name,operand_count,kind,register,high8,width,base,index,scale,displacement,segment,features,cpl,out);}
+    // 1 the sixteen setcc conditions over a register or a memory.
+    if family==1{return x64_fixed.encode_setcc_operand(name,operand_count,kind,register,high8,width,base,index,scale,displacement,segment,features,cpl,out);}
+    // 2 the push and pop memory direction, width 64 only.
+    if family==2{return x64_fixed.encode_stack_memory(name,operand_count,width,base,index,scale,displacement,segment,features,cpl,out);}
+    return 800;
+}

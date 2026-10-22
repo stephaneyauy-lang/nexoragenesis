@@ -1,0 +1,17 @@
+// Lot 122 counter-example, 1 of 4: `struct`.
+//
+// `struct` is a Nova keyword -- nova.c:1136 consumes it in collect_records --
+// and the NTASM dialect has no record declaration of any kind, so this is not a
+// construct a Nova front end may lack. Every line here is Nova and only Nova:
+// there is no `target`, no `section`, no `abi`, no `effects`, no `clobbers`,
+// no `@reg` binding. A parser that refuses this file is refusing the LANGUAGE.
+module nova_language_struct;
+
+export struct Pair {
+    first:u64,
+    second:u64
+}
+
+export fn take_left(p:Pair) -> u64 {
+    return p.first;
+}

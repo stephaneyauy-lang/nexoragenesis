@@ -1,0 +1,76 @@
+module x64_lower_nxo_import_entry;
+import ntasm_ast;import ntasm_parser;import ntasm_nxo;import ntasm_nxo_merge;import ntasm_nxo_link_pe;
+import ntasm_nxo_pe;import ntasm_nxo_inspect;import ntasm_pe;import x64_lower_nxo;
+
+// Gate entry for the import producer and for the cross producer link.
+//
+//   mode 0: x64_lower_nxo.build_import_call, one import symbol and one caller.
+//   mode 1: ntasm_nxo_merge.merge of the mode 0 object with the definition
+//           buffer, so the 825 contract refusal and the accepted link are both
+//           observable from the Nova side.
+//   mode 2: ntasm_nxo_link_pe.link_pe of the same two objects, the merged PE.
+//   mode 3: ntasm_nxo_inspect.copy_symbol_contract of the object in the source
+//           buffer, at the zero based index, so the contract text is read back
+//           out of the serialised object by the Nova accessor.
+//   mode 4: x64_lower_nxo.build_import_call_with_scalar_data, which adds the
+//           literal data records and therefore the data form of the contract.
+//
+// out is [size:u64][bytes] for modes 0, 1, 2 and 4. Mode 3 writes the contract
+// bytes at out[0..] and the byte count at out[0..8] of a separate length slot
+// the harness owns. Every mode is transactional: a non zero code leaves out
+// untouched and frees whatever the producer returned.
+
+fn deliver(bytes:buf<u8>,out:buf<u8>)->u64 {
+    let size:u64=len(bytes);
+    if len(out)<8 || size>len(out)-8 { rt_free(runtime(),bytes); return 800; }
+    ntasm_pe.copy(out,8,bytes);
+    rt_free(runtime(),bytes);
+    ntasm_pe.put64(out,0,size);
+    return 0;
+}
+
+export fn main(source:buf<u8>,definition:buf<u8>,mode:u64,index:u64,out:buf<u8>)->u64 {
+    if len(out)<8{return 800;}
+    if mode==3 {
+        // The text lands at out[0..count) and the harness knows the expected
+        // count, so the tail past it must stay untouched.
+        let length:buf<u64>=alloc(runtime(),1);
+        let code:u64=ntasm_nxo_inspect.copy_symbol_contract(source,index,out,length);
+        rt_free(runtime(),length);
+        return code;
+    }
+    if mode==1 || mode==2 {
+        let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+        if tree.ok==false{ntasm_ast.release(tree);return 800;}
+        let built:ntasm_nxo.WriteResult=x64_lower_nxo.build_import_call(source,tree,1,3);
+        ntasm_ast.release(tree);
+        let object_bytes:buf<u8>=built.bytes;
+        if built.code!=0{rt_free(runtime(),object_bytes);return built.code;}
+        if mode==1 {
+            let merged:ntasm_nxo.WriteResult=ntasm_nxo_merge.merge(object_bytes,definition);
+            rt_free(runtime(),object_bytes);
+            let merged_code:u64=merged.code;
+            let merged_bytes:buf<u8>=merged.bytes;
+            if merged_code!=0 { rt_free(runtime(),merged_bytes); return merged_code; }
+            return deliver(merged_bytes,out);
+        }
+        let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_link_pe.link_pe(object_bytes,definition);
+        rt_free(runtime(),object_bytes);
+        let converted_code:u64=converted.code;
+        let converted_bytes:buf<u8>=converted.bytes;
+        if converted_code!=0 { rt_free(runtime(),converted_bytes); return converted_code; }
+        return deliver(converted_bytes,out);
+    }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false{ntasm_ast.release(tree);return 800;}
+    let mut result:ntasm_nxo.WriteResult=x64_lower_nxo.build_import_call(source,tree,1,3);
+    if mode==4 {
+        let discarded:buf<u8>=result.bytes;
+        rt_free(runtime(),discarded);
+        result=x64_lower_nxo.build_import_call_with_scalar_data(source,tree,1,3);
+    }
+    ntasm_ast.release(tree);
+    let bytes:buf<u8>=result.bytes;
+    if result.code!=0{rt_free(runtime(),bytes);return result.code;}
+    return deliver(bytes,out);
+}

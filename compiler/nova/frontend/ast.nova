@@ -1,0 +1,368 @@
+module ntasm_ast;
+
+// Flat node layout, twelve u64 words per one-based node ID:
+// kind,token_begin,token_end,source,line,column,start,end,
+// first_child,last_child,next_sibling,aux.
+export struct Tree {
+    ok:bool,token_words:buf<u64>,token_count:u64,
+    node_words:buf<u64>,node_count:u64,
+    code:u64,reason:u64,source:u64,line:u64,column:u64,start:u64,end:u64
+}
+export struct Node {
+    kind:u64,token_begin:u64,token_end:u64,source:u64,line:u64,column:u64,
+    start:u64,end:u64,first_child:u64,last_child:u64,next_sibling:u64,aux:u64
+}
+// ---- the refusal ----------------------------------------------------------
+//
+// node_at REFUSES an id that is not a node. It does not invent one.
+//
+// The rule this obeys is the project's own: "Verifier qu'aucune erreur n'est
+// transformee en valeur valide par un helper." A zero-filled Node for an id
+// that names no node IS a valid-looking value, so returning one would be the
+// forbidden shape -- and it would be worse than the arithmetic fault it
+// replaces, because it would be silent and plausible. There is no node 0 to
+// return: the sentinel is the ID 0, and it is a sentinel precisely because no
+// node bears it.
+//
+// WHY THE REFUSAL IS INSIDE THE ACCESSOR AND NOT AT THE CALLERS. The defect
+// is that `(id-1)*12` has no domain test, and a domain test belongs to the
+// function whose arithmetic has the domain. 1056 call sites across 50 files
+// read this accessor; a guard at each of them is 1056 chances to forget one,
+// and the next caller written tomorrow would be unguarded by construction.
+// abi.nova:1051-1060 already carries four such guards and they are correct
+// there -- they are simply not a guard on the accessor, because the accessor
+// is public.
+//
+// MEASURED, not assumed. Two distinct wrongs live in this one expression and
+// a test for id==0 alone fixes only the first:
+//
+//   id == 0            (0-1)*12 = 18446744073709551604, twelve reads at an
+//                      offset near 2^64. MEASURED: runtime error NV2_BOUNDS.
+//
+//   id > node_count    node_words is allocated with capacity ABOVE node_count
+//                      (parser.nova:99 refuses a node only at
+//                      token_count*2+16), so an id one past the last node
+//                      reads INSIDE the buffer and answers
+//                      runtime=NV2_OK. MEASURED on a 27-node tree: id=28 and
+//                      id=29 both returned a Node of kind 0 with no error at
+//                      all. That is the words.py shape exactly -- an invalid
+//                      id became a plausible value -- and an id==0 test alone
+//                      would have left it in place.
+//
+// So the test is the WHOLE DOMAIN: 1 <= id <= node_count.
+//
+// HOW IT REFUSES. The loud channels available to Nova source are rt_diag,
+// which writes the host's stderr, and a runtime error, which the host reads
+// out of the context. Both are used, and the order matters: the diagnostic
+// goes out FIRST, because once the error word is set the runtime's
+// first-error-wins rule makes every later host call return 0 without touching
+// the table, so a diagnostic emitted after the raise would be lost. The
+// refusal itself is a deliberate out-of-range read, which is the one
+// operation whose refusal the runtime already implements and already names
+// NV2_BOUNDS -- so an out-of-range id is refused by the same mechanism that
+// was refusing it by accident, and the difference is that the accessor now
+// MEANS it.
+fn refuse_node_at(tree:Tree,id:u64)->Node {
+    let head:buf<u8>="ntasm_ast.node_at: id is not a node (id=";
+    rt_diag(runtime(),head);
+    let id_digits:buf<u8>=decimal(id);
+    rt_diag(runtime(),id_digits);
+    rt_free(runtime(),id_digits);
+    let mid:buf<u8>=", node_count=";
+    rt_diag(runtime(),mid);
+    let count_digits:buf<u8>=decimal(tree.node_count);
+    rt_diag(runtime(),count_digits);
+    rt_free(runtime(),count_digits);
+    let tail:buf<u8>=").  The id must satisfy 1<=id<=node_count; 0 is the sentinel for no-node and names none.\n";
+    rt_diag(runtime(),tail);
+    // THE REFUSAL, and the index here is the whole design. The FIRST version
+    // of this function indexed `words[id*12]` -- one node past the one asked
+    // for -- on the reasoning that it would land outside the array. MEASURED,
+    // that was false for exactly the ids this guard exists to catch: node_words
+    // carries capacity above node_count, so for id=0 and for id=node_count+1
+    // the index stayed INSIDE the buffer, the runtime answered NV2_OK, and the
+    // accessor returned a Node built from whatever was there. That is the
+    // words.py shape produced by the very code written to prevent it, and it
+    // is why the index is `len(words)` and not an arithmetic guess about
+    // where the array ends.
+    //
+    // len(words) is the buffer's own length, so `words[len(words)]` is one
+    // element PAST the end by construction, for every id and every tree. The
+    // runtime refuses it with NV2_BOUNDS (runtime_v2.c resolve(): `at >
+    // b->length`), the code it already uses for exactly this fault, and the
+    // refusal happens before the load -- the address is computed, the bounds
+    // are refused, and no node word is read. So the accessor's own act is the
+    // refusal, not a side effect of the read it was written to prevent.
+    let words:buf<u64>=tree.node_words;
+    let past:u64=words[len(words)];
+    // Unreachable once the runtime has refused. It is here because Nova
+    // requires a value on this path, and returning `past` is honest: it is
+    // the refused load's own result, not an invented Node. A caller that
+    // reached this line is running with ctx->error already set, so the host
+    // refuses the run and this value never becomes an answer.
+    return Node{kind:past,token_begin:past,token_end:past,source:past,line:past,
+        column:past,start:past,end:past,first_child:past,last_child:past,
+        next_sibling:past,aux:past};
+}
+
+// The decimal spelling of v, as a fresh host buffer the caller frees. It
+// exists because the diagnostic has to carry the id: "node_at refused" with
+// no number in it does not locate the call, and an accessor that cannot say
+// WHICH id it refused has moved the problem rather than fixed it.
+fn decimal(v:u64)->buf<u8> {
+    // The digit loop is machine_ir.nova:3087-3090 and ntir.nova:987-990 read
+    // off the tree, not written here: count the digits by dividing a copy,
+    // then fill from the back. `u8(...)` is the narrowing cast the other two
+    // use at the same spot; without it the store is a u64 into a u8 buffer
+    // and the compiler refuses the narrowing rather than doing it.
+    let mut digits:u64=0;
+    let mut rest:u64=v;
+    while rest!=0 { digits=digits+1;rest=rest/10; }
+    if digits==0 { return "0"; }
+    let out:buf<u8>=alloc(runtime(),digits);
+    let mut i:u64=digits;
+    let mut rest2:u64=v;
+    while i!=0 { i=i-1;out[i]=u8(48+(rest2%10));rest2=rest2/10; }
+    return out;
+}
+
+export fn node_at(tree:Tree,id:u64)->Node {
+    // THE WHOLE DOMAIN, and the second half of the test is the half that
+    // stops the silent read. See the note above: id>node_count reads inside
+    // the buffer's slack and answers NV2_OK, which is the shape this guard
+    // exists to refuse.
+    if id==0||id>tree.node_count { return refuse_node_at(tree,id); }
+    let at:u64=(id-1)*12;
+    return Node{kind:tree.node_words[at],token_begin:tree.node_words[at+1],
+        token_end:tree.node_words[at+2],source:tree.node_words[at+3],
+        line:tree.node_words[at+4],column:tree.node_words[at+5],
+        start:tree.node_words[at+6],end:tree.node_words[at+7],
+        first_child:tree.node_words[at+8],last_child:tree.node_words[at+9],
+        next_sibling:tree.node_words[at+10],aux:tree.node_words[at+11]};
+}
+// Scalar reads avoid allocating a Node snapshot. node_at still owns its copy.
+export fn node_kind(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.kind;
+    }
+    return tree.node_words[(id-1)*12+0];
+}
+export fn node_token_begin(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.token_begin;
+    }
+    return tree.node_words[(id-1)*12+1];
+}
+export fn node_token_end(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.token_end;
+    }
+    return tree.node_words[(id-1)*12+2];
+}
+export fn node_source(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.source;
+    }
+    return tree.node_words[(id-1)*12+3];
+}
+export fn node_line(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.line;
+    }
+    return tree.node_words[(id-1)*12+4];
+}
+export fn node_column(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.column;
+    }
+    return tree.node_words[(id-1)*12+5];
+}
+export fn node_start(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.start;
+    }
+    return tree.node_words[(id-1)*12+6];
+}
+export fn node_end(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.end;
+    }
+    return tree.node_words[(id-1)*12+7];
+}
+export fn node_first_child(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.first_child;
+    }
+    return tree.node_words[(id-1)*12+8];
+}
+export fn node_last_child(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.last_child;
+    }
+    return tree.node_words[(id-1)*12+9];
+}
+export fn node_next_sibling(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.next_sibling;
+    }
+    return tree.node_words[(id-1)*12+10];
+}
+export fn node_aux(tree:Tree,id:u64)->u64 {
+    if id==0||id>tree.node_count {
+        let refused:Node=refuse_node_at(tree,id);
+        return refused.aux;
+    }
+    return tree.node_words[(id-1)*12+11];
+}
+export fn release(tree:Tree)->u64 {
+    let tokens:buf<u64>=tree.token_words;
+    let nodes:buf<u64>=tree.node_words;
+    rt_free(runtime(),tokens);
+    return rt_free(runtime(),nodes);
+}
+
+// ---- the kind vocabulary --------------------------------------------------
+//
+// The shape is machine_ir.nova:123-125, read from that file and not invented:
+// KIND_BASE, KIND_COUNT, and a one-based kind_at. What the shape carries is
+// the SHAPE. Two of the three bodies cannot be copied, and the reason is
+// measured, not chosen.
+//
+// KIND_BASE IS 1, AND THAT IS NOT machine_ir's 2048. The two domains number
+// their kinds differently on purpose: machine_ir hands out a private band at
+// 2048 so its records cannot be confused with the AST's, and ntir uses 1024
+// for the same reason. The AST band is the tree's own numbering and starts at
+// 1, because parser.nova:102 writes the caller's kind literal straight into
+// node_words with no offset -- `nodes[at]=kind`. So 1 is the base, read off
+// the factory, and NOT copied from machine_ir.
+//
+// KIND_COUNT IS 51, AND THE COUNT IS NOT machine_ir's FORM either. The AST
+// kinds are NOT CONTIGUOUS: 26 is a hole and 46 through 89 are absent, so
+// KIND_BASE+KIND_COUNT is not an upper bound and a "is this kind in the
+// table" test cannot be the range test machine_ir uses at :524-528. That is
+// why kind_at below is an explicit table and not `KIND_BASE()+index-1`. A
+// formula would be shorter and WRONG: it would answer 26 for index 26, and 26
+// is the one hole.
+//
+// THE DISAGREEMENT IS NOT RESOLVED HERE, AND ast.nova DOES NOT AGREE WITH
+// ntir.nova. ntir.nova:395 states 50 AST kinds; the factory sites extract 51;
+// the difference is {32}. This module publishes 51 because 51 is what the
+// tree emits, and it publishes it ALONGSIDE a second number so the two answers
+// can be asked in one place rather than argued about in prose. NTIR_STATED_
+// COUNT carries ntir.nova's own sentence and nothing else: it is a record of
+// what that file says, not an endorsement and not a correction.
+export fn KIND_BASE()->u64 { return 1; }
+export fn KIND_COUNT()->u64 { return 51; }
+export fn NTIR_STATED_COUNT()->u64 { return 50; }
+
+// The i-th AST kind, one-based, or 0 for an index outside the table. The table
+// is written out because the numbering has a hole at 26 and a gap from 46, so
+// the arithmetic form machine_ir uses would name a kind that no factory emits.
+export fn kind_at(index:u64)->u64 {
+    if index==1 { return 1; }
+    if index==2 { return 2; }
+    if index==3 { return 3; }
+    if index==4 { return 4; }
+    if index==5 { return 5; }
+    if index==6 { return 6; }
+    if index==7 { return 7; }
+    if index==8 { return 8; }
+    if index==9 { return 9; }
+    if index==10 { return 10; }
+    if index==11 { return 11; }
+    if index==12 { return 12; }
+    if index==13 { return 13; }
+    if index==14 { return 14; }
+    if index==15 { return 15; }
+    if index==16 { return 16; }
+    if index==17 { return 17; }
+    if index==18 { return 18; }
+    if index==19 { return 19; }
+    if index==20 { return 20; }
+    if index==21 { return 21; }
+    if index==22 { return 22; }
+    if index==23 { return 23; }
+    if index==24 { return 24; }
+    if index==25 { return 25; }
+    if index==26 { return 27; }
+    if index==27 { return 28; }
+    if index==28 { return 29; }
+    if index==29 { return 30; }
+    if index==30 { return 31; }
+    if index==31 { return 32; }
+    if index==32 { return 33; }
+    if index==33 { return 34; }
+    if index==34 { return 35; }
+    if index==35 { return 36; }
+    if index==36 { return 37; }
+    if index==37 { return 38; }
+    if index==38 { return 39; }
+    if index==39 { return 40; }
+    if index==40 { return 41; }
+    if index==41 { return 42; }
+    if index==42 { return 43; }
+    if index==43 { return 44; }
+    if index==44 { return 45; }
+    if index==45 { return 90; }
+    if index==46 { return 91; }
+    if index==47 { return 92; }
+    if index==48 { return 93; }
+    if index==49 { return 94; }
+    if index==50 { return 95; }
+    if index==51 { return 96; }
+    return 0;
+}
+
+// A kind is in the table when some entry names it. This is a LOOKUP and not
+// machine_ir's range test, for the same reason kind_at is a table: 26 is a
+// hole inside [KIND_BASE, KIND_BASE+KIND_COUNT) and 96 is a kind above it.
+export fn kind_present(kind:u64)->bool {
+    let mut i:u64=1;
+    while i<=KIND_COUNT() {
+        if kind_at(i)==kind { return true; }
+        i=i+1;
+    }
+    return false;
+}
+
+// THE NAME OF AN AST KIND, OR "UNNAMED". Exactly two of the 51 carry a name
+// that this tree reads somewhere, and both were read, not chosen:
+//
+//   18  abi.nova:387-388 -- `if declaration.kind==18 { functions=... }` in a
+//       loop whose subject is a module's declarations. A function declaration.
+//   9   abi.nova:387-388 -- the same condition's other arm, `imports=...`. An
+//       import.
+//
+// THE OTHER 49 ARE "UNNAMED" AND THAT IS THE HONEST ANSWER, NOT A GAP. The
+// tree projects names onto AST kinds in ntir.nova's kind_ast_at column, and
+// those projections are the NTIR's names, not the AST's: the AST domain
+// declared no name before this line and a name borrowed from another module's
+// axis would be a transcription wearing a measurement's clothes. The C's
+// NTF_X_* / NTF_S_* enumerators are the C's axis for the same reason and are
+// not used here. UNNAMED means "no name in this domain, and nobody has
+// chosen one" -- not "unknown", which would claim a name exists and is merely
+// unfound, and not a derivation from another language.
+fn ast_kind_name(kind:u64)->buf<u8> {
+    if kind==18 { return "function_declaration"; }
+    if kind==9 { return "import"; }
+    return "UNNAMED";
+}
+export fn kind_name_of(kind:u64)->buf<u8> { return ast_kind_name(kind); }
+
+// The name of the i-th kind. This ANSWERS for every index in the table and
+// that fact is worth nothing: it is exactly the false positive this accessor
+// is shaped to refuse. "There is a name for index i" is not "the vocabulary
+// is complete", because 49 of the 51 answers are the string UNNAMED. A reader
+// that counted non-empty answers would report 51 names and be wrong 49 times.
+export fn kind_text(index:u64)->buf<u8> { return ast_kind_name(kind_at(index)); }

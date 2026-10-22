@@ -1,0 +1,480 @@
+module ntasm_ntir_inspect;
+import ntir;
+
+// THE READER FOR NTIR, and the module A7 asks for next to nxo_inspect.nova
+// and pe_inspect.nova. The measurement that opened this lot is the reason it
+// exists: ntir.nova can BUILD an image, CHECK it and WRITE it as bytes, and
+// nothing in the tree could turn any of those three back into something a
+// reader — or a gate — could assert on. `serialize` emits a text form whose
+// fields are NUMBERS, so a reader confronted a corrupted typed word learned
+// that the word was 7 and not that the word was wrong.
+//
+// WHY IT READS LIKE nxo_inspect.nova AND NOT LIKE pe_inspect.nova. The two
+// existing inspectors are not the same shape and the difference is not taste.
+// pe_inspect validates a FILE it did not write: it re-derives thirty-odd
+// invariants of the PE32+ writer profile and refuses an image that breaks
+// one, because there is no other authority on those invariants in the tree.
+// An NTIR is not like that: ntir.nova is its own authority, it publishes
+// HEADER_WORDS, NODE_WORDS, KIND_BASE and KIND_COUNT, and `verify` already
+// owns the structural refusals. A second validator here would be a second
+// opinion nobody asked for, and the one thing this tree has too much of is a
+// second convention that can drift. So the shape borrowed is nxo_inspect's
+// instead: READ, then hand back a fixed set of words; a caller that wants a
+// field asks for it BY INDEX; a text accessor copies exact bytes and reports
+// the copied count through a separate output. Every function here returns 0
+// or a code, writes nothing on a refusal, and names its codes.
+//
+// WHAT IS READ. The image is the flat u64 buffer ntir.build fills: a header
+// of HEADER_WORDS words then one record of NODE_WORDS words per node. This
+// module reads that buffer and NOTHING else. It never sees the AST, never
+// re-parses and never calls ntir.verify: a reader that re-derived the image
+// would be measuring its own reconstruction, which is the mirror image of the
+// defect this module exists to close.
+//
+// THE SPINE IS THE KIND ENUMERATION. ntir.nova publishes KIND_COUNT and two
+// accessors over the table — `kind_text(index)` for a one-based INDEX and
+// `kind_name_of(kind)` for a NUMBER — and both of those have the property this
+// module exists to refuse: an index outside the table does not fail, it
+// ANSWERS. `kind_text(0)` is `kind_at(0)` = KIND_BASE-1, which names no kind,
+// and kind_name returns "unknown" for it; `kind_text(KIND_COUNT+1)` is one
+// past the last kind and also returns "unknown". "unknown" is a plausible
+// answer to a question nobody asked, and a reader that prints it has invented
+// a kind. So `copy_kind_name` below range-checks the index ITSELF and returns
+// 812, and `kinds` below refuses rather than truncating. Every other index in
+// this module is range-checked for the same reason.
+//
+// THE THREE THINGS THE PLAN NAMES. types, symbols and effects.
+//
+//   TYPES are carried. A node's type_width, type_signed, memory_space and
+//   reg_class are four of the sixteen words, and `inspect_node` hands all
+//   sixteen back, so a type is readable per node with no reconstruction. The
+//   header's typed_count is carried too and `inspect` republishes it.
+//
+//   SYMBOLS ARE NOT CARRIED, and this is a property of the representation
+//   rather than a gap in this reader. The image holds sixteen u64 per node
+//   and a header; there is no string table, no symbol table and no name
+//   offset. What it does carry is `start` and `end`, a byte span into the
+//   source, so a node's TEXT is recoverable by slicing the source the caller
+//   already holds. `copy_node_text` does exactly that and nothing more: it
+//   copies the bytes at the node's own span. So the finding to record is
+//   that an NTIR names its nodes by position, not by name, and a reader that
+//   wants a symbol name must bring the source. Nothing here reconstructs a
+//   name from a span it was not given.
+//
+//   EFFECTS ARE CARRIED AS KINDS, NOT AS WORDS. `effects`, `clobbers`,
+//   `requires` and `ensures` are four of the fifty-three kinds, so a function
+//   that declares an effect set owns a child of kind `effects` and the atoms
+//   in it are its children. There is no effect bitset anywhere in the
+//   sixteen words: `typed_admissible` admits a width, a signedness, a space
+//   and a class, and nothing else. `effect_atoms` walks the child chain of
+//   the `effects` or `clobbers` node and copies the atoms' spans, which is
+//   the only way the representation holds them.
+//
+// CODES. Two of them are REUSED because the meaning is identical, and two are
+// NEW because the number they would have taken is already spoken for.
+//
+//   800  the transaction's own refusal: a buffer too short to hold what it
+//        claims, or a header this format does not describe. 800 is the
+//        structural band's common transactional code and this module joins
+//        the several hundred uses of it rather than minting a synonym.
+//   809  the caller output buffer is too small. REUSED: nxo_inspect.nova:78
+//        publishes exactly this for the same reason, and a reader that had its
+//        own number for "your buffer is short" would be a second convention.
+//   810  an index outside the count. REUSED for the same reason and the same
+//        shape as 809's: a node id the image does not have.
+//   845  a kind INDEX the table does not have — the refusal `kind_text` does
+//        not make. NEW, and not 811: nxo_inspect.nova:60 already returns 811
+//        for a RELOCATION index out of range, which is a different index in a
+//        different table, and two meanings on one number is how a caller ends
+//        up matching the wrong refusal.
+//   847  a kind NUMBER outside the table, which is a different mistake from an
+//        index outside it and is kept apart on purpose. NEW, and not 812:
+//        decls.nova:104 already returns 812 for a short output buffer, which has
+//        nothing to do with a kind table.
+//   813  an image carries a kind this module cannot name. REUSED: it is
+//        ntir.nova's own code for a kind outside the table, and a reader
+//        refusing the same defect as its writer is the point.
+//   819  a typed word outside its vocabulary. REUSED: ntir.verify publishes it
+//        for exactly this, and a reader laxer than the writer is the direction
+//        that hides a defect.
+//
+// NOTHING HERE ALLOCATES. Every accessor copies into a caller buffer and
+// reads from one, so a gate can call any of them in a loop without spending
+// the allocator, and a call that refuses spends nothing at all.
+fn node_base(id:u64)->u64 { return ntir.HEADER_WORDS()+(id-1)*ntir.NODE_WORDS(); }
+// A readable image or 0. The three refusals are the ones that make a later
+// read unsafe: a count that is zero, a buffer shorter than the count's own
+// records, and a header whose magic or version is not this format's.
+fn readable(words:buf<u64>,count:u64)->bool {
+    if count==0 { return false; }
+    if len(words)<ntir.HEADER_WORDS()+count*ntir.NODE_WORDS() { return false; }
+    if words[0]!=0x4E544952 { return false; }
+    if words[1]!=ntir.FORMAT_MAJOR() { return false; }
+    if words[2]!=ntir.FORMAT_MINOR() { return false; }
+    return true;
+}
+// The kind of node `id`, or 0 when the id is outside the image.
+fn kind_of(words:buf<u64>,count:u64,id:u64)->u64 {
+    if id<1 || id>count { return 0; }
+    return words[node_base(id)];
+}
+
+// ---------------------------------------------------------------------------
+// THE SUMMARY. Nine words, and the order is this module's, written down here
+// once so a reader does not have to find it:
+//
+//   0 node_count     the image's own header word 3
+//   1 root           header word 4
+//   2 stride         header word 5, which must be NODE_WORDS
+//   3 ast_node_count header word 6
+//   4 typed_count    header word 7, the nodes carrying a typed word
+//   5 kind_base      the base the table is numbered from
+//   6 kind_count     the size of that table
+//   7 typed_measured TYPED COUNT RE-COUNTED BY THIS MODULE
+//   8 kinds_used     how many DISTINCT kinds the image actually contains
+//
+// Words 7 and 8 are the reason `inspect` is worth calling. Words 0 to 6 are
+// what the image CLAIMS; 7 and 8 are what a reader MEASURES, and a claim that
+// disagrees with the measurement is a defect in the image that a reader is
+// the only party positioned to see — ntir.verify checks that word 7 is not
+// larger than the node count, which is a weaker statement and a different one.
+export fn summary_words()->u64 { return 9; }
+export fn inspect(words:buf<u64>,count:u64,out:buf<u64>)->u64 {
+    if len(out)<9 { return 809; }
+    if readable(words,count)==false { return 800; }
+    if words[5]!=ntir.NODE_WORDS() { return 800; }
+    out[0]=count;
+    out[1]=words[4];
+    out[2]=words[5];
+    out[3]=words[6];
+    out[4]=words[7];
+    out[5]=ntir.KIND_BASE();
+    out[6]=ntir.KIND_COUNT();
+    // Two sweeps, one pass. `seen` is indexed by table row, so a kind outside
+    // the table is not silently folded into some row's tally: the loop
+    // refuses the image at 813 rather than counting a kind that has no name.
+    let seen:buf<u64>=alloc(runtime(),ntir.KIND_COUNT());
+    let mut i:u64=0;
+    while i<ntir.KIND_COUNT() { seen[i]=0; i=i+1; }
+    let mut typed:u64=0;
+    let mut used:u64=0;
+    let mut id:u64=1;
+    let mut code:u64=0;
+    while id<=count && code==0 {
+        let at:u64=node_base(id);
+        let kind:u64=words[at];
+        let row:u64=kind_row(kind);
+        if row==0 { code=813; }
+        else {
+            if seen[row-1]==0 { seen[row-1]=1; used=used+1; }
+            // The same predicate ntir.build used to increment its own
+            // counter: a node is typed when it carries a width, a space or a
+            // class. SIGNED_NONE (2) is the default every untyped node gets,
+            // so it is not part of the test — and reading it as part of the
+            // test would count every node in the image as typed.
+            if words[at+12]!=0 || words[at+14]!=0 || words[at+15]!=ntir.CLASS_NONE() { typed=typed+1; }
+        }
+        id=id+1;
+    }
+    rt_free(runtime(),seen);
+    if code!=0 { return code; }
+    out[7]=typed;
+    out[8]=used;
+    return 0;
+}
+// The one-based row of `kind` in the table, or 0 when the table does not
+// hold it. This is the predicate that refuses, and `inspect` above is the
+// first caller that depends on it: an image carrying a kind outside the
+// table has no name this module may print.
+fn kind_row(kind:u64)->u64 {
+    if kind<ntir.KIND_BASE() { return 0; }
+    let row:u64=kind-ntir.KIND_BASE()+1;
+    if row>ntir.KIND_COUNT() { return 0; }
+    // The round trip, not the arithmetic: a table whose kind_at does not
+    // answer its own index would otherwise make every row look occupied.
+    if ntir.kind_at(row)!=kind { return 0; }
+    return row;
+}
+
+// ---------------------------------------------------------------------------
+// ONE NODE. Sixteen words, in the image's own field order and no other, so a
+// caller that knows the layout reads them without a translation table:
+//   0 kind  1 source  2 line  3 column  4 start  5 end  6 ast_kind  7 ast_id
+//   8 first_child  9 last_child  10 next_sibling  11 child_count
+//   12 type_width  13 type_signed  14 memory_space  15 reg_class
+// `index` is one-based, which is the image's own convention and not this
+// module's: an id outside 1..count is 810 and writes nothing.
+export fn inspect_node(words:buf<u64>,count:u64,index:u64,out:buf<u64>)->u64 {
+    if len(out)<16 { return 809; }
+    if readable(words,count)==false { return 800; }
+    if index<1 || index>count { return 810; }
+    let at:u64=node_base(index);
+    let mut i:u64=0;
+    while i<16 { out[i]=words[at+i]; i=i+1; }
+    return 0;
+}
+// The five words a reader asks about most, packed so a caller does not have
+// to lend sixteen: width, signedness, space, class, child_count. A node with
+// no typed word answers 0 for the first four, which is a real answer and not
+// an absence — a block carries no width and says so.
+//
+// AND IT REFUSES A TYPED WORD IT CANNOT NAME, at 819, the code ntir.verify
+// already publishes for exactly that. This is the one place where this module
+// checks a field instead of copying it, and the reason is the whole lot: a
+// reader that hands back a width of 7 has told the caller the node is 7 bits
+// wide, and the caller has no way to know that no width 7 exists. `verify`
+// refuses the same image, but a reader is reached by callers that never call
+// `verify`, and one laxer than the writer is the direction that HIDES a
+// defect rather than the one that finds it.
+//
+// width_readable writes out ntir.nova's width_known set instead of calling
+// it, because that predicate is private to ntir.nova and this lot does not
+// edit it. Two copies of one set is a real risk and it is MEASURED rather
+// than trusted: the gate probes every width from 0 to 96 against this reader
+// and against ntir.verify on a real image, so a width one of them accepts and
+// the other rejects is a red. The list below is therefore an assertion under
+// test and not a convention this module gets to be right about.
+export fn typed_words()->u64 { return 5; }
+fn width_readable(width:u64)->bool {
+    if width==0 { return true; }
+    if width==1 { return true; }
+    if width==8 { return true; }
+    if width==16 { return true; }
+    if width==32 { return true; }
+    if width==64 { return true; }
+    return width==ntir.WIDTH_MEMORY();
+}
+fn typed_readable(words:buf<u64>,at:u64)->bool {
+    if width_readable(words[at+12])==false { return false; }
+    if words[at+13]>ntir.SIGNED_NONE() { return false; }
+    if words[at+14]!=0 && ntir.space_known(words[at+14])==false { return false; }
+    if words[at+15]>ntir.CLASS_LIMIT() { return false; }
+    return true;
+}
+export fn inspect_typed(words:buf<u64>,count:u64,index:u64,out:buf<u64>)->u64 {
+    if len(out)<5 { return 809; }
+    if readable(words,count)==false { return 800; }
+    if index<1 || index>count { return 810; }
+    let at:u64=node_base(index);
+    if typed_readable(words,at)==false { return 819; }
+    out[0]=words[at+12];
+    out[1]=words[at+13];
+    out[2]=words[at+14];
+    out[3]=words[at+15];
+    out[4]=words[at+11];
+    return 0;
+}
+// The child of `parent` at the one-based `ordinal`, or 0 when the parent does
+// not have one. The step bound closes a cycle before the walk can run away,
+// so a caller gets 0 — an answer it can refuse — and never a count it would
+// believe.
+export fn child_at(words:buf<u64>,count:u64,parent:u64,ordinal:u64,out:buf<u64>)->u64 {
+    if len(out)<1 { return 809; }
+    if readable(words,count)==false { return 800; }
+    if ordinal<1 || parent<1 || parent>count { return 810; }
+    let mut id:u64=words[node_base(parent)+8];
+    let mut step:u64=1;
+    while id!=0 && step<ordinal {
+        if id>count { return 800; }
+        step=step+1;
+        if step>count { return 800; }
+        id=words[node_base(id)+10];
+    }
+    if id>count { return 800; }
+    out[0]=id;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// THE KIND TABLE, ALL OF IT. Four words per entry after the two header words:
+//   0 KIND_COUNT   1 KIND_BASE
+//   then per one-based entry i: kind, the AST kind it lowers from (0 on a
+//   split entry), the aux the mapping requires (ANY_AUX when it ignores it),
+//   and the byte length of the name.
+//
+// The length is the FOURTH word and it is what makes the enumeration
+// assertable: the count and the base are the table's shape, but a reader that
+// cannot see how long each name is cannot tell a name from a truncated one.
+// Every entry is written, including the two split pairs, and the names
+// themselves are fetched by `copy_kind_name` rather than written here, so
+// this function costs one word per kind for a name nobody asked for.
+//
+// A table whose count does not fit the caller's buffer is 809 and writes
+// nothing: a partial table read as a whole one is the exact shape of defect
+// this whole lot is about.
+export fn kind_words()->u64 { return 4; }
+export fn kinds(out:buf<u64>)->u64 {
+    let count:u64=ntir.KIND_COUNT();
+    if len(out)<2+count*4 { return 809; }
+    out[0]=count;
+    out[1]=ntir.KIND_BASE();
+    let mut i:u64=1;
+    while i<=count {
+        let at:u64=2+(i-1)*4;
+        out[at]=ntir.kind_at(i);
+        out[at+1]=ntir.kind_ast_at(i);
+        out[at+2]=ntir.kind_aux_at(i);
+        out[at+3]=len(ntir.kind_text(i));
+        i=i+1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ONE KIND NAME, and the refusal this module exists to make.
+//
+// `index` is the table's one-based INDEX, so this is `kind_text` with a
+// range check in front of it. ntir.kind_text does not range check: index 0 is
+// KIND_BASE-1 and index KIND_COUNT+1 is one past the last kind, and BOTH
+// return the string "unknown". "unknown" is a plausible answer to a question
+// nobody asked. A reader that prints it has invented a kind name, and the
+// caller downstream cannot tell an invented name from a real one — which is
+// why this returns 811 and writes nothing instead.
+//
+// The name is a compile-time literal in ntir.nova, so len() is its length and
+// the copy is a straight byte loop; nothing is allocated and nothing is
+// parsed. A caller buffer shorter than the name is 809, and out_length is
+// written only after the copy, so a rejected call leaves both of the caller's
+// buffers exactly as it supplied them.
+export fn copy_kind_name(index:u64,out:buf<u8>,out_length:buf<u64>)->u64 {
+    if len(out_length)<1 { return 809; }
+    if index<1 || index>ntir.KIND_COUNT() { return 845; }
+    let name:buf<u8>=ntir.kind_text(index);
+    let size:u64=len(name);
+    if size>len(out) { return 809; }
+    let mut i:u64=0;
+    while i<size { out[i]=name[i]; i=i+1; }
+    out_length[0]=size;
+    return 0;
+}
+// The same name addressed by its NUMBER rather than its index, so a caller
+// reading a kind straight out of an image does not have to convert first.
+// The two refusals are different numbers and the difference is deliberate: an
+// index outside the table is 811 and a NUMBER outside the table is 812,
+// because `kind_name_of` accepts any u64 at all and answers "unknown" for
+// every one of them, including a number below KIND_BASE that never named a
+// kind in any table.
+export fn copy_kind_name_of(kind:u64,out:buf<u8>,out_length:buf<u64>)->u64 {
+    if len(out_length)<1 { return 809; }
+    if kind_row(kind)==0 { return 847; }
+    let name:buf<u8>=ntir.kind_name_of(kind);
+    let size:u64=len(name);
+    if size>len(out) { return 809; }
+    let mut i:u64=0;
+    while i<size { out[i]=name[i]; i=i+1; }
+    out_length[0]=size;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// A NODE'S TEXT, which is how a symbol becomes readable.
+//
+// The image carries a byte span per node and no string table at all, so this
+// is the ONLY way the representation holds a name: slice the caller's source
+// at the node's own `start` and `end`. The source is the caller's and the
+// span is the image's, and this module checks that the span is inside the
+// source before it reads a byte — a corrupt `start` or `end` must not become
+// an out-of-bounds read that happens to return a plausible name.
+//
+// 800 is a span that leaves the source, 810 a node id outside the image and
+// 809 a caller buffer too short. As everywhere here, a refusal writes
+// nothing: out and out_length come back exactly as they were supplied.
+export fn copy_node_text(source:buf<u8>,words:buf<u64>,count:u64,index:u64,
+        out:buf<u8>,out_length:buf<u64>)->u64 {
+    if len(out_length)<1 { return 809; }
+    if readable(words,count)==false { return 800; }
+    if index<1 || index>count { return 810; }
+    let at:u64=node_base(index);
+    let start:u64=words[at+4];
+    let end:u64=words[at+5];
+    if start>end || end>len(source) { return 800; }
+    let size:u64=end-start;
+    if size>len(out) { return 809; }
+    let mut i:u64=0;
+    while i<size { out[i]=source[start+i]; i=i+1; }
+    out_length[0]=size;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// EFFECTS, which the representation holds as KINDES and not as a word.
+//
+// There is no effect bitset in the sixteen node words. `effects` and
+// `clobbers` are kinds (rows 20 and 21 of the table), so a function that
+// declares an effect set owns a child of kind `effects`, and the ATOMS in
+// that set are its children. `effect_atoms` walks exactly that chain and
+// copies each atom's span through `copy_node_text`, which is the only reading
+// the representation supports.
+//
+// `which` selects the set: 0 the effects set, 1 the clobbers set. A
+// function that declares neither has no child of that kind and this answers
+// 0 atoms, which is a real answer. `out_count[0]` receives the number of
+// atoms copied; a node whose child is not of the requested kind is 800 rather
+// than an empty list, because an empty list and a wrong node are different
+// answers and only one of them is true.
+//
+// No allocation: the caller lends the atom buffer and this walks into it.
+fn effect_kind(which:u64)->u64 {
+    // The two rows are read out of the table rather than written down, so a
+    // renumbering is visible in the refusal instead of silent here.
+    if which==0 { return ntir.kind_at(20); }
+    if which==1 { return ntir.kind_at(21); }
+    return 0;
+}
+// The id of the first child of `parent` whose kind is `kind`, or 0.
+fn child_of_kind(words:buf<u64>,count:u64,parent:u64,kind:u64)->u64 {
+    if parent<1 || parent>count { return 0; }
+    let mut id:u64=words[node_base(parent)+8];
+    let mut step:u64=0;
+    while id!=0 {
+        if id>count { return 0; }
+        step=step+1;
+        if step>count { return 0; }
+        if kind_of(words,count,id)==kind { return id; }
+        id=words[node_base(id)+10];
+    }
+    return 0;
+}
+// The atoms of the `which` set of the function at `index`, each copied as
+// source bytes. out_ids receives one node id per atom, in chain order, and
+// out_count[0] the number copied; both are written only on the accepting path.
+export fn effect_atoms(source:buf<u8>,words:buf<u64>,count:u64,index:u64,which:u64,
+        out:buf<u8>,out_ids:buf<u64>,out_count:buf<u64>)->u64 {
+    if len(out_count)<1 || len(out_ids)<1 { return 809; }
+    if readable(words,count)==false { return 800; }
+    if index<1 || index>count { return 810; }
+    if which>1 { return 810; }
+    let wanted:u64=effect_kind(which);
+    if wanted==0 { return 800; }
+    let set:u64=child_of_kind(words,count,index,wanted);
+    // A function with no such set is an empty one, and 0 atoms is what it
+    // has. That is written through out_count so the caller learns the answer
+    // from a return of 0 rather than from a refusal it has to interpret.
+    out_ids[0]=0;
+    out_count[0]=0;
+    if set==0 { return 0; }
+    let mut ids:u64=1;
+    let mut size:u64=0;
+    let mut atom:u64=words[node_base(set)+8];
+    let mut step:u64=0;
+    while atom!=0 {
+        if atom>count || step>count { return 800; }
+        step=step+1;
+        let at:u64=node_base(atom);
+        let start:u64=words[at+4];
+        let end:u64=words[at+5];
+        if start>end || end>len(source) { return 800; }
+        let width:u64=end-start;
+        if size+width>len(out) { return 809; }
+        let mut i:u64=0;
+        while i<width { out[size+i]=source[start+i]; i=i+1; }
+        if ids>=len(out_ids) { return 809; }
+        out_ids[ids]=atom;
+        ids=ids+1;
+        size=size+width;
+        atom=words[node_base(atom)+10];
+    }
+    out_ids[0]=ids-1;
+    out_count[0]=size;
+    return 0;
+}

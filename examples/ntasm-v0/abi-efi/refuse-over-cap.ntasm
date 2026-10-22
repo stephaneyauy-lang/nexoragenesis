@@ -1,0 +1,9 @@
+module efi.bad
+target x86_64-nexora-none
+default_abi efi-x64-v0
+section .text {
+fn leaf(in p1:u64,in p2:u64,in p3:u64,in p4:u64,in p5:u64,in p6:u64,in p7:u64,in p8:u64,in p9:u64,in p10:u64,in p11:u64,in p12:u64,in p13:u64,in p14:u64,in p15:u64,in p16:u64,in p17:u64,in p18:u64,in p19:u64,in p20:u64,in p21:u64,in p22:u64,in p23:u64,in p24:u64,in p25:u64,in p26:u64,in p27:u64,in p28:u64,in p29:u64,in p30:u64,in p31:u64,in p32:u64,in p33:u64,in p34:u64,in p35:u64,in p36:u64,in p37:u64,in p38:u64,in p39:u64,in p40:u64,in p41:u64,in p42:u64,in p43:u64,in p44:u64,in p45:u64,in p46:u64,in p47:u64,in p48:u64,in p49:u64,in p50:u64,in p51:u64,in p52:u64,in p53:u64,in p54:u64,in p55:u64,in p56:u64,in p57:u64,in p58:u64,in p59:u64,in p60:u64,in p61:u64,in p62:u64,in p63:u64,in p64:u64,in p65:u64)->u64
+effects {}
+clobbers {} { return 0
+}
+}

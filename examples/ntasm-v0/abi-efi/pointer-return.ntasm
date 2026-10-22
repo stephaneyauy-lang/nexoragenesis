@@ -1,0 +1,16 @@
+module efi.pointer
+target x86_64-nexora-uefi
+default_abi efi-x64-v0
+section .text {
+fn leaf(in p:ptr<user,u64> @rcx)->ptr<user,u64>
+effects {}
+clobbers {} {
+return p
+}
+export fn main(in q:ptr<user,u64> @rcx)->u64
+effects {}
+clobbers {rax} {
+let back:ptr<user,u64> = leaf(q);
+return 42
+}
+}

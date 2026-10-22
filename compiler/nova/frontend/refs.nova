@@ -1,0 +1,200 @@
+module ntasm_refs;
+
+import ntasm_ast;
+
+// Node kinds: import 9, function declaration 18, comptime 11, macro 13,
+// quote 43.
+fn k_comptime()->u64 { return 11; }
+fn k_macro()->u64 { return 13; }
+fn k_quote()->u64 { return 43; }
+
+// --------------------------------------------------- the template exclusion
+// spec/ntasm/ntasm.md 13 develops a macro before the final verification of types
+// and contracts, so a comptime(11), a macro(13) and a quote(43) subtree is a
+// template and not code: what it spells is either replaced by an expansion
+// or refused by the expander, and neither a declaration nor a call written
+// there is part of the module. Both sweeps below are flat node id scans, so
+// the subtree is what excludes them, not the expansion: a template that no
+// invocation developed stays in the tree and would otherwise register a
+// callee that does not exist, and resolve a call that is not a call.
+//
+// The mask is a whole pass of its own, done before the sweeps below, and it
+// marks a template root together with everything under it, so it assumes
+// nothing about where a subtree sits in the id order: every root is found,
+// and each is marked in full before the sweeps that consult the mask start.
+// Marking is idempotent, so a nested root costs one compare and a cyclic
+// child chain terminates. The recursion is bounded by the depth of a template
+// subtree, a handful of levels, the same shape control_flow.nova already
+// walks recursively. A node no template owns, including the copy a spliced
+// tree retires, keeps mask 0 and is real code, exactly as this module treated
+// it before. Two locals and no buffer: this module shares a program wide
+// budget with the thirty nine other modules the diagnostics gate compiles,
+// and that budget is the next wall the tree is on.
+fn mask_below(tree:ntasm_ast.Tree,mask:buf<u64>,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 800; }
+    if mask[id]==1 { return 0; }
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    mask[id]=1;
+    let mut at:u64=n.first_child;
+    while at!=0 {
+        if at>tree.node_count { return 800; }
+        mask_below(tree,mask,at);
+        at=ntasm_ast.node_at(tree,at).next_sibling;
+    }
+    return 0;
+}
+fn template_mask(tree:ntasm_ast.Tree,mask:buf<u64>)->u64 {
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==k_comptime() || n.kind==k_macro() || n.kind==k_quote() {
+            let refused:u64=mask_below(tree,mask,id);
+            if refused!=0 { return refused; }
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+fn same_name(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);
+    let mut id:u64=p.first_child;
+    let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;
+        index=index+1;
+    }
+    if id>tree.node_count { return 0; }
+    return id;
+}
+
+fn callable_name(tree:ntasm_ast.Tree,id:u64)->u64 {
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if n.kind==18 { return child(tree,id,0); }
+    if n.kind==9 { return child(tree,id,1); }
+    return 0;
+}
+
+// Callee node of a call: the first child of a call statement or of a call
+// expression is the qualified name node the callee was spelled with. Returns 0
+// when the node is not a call or carries no usable callee shape.
+fn call_callee(tree:ntasm_ast.Tree,id:u64)->u64 {
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if n.kind!=28 && (n.kind!=35 || n.aux!=1) { return 0; }
+    let qid:u64=child(tree,id,0);
+    if qid==0 || qid>tree.node_count { return 0; }
+    let q:ntasm_ast.Node=ntasm_ast.node_at(tree,qid);
+    if q.kind!=91 || q.last_child==0 || q.last_child>tree.node_count { return 0; }
+    return qid;
+}
+
+// Resolves call statements and expression calls against local functions and import aliases.
+// A callee is matched by its whole spelling: a qualified callee such as
+// `other.add` matches no single-identifier declaration or alias and is reported
+// as a missing reference. A declaration or a call that a comptime(11), a
+// macro(13) or a quote(43) subtree owns is a template and is excluded from
+// both sweeps, because spec/ntasm/ntasm.md 13 develops a macro before the final
+// verification: a template that no invocation developed is still in the tree,
+// and a callee it names is not a callee of the module.
+// Success writes callable/call/resolved counts to out[0..2]. Error 310 writes
+// line/column of the first missing reference to out[0..1]. Error 800 leaves out
+// untouched. The source, tree and output remain owned by the caller.
+export fn resolve(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<3 { return 800; }
+    let slots:u64=tree.node_count+1;
+    let scratch:buf<u64>=alloc(runtime(),tree.node_count*2);
+    let mask:buf<u64>=alloc(runtime(),slots);
+    let mut i:u64=0;
+    while i<slots { mask[i]=0;i=i+1; }
+    let mut callable_count:u64=0;
+    let mut id:u64=1;
+    let mut code:u64=template_mask(tree,mask);
+    let mut error_line:u64=0;
+    let mut error_column:u64=0;
+    while id<=tree.node_count && code==0 {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if (n.kind==18 || n.kind==9) && mask[id]!=1 {
+            let name_id:u64=callable_name(tree,id);
+            if name_id==0 || name_id>tree.node_count {
+                code=800;
+            } else {
+                let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                if name.start>name.end || name.end>len(source) { code=800; }
+                else {
+                    scratch[callable_count*2]=name.start;
+                    scratch[callable_count*2+1]=name.end;
+                    callable_count=callable_count+1;
+                }
+            }
+        }
+        id=id+1;
+    }
+    let mut calls:u64=0;
+    let mut resolved:u64=0;
+    id=1;
+    while id<=tree.node_count && code==0 {
+        // A call a template owns is a template spelling, so it is neither
+        // counted nor resolved: the mirror image of the declaration index.
+        let mut callee_id:u64=0;
+        if mask[id]!=1 { callee_id=call_callee(tree,id); }
+        if callee_id!=0 {
+            calls=calls+1;
+            let callee:ntasm_ast.Node=ntasm_ast.node_at(tree,callee_id);
+            // A declaration name and an import alias are always a single
+            // identifier, so a qualified callee spelling resolves against no
+            // declaration: report it as a missing reference instead of
+            // dropping the qualifier and matching the final segment alone.
+            if callee.first_child!=callee.last_child {
+                code=310;
+                error_line=callee.line;
+                error_column=callee.column;
+            } else {
+                let name:ntasm_ast.Node=ntasm_ast.node_at(tree,callee.last_child);
+                if name.start>name.end || name.end>len(source) { code=800; }
+                else {
+                    let mut found:bool=false;
+                    let mut j:u64=0;
+                    while j<callable_count {
+                        if same_name(source,scratch[j*2],scratch[j*2+1],
+                                     name.start,name.end) { found=true; }
+                        j=j+1;
+                    }
+                    if found==true { resolved=resolved+1; }
+                    else {
+                        code=310;
+                        error_line=name.line;
+                        error_column=name.column;
+                    }
+                }
+            }
+        }
+        id=id+1;
+    }
+    if code==0 {
+        out[0]=callable_count;
+        out[1]=calls;
+        out[2]=resolved;
+    } else if code==310 {
+        out[0]=error_line;
+        out[1]=error_column;
+    }
+    rt_free(runtime(),scratch);
+    rt_free(runtime(),mask);
+    return code;
+}

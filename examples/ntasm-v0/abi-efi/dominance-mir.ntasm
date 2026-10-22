@@ -1,0 +1,22 @@
+module dominance.m
+target x86_64-nexora-uefi
+default_abi efi-x64-v0
+section .text {
+fn leaf(in a:u64,in b:u64,in c:u64,in d:u64,in e:u64)->u64
+effects {}
+clobbers {} { return a+e
+}
+fn side()->u64
+effects {}
+clobbers {} { return 99
+}
+export fn main(in cond:bool)->u64
+effects {}
+clobbers {rax} {
+if cond { let hidden:u64 = side();
+} else { nop
+}
+let answer:u64 = leaf(1,2,3,4,5);
+return answer+777
+}
+}

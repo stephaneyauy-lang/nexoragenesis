@@ -1,0 +1,11 @@
+module app_data_import
+target x86_64-nexora-uefi
+import math_data.step as step: u64
+section .text {
+    export fn main()->u64
+    effects {reads_mem(user)}
+    clobbers {rax} {
+        load rax,[step]:ptr<user,u64>
+        return rax
+    }
+}

@@ -1,0 +1,6 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+case,B18-X00,file,legacy/ntasm-s0/b1-8/B18-X00-section-name-case.ntasm,53,a75527629389cd569863cd782b150310ea3289bc0cf1d44f332c435831d46340,NGS0 E200 L0004 C0009 O0000002C
+case,B18-X01,file,legacy/ntasm-s0/b1-8/B18-X01-rights-case.ntasm,53,044e0887d774dba50e783d078347dfac104d4515de41f7cad4f63801f27deb9b,NGS0 E200 L0004 C000F O00000032
+boundary,B18-X02,file,legacy/ntasm-s0/b1-8/B18-X02-data-keyword-boundary.ntasm,63,17f8cadcf24e730f8fc3f4f1454c54b2eec596ceede90616f825373f080f4f72,NGS0 E400 L0005 C0001 O00000035
+position,B18-X03,file,legacy/ntasm-s0/b1-8/B18-X03-indented-data.ntasm,62,0b585aae328fdfe076912a02e17365eb06d670b3978707a409780910c13073f0,NGS0 E202 L0005 C0003 O00000037
+eol,B18-X04,file,legacy/ntasm-s0/b1-8/B18-X04-minimal-text-header-crlf.ntasm,57,b2a8b89415fed05a3b7ff9a5a56a2e0aee33dc9a741118f6173822e25a65de20,NG_S0_T08_OK

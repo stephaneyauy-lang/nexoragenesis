@@ -1,0 +1,8 @@
+module nova_source_emit_probe_entry;
+
+import nova_source_emit;
+
+export fn main(source: buf<u8>, nodes: buf<u64>, count: u64,
+               out: buf<u8>, length: buf<u64>, report: buf<u64>) -> u64 {
+    return nova_source_emit.emit(source, nodes, count, out, length, report);
+}

@@ -1,0 +1,2230 @@
+module nova_machine_lower;
+import machine_ir;
+import machine_pipeline;
+import ntasm_ast;
+import ntasm_parser;
+import ntir;
+
+// Only declarations travel through NTASM. Every executable instruction below
+// is constructed from the resolved Nova AST, through the common MIR writer.
+// Provenance: MIR node/origin IDs and line/column belong exclusively to the
+// actual declaration NTIR and declaration text. Native body operations use
+// the containing function declaration as a contextual origin, not as a claim
+// that the executable Nova body exists in that NTIR. No Nova location is
+// written into these MIR fields. Native AST refusals (phase 2) report Nova
+// node/line/code/column; verifier/emitter refusals retain their own reports
+// in declaration coordinates with the MIR record ID. Precise Nova locations
+// for emitted records require a separate sidecar, which is not provided here.
+export fn E_UNSUPPORTED()->u64 { return 970; }
+export fn E_AST()->u64 { return 971; }
+export fn E_BOUND()->u64 { return 972; }
+// E_ROOT IS THE ROOT SELECTION'S OWN REFUSAL: the root module has no main,
+// has more than one, or has its main in another module.
+export fn E_ROOT()->u64 { return 973; }
+struct V { id:u64, width:u64, sign:u64, class:u64, owned_next:V, length:u64 }
+// THE MULTI-SOURCE CONTEXT. It is EMPTY in the mono path: that path has one
+// source, one module and no spans, and the core reads both cases the same
+// way. `program` is the frontend's program node, the root of every source's
+// module node; `spans` is the frontend's span table (an offset and a length
+// per source); `modules` is the frontend's unit table (nine words per
+// source); `root_idx` is the root's SOURCE index, zero based.
+struct Many { program:u64, spans:buf<u64>, span_count:u64, modules:buf<u64>, root_idx:u64, multi:u64 }
+struct FunctionIndex { nodes:buf<u64>,imports:buf<u64>,declared:u64,reachable:u64,emitted:u64 }
+struct L {
+    source:buf<u8>,nodes:buf<u64>,count:u64,text:buf<u8>,at:u64,
+    nt:buf<u64>,nt_count:u64,b:machine_ir.Builder,
+    bindings:buf<u64>,functions:buf<u64>,heads:buf<u64>,active:buf<u64>,breaks:buf<u64>,break_count:u64,
+    code:u64,node:u64,origin:u64,current_fn:u64,return_type:u64,depth:u64,owned_head:V,
+    abi2:u64,main_node:u64,wrapper_origin:u64,context:u64,
+    lengths:buf<u64>,structs:buf<u64>,runtime_origin:u64,runtime_sig:u64,fault_node:u64,
+    access_handle:u64,access_offset:u64,access_spec:u64,
+    lits:buf<u64>,litv:buf<u64>,lit_count:u64,lit_chunks:u64,
+    dec_byte:u64,dec_next:u64,runtime_mask:u64,
+    many:Many,src_index:u64,rel_offset:u64,root_module:u64,helper_origin:u64,
+    // THE CLOSED APPLICATION MODE. `closed` is the EXPLICIT FLAG of the mode
+    // and it is not the ABI: `abi2` says which ABI, this says whether the
+    // program is closed. The five buffers below are the marking's own and
+    // they exist only in the closed mode; in the normal mode they are the
+    // empty buffer and are never read and never freed.
+    closed:u64,work:buf<u64>,queue:buf<u64>,reach:buf<u64>,fnord:buf<u64>,seen:buf<u64>,litlive:buf<u64>,
+    // THE BATCH. `batch` is the mode's own flag; `batch_start` and
+    // `batch_limit` are RANKS, zero based, in the REACHABLE functions taken
+    // in ORDINAL ORDER, and they name the functions this object DEFINES.
+    // `batchord` is the reachable functions in that order and `batchsel`
+    // says which of them this object defines. `batch_count` is the number of
+    // reachable functions and `batch_selected` the number this object owns.
+    batch:u64,batch_start:u64,batch_limit:u64,batchord:buf<u64>,batchsel:buf<u64>,
+    batch_count:u64,batch_selected:u64,runtime_import:u64,sig_ret:u64,
+    // All function nodes in AST order, including unreachable declarations.
+    // Owned separately from the marking tables; absent in the normal mode.
+    funcidx:FunctionIndex
+}
+fn bad(l:L,node:u64,code:u64)->u64 {
+    // THE BUILDER'S REFUSAL HAS PRIORITY OVER THE LOWER'S OWN.
+    //
+    // A FULL IMAGE MAKES THE BUILDER REFUSE, and every refusal stated after
+    // that is a CONSEQUENCE of it: a coercion that cannot see a value because
+    // the record that holds the value was never written, a shape that does not
+    // add up because the record it wanted is the one that did not fit.
+    //
+    // REPORTING THE CONSEQUENCE INSTEAD OF THE CAUSE SENDS THE READER TO THE
+    // WRONG LINE, and the cause is the one that says the capacity was
+    // exhausted. MEASURED on the full audit: the image filled to exactly
+    // floor((capacity-10)/24) records, the builder said E_HEADER, and the
+    // lower answered 971 as if the program were malformed.
+    //
+    // THE BUILDER DOES NOT EXIST YET AT THE DECLARATION AND THE ROOT
+    // REFUSALS: `l.b` is NULL there, because the writer is created after the
+    // declaration text is written. THE TEST IS SHORT-CIRCUITED so a null
+    // handle is never read as a builder, and the FIRST refusal is the one that
+    // is kept.
+    if l.b!=null && l.b.code!=0 {
+        if l.code==0 { l.code=l.b.code;l.node=node; }
+        return l.code;
+    }
+    if l.code==0 { l.code=code;l.node=node; }
+    return code;
+}
+fn n(l:L,node:u64,field:u64)->u64 {
+    if node==0 || node>l.count || field>=16 { bad(l,node,E_AST());return 0; }
+    return l.nodes[(node-1)*16+field];
+}
+fn scalar_width(ty:u64)->u64 {
+    if ty==1 || ty==5 { return 8; } if ty==2 || ty==6 { return 16; }
+    if ty==3 || ty==7 { return 32; } if ty==4 || ty==8 { return 64; }
+    if ty==9 { return 1; } return 0;
+}
+fn sign(ty:u64)->u64 { if ty>=5 && ty<=8 { return 1; }return 0; }
+fn buffer_type(ty:u64)->bool { return ty==10 || ty==11; }
+fn element_bytes(ty:u64)->u64 { if ty==11 { return 8; }return 1; }
+fn bits(l:L,ty:u64)->u64 {
+    let scalar:u64=scalar_width(ty);if scalar!=0 { return scalar; }
+    if l.abi2!=0 {
+        if ty>=10 && ty<=12 { return 64; }
+        if ty>12 && ty<len(l.structs) && l.structs[ty]!=0 { return 64; }
+    }
+    return 0;
+}
+fn owned(l:L,id:u64,bits:u64,signed:u64,class:u64)->V {
+    let v:V=V{id:id,width:bits,sign:signed,class:class,owned_next:l.owned_head,length:0};
+    l.owned_head=v;return v;
+}
+fn release_values(l:L)->u64 {
+    let mut cur:V=l.owned_head;
+    while cur!=null { let next:V=cur.owned_next;rt_free(runtime(),cur);cur=next; }
+    l.owned_head=null;return 0;
+}
+fn empty(l:L)->V { return owned(l,0,0,0,0); }
+fn byte(l:L,x:u64)->u64 {
+    if l.code!=0 { return l.code; }
+    if l.at>=len(l.text) { return bad(l,0,E_BOUND()); }
+    l.text[l.at]=u8(x&255);l.at=l.at+1;return 0;
+}
+fn text(l:L,s:buf<u8>)->u64 { let mut i:u64=0;while i<len(s) && l.code==0 { byte(l,s[i]);i=i+1; }return l.code; }
+// THE WRITER IS BORROWED, THE BUFFER IS OWNED HERE.
+//
+// A string literal is a RUNTIME BUFFER, and one that is copied into the text
+// and never freed is one LIVE BUFFER for the rest of the run. The audit's own
+// allocation map measured this site at seven thousand live buffers against the
+// runtime's sixty five thousand, and the table filled up.
+//
+// The free is on EVERY path, including the early return the borrowed writer
+// takes when the text is already refused, and the handle is freed ONCE: the
+// owner hands it over and does not touch it again. The bytes written, the
+// ids, the spans and the limits are the writer's, unchanged.
+fn write_owned(l:L,s:buf<u8>)->u64 {
+    let code:u64=text(l,s);
+    rt_free(runtime(),s);
+    return code;
+}
+fn literal(l:L,id:u64)->u64 {
+    if id==1 { let s:buf<u8>="u8";return write_owned(l,s); }
+    if id==2 { let s:buf<u8>="u16";return write_owned(l,s); }
+    if id==3 { let s:buf<u8>="u32";return write_owned(l,s); }
+    if id==4 { let s:buf<u8>="u64";return write_owned(l,s); }
+    if id==5 { let s:buf<u8>="i8";return write_owned(l,s); }
+    if id==6 { let s:buf<u8>="i16";return write_owned(l,s); }
+    if id==7 { let s:buf<u8>="i32";return write_owned(l,s); }
+    if id==8 { let s:buf<u8>="i64";return write_owned(l,s); }
+    if id==9 { let s:buf<u8>="bool";return write_owned(l,s); }
+    if id==10 { let s:buf<u8>="module nova.native\ntarget x86_64-nexora-uefi\ndefault_abi efi-x64-v0\nsection .text {\n";return write_owned(l,s); }
+    if id==11 { let s:buf<u8>="export ";return write_owned(l,s); }
+    if id==12 { let s:buf<u8>="fn ";return write_owned(l,s); }
+    if id==13 { let s:buf<u8>="main";return write_owned(l,s); }
+    if id==14 { let s:buf<u8>="native_fn_";return write_owned(l,s); }
+    if id==15 { let s:buf<u8>="in p";return write_owned(l,s); }
+    if id==16 { let s:buf<u8>=")->";return write_owned(l,s); }
+    if id==17 { let s:buf<u8>=" effects {} clobbers {rax} { return ";return write_owned(l,s); }
+    if id==18 { let s:buf<u8>="false";return write_owned(l,s); }
+    if id==19 { let s:buf<u8>="; }\n";return write_owned(l,s); }
+    if id==20 { let s:buf<u8>="}\n";return write_owned(l,s); }
+    if id==21 { let s:buf<u8>="_";return write_owned(l,s); }
+    if id==22 { let s:buf<u8>=" effects {reads_mem(user),writes_mem(user),changes_flags} clobbers {rax} { return ";return write_owned(l,s); }
+    if id==23 { let s:buf<u8>="export fn main(in ctx:u64,in args:u64,in count:u64)->u64 effects {reads_mem(user),writes_mem(user),changes_flags} clobbers {rax} {return 0;}\n";return write_owned(l,s); }
+    if id==24 { let s:buf<u8>="fn nova_runtime_signature(in ctx:u64,in a:u64,in b:u64,in c:u64)->u64 effects {reads_mem(user),writes_mem(user),changes_flags} clobbers {rax,rcx,rdx,r8,r9,r10,r11,rflags} {return 0;}\n";return write_owned(l,s); }
+    // The storage section and the three pieces of a storage item. The section
+    // name is the NXO section id 2 (`.rdata`), and the item is a `u64` because
+    // that is the widest unit `machine_emit`'s data layout accepts.
+    if id==25 { let s:buf<u8>="section .rdata {\n";return write_owned(l,s); }
+    if id==26 { let s:buf<u8>="data ";return write_owned(l,s); }
+    if id==27 { let s:buf<u8>=": u64 = ";return write_owned(l,s); }
+    if id==28 { let s:buf<u8>=";\n";return write_owned(l,s); }
+    // The helper's effects and clobbers: the same set the runtime signature
+    // declares, because the helper CALLS the runtime through a callback. R15 is
+    // not in it: the context lives in R15 and the helper reads it from there.
+    if id==29 { let s:buf<u8>=" effects {reads_mem(user),writes_mem(user),changes_flags} clobbers {rax,rcx,rdx,r8,r9,r10,r11,rflags} { return ";return write_owned(l,s); }
+    // THE BATCH'S OWN SPELLINGS. The module head is written without the
+    // section, so the imports can come between the two, and the import lines
+    // carry the real qualified target, the real local name and the function's
+    // own signature.
+    if id==30 { let s:buf<u8>="module nova.native\ntarget x86_64-nexora-uefi\ndefault_abi efi-x64-v0\n";return write_owned(l,s); }
+    if id==31 { let s:buf<u8>="section .text {\n";return write_owned(l,s); }
+    if id==32 { let s:buf<u8>="import nova.native.";return write_owned(l,s); }
+    if id==33 { let s:buf<u8>=" as ";return write_owned(l,s); }
+    if id==34 { let s:buf<u8>=": fn";return write_owned(l,s); }
+    if id==35 { let s:buf<u8>="effects {reads_mem(user),writes_mem(user),changes_flags}\n";return write_owned(l,s); }
+    if id==36 { let s:buf<u8>="clobbers {rax}\n";return write_owned(l,s); }
+    if id==37 { let s:buf<u8>="effects {reads_mem(user),writes_mem(user),changes_flags}\nclobbers {rax,rcx,rdx,r8,r9,r10,r11,rflags}\n";return write_owned(l,s); }
+    if id==38 { let s:buf<u8>="import nova.native.nova_runtime_signature as nova_runtime_signature: fn(in ctx:u64,in a:u64,in b:u64,in c:u64)->u64\n";return write_owned(l,s); }
+    if id==39 { let s:buf<u8>=": fn(in p0:u64,in p1:u64,in p2:u64,in p3:u64,in p4:u64,in p5:u64)->u64\n";return write_owned(l,s); }
+    if id==40 { let s:buf<u8>="data nova_lit_";return write_owned(l,s); }
+    return bad(l,0,E_AST());
+}
+// ---- string literals --------------------------------------------------------
+// A Nova string literal is a STORAGE ITEM in the generated NTASM declaration,
+// and the address of that item is the pointer the runtime copies from. The
+// scan below runs BEFORE the declaration text is written, because the text is
+// parsed once and the data has to be inside it: a string that is not in the
+// text has no address to take.
+//
+// THE ITEM IS A `u64`, NOT AN ARRAY. `machine_emit`'s `data_layout` refuses a
+// storage `data` whose ELEMENT COUNT is not zero (`W(e,r,14)!=0` is a
+// refusal), so an array-typed `data` would be refused by the emitter instead
+// of laid out. Eight bytes is the widest unit that layout accepts, and
+// consecutive items are CONTIGUOUS because each one is aligned to its own
+// width, so a string of N bytes is ceil(N/8) items and one address.
+//
+// THE ESCAPES ARE THE LEXER'S OWN SET, read from `nova_language_parse.nova`'s
+// scanner: `\n` `\r` `\t` `\0` `\\` `\"` and `\xHH`. Any other escape is a
+// refusal here exactly as it is there, and a byte the scanner would have
+// passed through (every byte above 0x7f, so UTF-8) is passed through here.
+// THE DECODER WRITES ITS ANSWER INTO THE CONTEXT AND NOT INTO A FRESH CELL.
+// A struct value in this dialect is a heap cell with a lifetime, and one cell
+// per decoded byte would be a leak per byte; the context carries the byte and
+// the cursor instead, and nothing is allocated at all.
+fn hex_digit(c:u64)->u64 {
+    if c>=48 && c<=57 { return c-48; }
+    if c>=97 && c<=102 { return c-97+10; }
+    if c>=65 && c<=70 { return c-70+10; }
+    return 255;
+}
+fn decode_at(l:L,at:u64,end:u64)->u64 {
+    if at>=end { return 0; }
+    let c:u64=l.source[at];
+    if c!=92 { l.dec_byte=c;l.dec_next=at+1;return 1; }
+    if at+1>=end { return 0; }
+    let e:u64=l.source[at+1];
+    if e==110 { l.dec_byte=10;l.dec_next=at+2;return 1; }
+    if e==114 { l.dec_byte=13;l.dec_next=at+2;return 1; }
+    if e==116 { l.dec_byte=9;l.dec_next=at+2;return 1; }
+    if e==48 { l.dec_byte=0;l.dec_next=at+2;return 1; }
+    if e==92 { l.dec_byte=92;l.dec_next=at+2;return 1; }
+    if e==34 { l.dec_byte=34;l.dec_next=at+2;return 1; }
+    if e==120 {
+        if at+3>=end { return 0; }
+        let h1:u64=hex_digit(l.source[at+2]);let h2:u64=hex_digit(l.source[at+3]);
+        if h1>15 || h2>15 { return 0; }
+        l.dec_byte=h1*16+h2;l.dec_next=at+4;return 1;
+    }
+    return 0;
+}
+// WHETHER A LITERAL IS EMITTED.
+//
+// THE MARKING MARKS THE LITERALS AS IT WALKS: a literal node the walk
+// reaches belongs to a REACHABLE function, and a literal it never reaches
+// belongs to a function the root module's main cannot call. The normal mode
+// emits every literal of the program, and the closed mode emits the
+// literals of the reachable functions and no other: the same marking that
+// chose the declarations chooses the data.
+//
+// THE FLAG IS NOT THE WALK'S OWN "SEEN" FLAG: a node that was pushed is not
+// a node that was visited, and only a visited literal is a live one.
+fn literal_is_live(l:L,node:u64)->bool {
+    // THE NORMAL PROFILE EMITS EVERY LITERAL. The closed profile emits the
+    // literals of the reachable functions, and a batch emits the literals of
+    // the functions it DEFINES: the owner is the ordinal the marking walk
+    // recorded, and the object that carries the function carries its data.
+    if l.closed==0 && l.batch==0 { return true; }
+    if node==0 || node>l.count { return false; }
+    let owner:u64=l.litlive[node];
+    if owner==0 { return false; }
+    return defines(l,owner);
+}
+// THE COUNT, over the WHOLE resolved Nova AST. The descriptor is six words:
+// the node, the decoded length, the item count, the base of the item values,
+// and the name span of the FIRST item, which is the address the body takes.
+fn count_literals(l:L)->u64 {
+    let mut literals:u64=0;let mut chunks:u64=0;let mut i:u64=1;
+    while i<=l.count {
+        if n(l,i,0)==15 && n(l,i,13)==4 && literal_is_live(l,i) {
+            let len:u64=n(l,i,15);
+            literals=literals+1;
+            if len>0 { chunks=chunks+(len+7)/8; }
+        }
+        i=i+1;
+    }
+    l.lit_count=literals;l.lit_chunks=chunks;return 0;
+}
+fn decode_literals(l:L)->u64 {
+    let mut index:u64=0;let mut base:u64=0;let mut i:u64=1;
+    while i<=l.count && l.code==0 {
+        if n(l,i,0)==15 && n(l,i,13)==4 && literal_is_live(l,i) {
+            let len:u64=n(l,i,15);
+            let mut chunks:u64=0;if len>0 { chunks=(len+7)/8; }
+            let a:u64=n(l,i,5);let z:u64=n(l,i,6);
+            // THE SPAN ITSELF: ORDERED, INSIDE THE SOURCE, LONG ENOUGH TO HOLD
+            // TWO QUOTES, AND OPENING AND CLOSING ON A QUOTE. A forged node
+            // count must not make the decoder read outside its span.
+            if z>len(l.source) || a>z || z-a<2 || a+1>z { bad(l,i,E_AST());break; }
+            if l.source[a]!=34 || l.source[z-1]!=34 { bad(l,i,E_AST());break; }
+            let mut at:u64=a+1;let stop:u64=z-1;
+            let mut produced:u64=0;let mut written:u64=0;
+            let mut chunk:u64=0;let mut shift:u64=0;
+            while produced<len && l.code==0 {
+                if decode_at(l,at,stop)==0 { bad(l,i,E_AST());break; }
+                chunk=chunk|(l.dec_byte<<shift);shift=shift+8;
+                if shift==64 { l.litv[base+written]=chunk;written=written+1;chunk=0;shift=0; }
+                produced=produced+1;at=l.dec_next;
+            }
+            // THE WHOLE SPAN WAS CONSUMED, and the decoded count is the lexer's
+            // count. Either disagreement is a refusal rather than a silently
+            // truncated string.
+            if l.code==0 && at!=stop { bad(l,i,E_AST()); }
+            if l.code==0 && produced!=len { bad(l,i,E_AST()); }
+            if l.code==0 && shift!=0 { l.litv[base+written]=chunk;written=written+1; }
+            if l.code==0 && written!=chunks { bad(l,i,E_AST()); }
+            let desc:u64=index*6;
+            l.lits[desc]=i;l.lits[desc+1]=len;l.lits[desc+2]=chunks;l.lits[desc+3]=base;
+            base=base+chunks;index=index+1;
+        }
+        i=i+1;
+    }
+    return l.code;
+}
+fn literal_index(l:L,node:u64)->u64 {
+    // THE TABLE HOLDS THE EMITTED DESCRIPTORS AND NO OTHER: the closed mode
+    // does not decode the literals of an unreachable function, so a literal
+    // that is not emitted has no index and no address.
+    let mut i:u64=0;
+    while i<l.lit_count {
+        if l.lits[i*6]==node { return i+1; }
+        i=i+1;
+    }
+    return 0;
+}
+fn decimal(l:L,x:u64)->u64 {
+    if x>=10 { decimal(l,x/10); }
+    return byte(l,48+x%10);
+}
+fn type_text(l:L,ty:u64)->u64 {
+    if l.abi2!=0 && ty>=10 && bits(l,ty)==64 { return literal(l,4); }
+    if ty==1 { return literal(l,1); } if ty==2 { return literal(l,2); }
+    if ty==3 { return literal(l,3); } if ty==4 { return literal(l,4); }
+    if ty==5 { return literal(l,5); } if ty==6 { return literal(l,6); }
+    if ty==7 { return literal(l,7); } if ty==8 { return literal(l,8); }
+    if ty==9 { return literal(l,9); }return bad(l,0,E_UNSUPPORTED());
+}
+fn is_main(l:L,fn_node:u64)->bool {
+    let a:u64=n(l,fn_node,5);let z:u64=n(l,fn_node,6);
+    if z<a || z>len(l.source) || z-a!=4 { return false; }
+    return l.source[a]==109 && l.source[a+1]==97 && l.source[a+2]==105 && l.source[a+3]==110;
+}
+// THE SOURCE AN OFFSET BELONGS TO, AND THE OFFSET INSIDE THAT SOURCE.
+//
+// THE SPANS ARE THE FRONTEND'S OWN, so the answer is a MEASUREMENT and not a
+// convention: a blob with a span table says which file each range of bytes
+// came from. Without them the source index is one and the offset is the
+// absolute one in the blob, and every file but the first is then reported at
+// the wrong place. The mono path has no spans and keeps its own answer.
+fn locate(l:L,offset:u64)->u64 {
+    l.src_index=1;l.rel_offset=offset;
+    if l.many.multi==0 { return 1; }
+    let mut i:u64=1;
+    while i<=l.many.span_count {
+        let start:u64=l.many.spans[(i-1)*2];
+        let len:u64=l.many.spans[(i-1)*2+1];
+        if len!=0 && offset>=start && offset<start+len {
+            l.src_index=i;l.rel_offset=offset-start;return i;
+        }
+        i=i+1;
+    }
+    return 1;
+}
+// THE MODULE A DECLARATION BELONGS TO. The module node is the declaration's
+// parent, and the module nodes hang from the program node in SOURCE ORDER, so
+// the child's ordinal is the source index and the unit table answers the
+// module id. Zero when the declaration is not under a module.
+fn module_of(l:L,node:u64)->u64 {
+    if l.many.multi==0 { return 0; }
+    let owner:u64=n(l,node,1);
+    if owner==0 { return 0; }
+    let mut child:u64=n(l,l.many.program,2);
+    let mut index:u64=1;
+    while child!=0 && index<=l.many.span_count {
+        if child==owner { return l.many.modules[(index-1)*9+2]; }
+        child=n(l,child,4);index=index+1;
+    }
+    return 0;
+}
+// THE ROOT'S MAIN. It must EXIST, it must be UNIQUE, and it must BELONG TO
+// THE ROOT MODULE. Three different refusals, and choosing one of them
+// SILENTLY would lower a program the caller did not ask for: a root without
+// a main, two mains anywhere, and a single main that belongs to another
+// module.
+fn select_root_main(l:L)->u64 {
+    let mut mains:u64=0;let mut found:u64=0;let mut i:u64=1;
+    while i<=l.count {
+        if n(l,i,0)==5 && is_main(l,i) { mains=mains+1;found=i; }
+        i=i+1;
+    }
+    if mains==0 { return bad(l,0,E_ROOT()); }
+    if mains>1 { return bad(l,found,E_ROOT()); }
+    if module_of(l,found)!=l.root_module { return bad(l,found,E_ROOT()); }
+    l.main_node=found;return 0;
+}
+// ---- the closed application mode --------------------------------------------
+//
+// A CLOSED APPLICATION IS ONE WHOSE WHOLE PROGRAM IS REACHABLE FROM THE MAIN
+// OF ITS ROOT MODULE. The frontend has already resolved the program into ONE
+// tree with GLOBAL ORDINALS, so "which functions does this program actually
+// use" is a question about that tree: a DIRECT CALL (a K_CALL whose aux is
+// zero) carries the ORDINAL of the function it calls, and a declaration
+// carries the ordinal it was bound at.
+//
+// THE ROOTS ARE THE ROOT MODULE'S MAIN AND NOTHING ELSE. This dialect has no
+// function-as-a-value: a name that is not a binding is refused by the
+// frontend, and a call is the only way to enter a function, so there is no
+// function whose address is taken and no root to keep for it. The WRAPPER,
+// the RUNTIME SIGNATURE and the HELPER are the lower's own and are always
+// emitted.
+//
+// THE MARKING IS LINEAR. Each reachable function's own subtree is walked ONCE,
+// the walk is ITERATIVE with an explicit stack (so a body deeper than the
+// expression depth cap is not a refusal here), and a node is pushed at most
+// once (so the stack cannot outgrow the tree). There is no rescan of the tree
+// per call.
+//
+// THE TREE IS CHECKED WHILE IT IS WALKED, and every check is a refusal and
+// not a repair: a child out of bounds, a child whose parent is not the node
+// it hangs from, a node reached twice (a cycle or a node shared by two
+// parents), a sibling chain longer than the tree itself, and a call that
+// names a function which does not exist. A malformed tree is refused; it is
+// never walked into an answer.
+fn index_functions(l:L)->u64 {
+    // THE FUNCTIONS OF THE PROGRAM, BY THEIR GLOBAL ORDINAL. The scan is
+    // linear over the resolved tree and it refuses NOTHING: the validation of
+    // an ordinal stays where it was, in `declarations`, so the normal
+    // profile's verdicts do not move.
+    let mut i:u64=1;let mut total:u64=0;
+    while i<=l.count {
+        if n(l,i,0)==5 {
+            total=total+1;
+            let ord:u64=n(l,i,15);
+            if ord!=0 && ord<=l.count && l.fnord[ord]==0 { l.fnord[ord]=i; }
+        }
+        i=i+1;
+    }
+    l.funcidx.declared=total;return 0;
+}
+fn mark_reachable(l:L)->u64 {
+    // THE ROOT MODULE'S MAIN IS THE FIRST ROOT, and the mode needs a root
+    // module: the mono profile has none and its main is chosen by position
+    // later, so the closed mode refuses it rather than guess.
+    if l.many.multi==0 { return bad(l,0,E_UNSUPPORTED()); }
+    let main_ord:u64=n(l,l.main_node,15);
+    if main_ord==0 || main_ord>l.count { return bad(l,l.main_node,E_AST()); }
+    if l.fnord[main_ord]==0 { return bad(l,l.main_node,E_AST()); }
+    l.reach[main_ord]=1;
+    l.queue[0]=main_ord;
+    let mut head:u64=0;let mut tail:u64=1;let mut live:u64=1;
+    while head<tail {
+        let ord:u64=l.queue[head];head=head+1;
+        let fnode:u64=l.fnord[ord];
+        if fnode!=0 {
+            // THE WALK OF ONE FUNCTION'S OWN SUBTREE. The stack holds the
+            // nodes still to visit and `seen` says which ones are already on
+            // it, so a node is pushed at most once and the stack cannot
+            // outgrow the tree: it holds at most one entry per node.
+            let mut sp:u64=0;
+            if l.seen[fnode]!=0 { return bad(l,fnode,E_AST()); }
+            l.work[sp]=fnode;sp=sp+1;l.seen[fnode]=ord;
+            while sp>0 {
+                sp=sp-1;
+                let x:u64=l.work[sp];
+                // A LITERAL BELONGS TO THE FUNCTION THAT HOLDS IT, and the
+                // walk knows which one that is: the ORDINAL of the function
+                // being walked. The owner is kept, and not a flag, because the
+                // batch's own choice of functions is made after the walk.
+                if n(l,x,0)==15 && n(l,x,13)==4 { l.litlive[x]=ord; }
+                if n(l,x,0)==17 && n(l,x,13)==0 {
+                    // A DIRECT CALL: the aux is zero and the ordinal names the
+                    // function called. An intrinsic call carries its own
+                    // descriptor in the aux and names no function.
+                    let target:u64=n(l,x,15);
+                    if target==0 || target>l.count { return bad(l,x,E_AST()); }
+                    if l.fnord[target]==0 { return bad(l,x,E_AST()); }
+                    if l.reach[target]==0 {
+                        l.reach[target]=1;live=live+1;
+                        l.queue[tail]=target;tail=tail+1;
+                    }
+                }
+                // THE CHILDREN OF THIS NODE. The chain of siblings is walked
+                // with a bound of the tree's own size, so a chain that does
+                // not end is a refusal and not a loop, and every child is
+                // checked against the node it hangs from.
+                let mut child:u64=n(l,x,2);
+                let mut steps:u64=0;
+                while child!=0 {
+                    if steps>=l.count { return bad(l,x,E_AST()); }
+                    if child>l.count { return bad(l,child,E_AST()); }
+                    if n(l,child,1)!=x { return bad(l,child,E_AST()); }
+                    steps=steps+1;
+                    // A NODE REACHED TWICE IS A CYCLE OR A NODE SHARED BY TWO
+                    // PARENTS, and both are a tree this dialect does not
+                    // produce.
+                    if l.seen[child]!=0 { return bad(l,child,E_AST()); }
+                    // Nonzero still means visited; the ordinal additionally
+                    // records the owning function for the batch's direct calls.
+                    l.seen[child]=ord;
+                    l.work[sp]=child;sp=sp+1;
+                    child=n(l,child,4);
+                }
+            }
+        }
+    }
+    // THE THREE FUNCTIONS THE LOWER WRITES FOR EVERY PROGRAM: the wrapper
+    // entry, the runtime signature and the helper. They are SYNTHETIC: they
+    // are not the program's own functions, and they are counted apart. The
+    // MONO PROFILE HAS NO WRAPPER, so it writes none and carries none.
+    //
+    // A LATER BATCH IMPORTS THE TWO OF THEM IT NEEDS and defines neither, so
+    // its unit carries two synthetic declarations and not three: the count
+    // says what the unit carries and not what the program has.
+    l.funcidx.reachable=live;
+    if l.abi2!=0 {
+        if is_later_batch(l) { l.funcidx.emitted=live+2; } else { l.funcidx.emitted=live+3; }
+    } else { l.funcidx.emitted=live; }
+    return 0;
+}
+// ---- the batch --------------------------------------------------------------
+//
+// A BATCH IS A PART OF THE PROGRAM, COMPILED ALONE. It DEFINES the functions
+// its ranks name and IMPORTS their direct callees outside this batch, so the
+// parts can be compiled one at a time and joined afterwards.
+//
+// THE RANKS ARE RANKS, NOT ORDINALS: the reachable functions, in ordinal
+// order, numbered from zero. The ordinals themselves never move: the name of
+// a function is built from its global ordinal, so the same function has the
+// same name in every batch and the merge can match the names.
+//
+// THE IMPORTS ARE REAL. An import is a declaration in the text, with the
+// function's own signature, and the machine IR lowers it as a callable
+// without a body. The call sites name the imported function by its local
+// name, which is the name the definition carries, so the two objects agree
+// on it without either of them knowing the other exists.
+fn defines(l:L,ord:u64)->bool {
+    // DOES THIS OBJECT CARRY THE FUNCTION'S BODY?
+    if l.batch!=0 { if ord==0 || ord>l.count { return false; } return l.batchsel[ord]!=0; }
+    if l.closed!=0 { if ord==0 || ord>l.count { return false; } return l.reach[ord]!=0; }
+    return true;
+}
+// IS THIS OBJECT THE FIRST ONE? The normal profile and the closed profile
+// are one object each, and the first batch is the one that owns the entry,
+// the runtime signature and the helper. The LATER batches import the two of
+// them they need and have no body for either.
+fn is_first_batch(l:L)->bool { return l.batch==0 || l.batch_start==0; }
+fn is_later_batch(l:L)->bool { return l.batch!=0 && l.batch_start!=0; }
+fn is_reachable(l:L,ord:u64)->bool {
+    // IS THE FUNCTION IN THE PROGRAM AT ALL, IN THE CLOSED AND THE BATCH
+    // PROFILES? The normal profile carries every function, so it answers
+    // yes without reading a table it did not fill.
+    if l.closed==0 && l.batch==0 { return true; }
+    if ord==0 || ord>l.count { return false; }
+    return l.reach[ord]!=0;
+}
+fn select_batch(l:L)->u64 {
+    // THE REACHABLE FUNCTIONS IN ORDINAL ORDER, AND THE RANKS THIS OBJECT
+    // OWNS. A LIMIT OF ZERO IS A REFUSAL AND NOT AN EMPTY BATCH: an empty
+    // batch would be an object with nothing in it, and a batch that starts
+    // past the last function is a range that names nothing.
+    let mut rank:u64=0;let mut ord:u64=1;
+    while ord<=l.count {
+        if l.reach[ord]!=0 { l.batchord[rank]=ord;rank=rank+1; }
+        ord=ord+1;
+    }
+    l.batch_count=rank;
+    if l.batch_limit==0 { return bad(l,0,E_BOUND()); }
+    if l.batch_start>=rank { return bad(l,0,E_BOUND()); }
+    // THE RANGE IS THE SMALLER OF WHAT WAS ASKED FOR AND WHAT IS LEFT, and
+    // it is never computed as a sum: a limit of UINT64_MAX must select every
+    // function that is left and not wrap around to an empty range.
+    let remaining:u64=rank-l.batch_start;
+    let mut take:u64=l.batch_limit;
+    if take>remaining { take=remaining; }
+    let mut r:u64=l.batch_start;
+    let mut done:u64=0;
+    while done<take {
+        l.batchsel[l.batchord[r]]=1;
+        r=r+1;done=done+1;
+    }
+    l.batch_selected=done;
+    return 0;
+}
+fn imports_function(l:L,ord:u64)->bool {
+    if l.batch==0 || ord==0 || ord>l.count { return false; }
+    return l.funcidx.imports[ord]!=0 && l.batchsel[ord]==0;
+}
+fn select_imports(l:L)->u64 {
+    // Reachability has validated every reachable subtree and direct target.
+    // Keep the same global closure and ranks; only this object's declarations
+    // shrink. Repeated calls and recursive calls require one identity each.
+    let mut i:u64=1;
+    while i<=l.count {
+        let owner:u64=l.seen[i];
+        if owner!=0 && l.batchsel[owner]!=0 && n(l,i,0)==17 && n(l,i,13)==0 {
+            l.funcidx.imports[n(l,i,15)]=1;
+        }
+        i=i+1;
+    }
+    // The wrapper is synthetic and therefore absent from the AST walk.
+    if l.abi2!=0 && is_first_batch(l) { l.funcidx.imports[n(l,l.main_node,15)]=1; }
+    let mut imported:u64=0;i=1;
+    while i<=l.count { if imports_function(l,i) { imported=imported+1; }i=i+1; }
+    l.funcidx.emitted=l.batch_selected+imported;
+    if l.abi2!=0 {
+        if is_later_batch(l) { l.funcidx.emitted=l.funcidx.emitted+2; }
+        else { l.funcidx.emitted=l.funcidx.emitted+3; }
+    }
+    return l.code;
+}
+// THE SIGNATURE OF A FUNCTION, IN THE TEXT'S OWN SPELLING: the parameters and
+// the return type. A DEFINITION AND AN IMPORT OF THE SAME FUNCTION ARE
+// WRITTEN BY THIS ONE FUNCTION, so the two spellings cannot drift.
+fn write_signature(l:L,i:u64)->u64 {
+    byte(l,40);
+    let mut p:u64=n(l,i,2);let mut params:u64=0;let mut ret:u64=0;let mut body:u64=0;let mut seen:u64=0;
+    while p!=0 && seen<l.count && l.code==0 {
+        if n(l,p,1)!=i { return bad(l,p,E_AST()); }
+        let k:u64=n(l,p,0);
+        if k==6 {
+            if ret!=0 || body!=0 || params>=64 { return bad(l,p,E_AST()); }
+            if params!=0 { byte(l,44); }
+            let ty:u64=n(l,p,14);
+            literal(l,15);decimal(l,params);byte(l,58);type_text(l,ty);params=params+1;
+            if l.abi2!=0 && buffer_type(ty) {
+                if params>=64 { return bad(l,p,E_BOUND()); }
+                byte(l,44);literal(l,15);decimal(l,params);byte(l,58);literal(l,4);params=params+1;
+            }
+        } else if k==7 {
+            if ret!=0 || body!=0 { return bad(l,p,E_AST()); }ret=n(l,p,14);
+        } else if k==8 {
+            if ret==0 || body!=0 { return bad(l,p,E_AST()); }body=p;
+        } else { return bad(l,p,E_UNSUPPORTED()); }
+        p=n(l,p,4);seen=seen+1;
+    }
+    if p!=0 || ret==0 || body==0 { return bad(l,i,E_AST()); }
+    l.sig_ret=ret;
+    literal(l,16);type_text(l,ret);
+    return l.code;
+}
+// THE IMPORTS OF A BATCH.
+//
+// A DIRECT CALLEE THIS OBJECT DOES NOT DEFINE IS IMPORTED, as is the first
+// batch's main when its wrapper needs it. The import carries the function's
+// OWN signature: the same parameters, the same return type,
+// the same effects and the same clobbers, so the merged object calls the
+// same function and the merge has nothing to reconcile.
+//
+// THE TARGET IS THE QUALIFIED NAME THE DEFINITION WILL CARRY and the local
+// name is the same spelling, so a call site here spells the name the
+// definition spells and the two objects agree on it.
+fn batch_imports(l:L)->u64 {
+    let mut i:u64=1;
+    while i<=l.count && l.code==0 {
+        if n(l,i,0)==5 {
+            let ord:u64=n(l,i,15);
+            if ord!=0 && ord<=l.count && l.reach[ord]!=0 && l.batchsel[ord]==0 {
+                if imports_function(l,ord)==false {
+                    // Preserve signature refusals, in the old import order,
+                    // even when this object does not need the declaration.
+                    // The first error survives; only tentative text is undone.
+                    let saved:u64=l.at;write_signature(l,i);l.at=saved;
+                    if l.code!=0 { return l.code; }
+                } else {
+                literal(l,32);
+                private_name(l,ord);
+                literal(l,33);
+                private_name(l,ord);
+                literal(l,34);
+                if write_signature(l,i)!=0 { return l.code; }
+                // THE SIGNATURE ENDS THE LINE: the import's type is followed
+                // by a term and its contracts come after it, so the return
+                // type and the effects are not one word.
+                byte(l,10);
+                literal(l,35);
+                literal(l,36);
+                }
+            }
+        }
+        i=i+1;
+    }
+    // THE ENTRY, THE RUNTIME SIGNATURE AND THE HELPER BELONG TO THE FIRST
+    // BATCH, and the other batches import the two of them they need: the
+    // runtime signature, which every runtime call names, and the helper,
+    // which every runtime call goes through.
+    if l.batch_start!=0 {
+        literal(l,38);
+        literal(l,37);
+        literal(l,32);
+        helper_name(l);
+        literal(l,33);
+        helper_name(l);
+        literal(l,39);
+        literal(l,37);
+    }
+    return l.code;
+}
+// THE LOCAL NAME OF A DECLARATION, WHETHER IT IS A DEFINITION OR AN IMPORT.
+//
+// A FUNCTION'S FIRST CHILD IS ITS NAME; an IMPORT'S FIRST CHILD IS THE
+// QUALIFIED TARGET and its second is the local name. The name node is the
+// one whose NTIR index is 47, and the index is read out of the image, so a
+// call site names the same local name the declaration carries.
+fn local_name_node(l:L,node:u64)->u64 {
+    // THE LOCAL NAME OF A DECLARATION, WHETHER IT IS A DEFINITION OR AN
+    // IMPORT.
+    //
+    // A FUNCTION'S FIRST CHILD IS ITS NAME. An IMPORT'S FIRST CHILD IS THE
+    // QUALIFIED TARGET and its second is the LOCAL NAME, and the name inside
+    // the qualified target is NOT the local name: it is the target's own
+    // spelling. So the import's local name is read from its second child and
+    // the function's from its first, and the index 47 says which one it is.
+    if node==0 || node>l.nt_count { return 0; }
+    let base:u64=ntir.HEADER_WORDS()+(node-1)*ntir.NODE_WORDS();
+    let mut child:u64=l.nt[base+8];
+    let mut steps:u64=0;
+    while child!=0 && child<=l.nt_count && steps<=l.nt_count {
+        let cb:u64=ntir.HEADER_WORDS()+(child-1)*ntir.NODE_WORDS();
+        if l.nt[cb]-ntir.KIND_BASE()+1==47 { return child; }
+        child=l.nt[cb+10];
+        steps=steps+1;
+    }
+    return 0;
+}
+// THE SYMBOL OF A DECLARATION: THE SPAN OF ITS LOCAL NAME, in a record that
+// is already the call site's symbol.
+fn name_symbol(l:L,node:u64,record:u64)->u64 {
+    let name:u64=local_name_node(l,node);
+    if name==0 { return 0; }
+    let np:u64=ntir.HEADER_WORDS()+(name-1)*ntir.NODE_WORDS();
+    put(l,record,5,l.nt[np+4]);put(l,record,6,l.nt[np+5]);put(l,record,8,2);
+    return record;
+}
+// THE MIR RECORD THAT CAME FROM AN NTIR NODE. The unit walk emits the
+// imports, and the lower does not create them, so the record of an imported
+// declaration is FOUND by its origin and not by a count.
+//
+// THE RECORD IS THE CALLABLE AND NOT THE FIRST RECORD THAT SHARES THE
+// ORIGIN: a declaration's records all carry the same origin, and the
+// callable is the one whose kind is 2051. The kind is checked, so a
+// parameter record with the same origin is never mistaken for it.
+fn record_of_origin(l:L,node:u64)->u64 {
+    let mut r:u64=1;
+    while r<=l.b.records {
+        let p:u64=machine_ir.HEADER_WORDS()+(r-1)*machine_ir.NODE_WORDS();
+        let mut origin:u64=l.b.out[p+1];if origin==0 { origin=l.b.out[p+18]; }
+        if origin==node && l.b.out[p]==2051 { return r; }
+        r=r+1;
+    }
+    return 0;
+}
+fn valid_name(l:L,node:u64)->bool {
+    let a:u64=n(l,node,5);let z:u64=n(l,node,6);
+    if a>=z || z>len(l.source) { bad(l,node,E_AST());return false; }
+    let mut i:u64=a;
+    while i<z {
+        let c:u64=l.source[i];
+        let letter:bool=(c>=65 && c<=90) || (c>=97 && c<=122) || c==95;
+        if letter==false && (i==a || c<48 || c>57) { bad(l,node,E_AST());return false; }
+        i=i+1;
+    }
+    return true;
+}
+fn source_name(l:L,node:u64)->u64 {
+    if valid_name(l,node)==false { return l.code; }
+    let mut i:u64=n(l,node,5);let end:u64=n(l,node,6);
+    while i<end && l.code==0 { byte(l,l.source[i]);i=i+1; }return l.code;
+}
+fn exported_name_matches(l:L,start:u64,end:u64,node:u64)->bool {
+    if valid_name(l,node)==false { return false; }
+    let a:u64=n(l,node,5);let z:u64=n(l,node,6);
+    if end-start!=z-a { return false; }
+    let mut i:u64=0;
+    while i<end-start { if l.text[start+i]!=l.source[a+i] { return false; }i=i+1; }
+    return true;
+}
+fn private_name(l:L,ord:u64)->u64 {
+    let start:u64=l.at;let mut attempt:u64=0;
+    let indexed:bool=len(l.funcidx.nodes)!=0;let mut limit:u64=l.count;
+    if indexed { limit=l.funcidx.declared; }
+    while attempt<=l.count && l.code==0 {
+        l.at=start;literal(l,14);decimal(l,ord);
+        if attempt!=0 { literal(l,21);decimal(l,attempt); }
+        let end:u64=l.at;let mut i:u64=1;let mut collision:bool=false;
+        // Reserve every public identity, including declarations later in the
+        // source. Other private bases have distinct function ordinals.
+        while i<=limit && collision==false && l.code==0 {
+            let mut node:u64=i;if indexed { node=l.funcidx.nodes[i-1]; }
+            if n(l,node,0)==5 && (n(l,node,13)==1 || is_main(l,node)) {
+                if exported_name_matches(l,start,end,node) { collision=true; }
+            }
+            i=i+1;
+        }
+        if collision==false { return l.code; }
+        attempt=attempt+1;
+    }
+    return bad(l,0,E_BOUND());
+}
+// THE HELPER'S NAME, AND IT IS COLLISION-SAFE. The candidate is checked
+// against EVERY function of the resolved program -- public and private -- and
+// a program that declares the same name still gets a helper of its own.
+fn helper_name(l:L)->u64 {
+    let start:u64=l.at;let mut attempt:u64=0;
+    let indexed:bool=len(l.funcidx.nodes)!=0;let mut limit:u64=l.count;
+    if indexed { limit=l.funcidx.declared; }
+    while attempt<=l.count && l.code==0 {
+        l.at=start;
+        byte(l,110);byte(l,97);byte(l,116);byte(l,105);byte(l,118);byte(l,101);byte(l,95);byte(l,114);byte(l,116);byte(l,95);byte(l,104);byte(l,101);byte(l,108);byte(l,112);byte(l,101);byte(l,114);
+        if attempt!=0 { byte(l,95);decimal(l,attempt); }
+        let end:u64=l.at;let mut i:u64=1;let mut collision:bool=false;
+        while i<=limit && collision==false && l.code==0 {
+            let mut node:u64=i;if indexed { node=l.funcidx.nodes[i-1]; }
+            if n(l,node,0)==5 { if exported_name_matches(l,start,end,node) { collision=true; } }
+            i=i+1;
+        }
+        if collision==false { return l.code; }
+        attempt=attempt+1;
+    }
+    return bad(l,0,E_BOUND());
+}
+fn declarations(l:L)->u64 {
+    // THE BATCH'S TEXT IS THE MODULE HEAD, THEN THE IMPORTS, THEN THE
+    // SECTION. The other profiles write the head and the section in one
+    // piece, because they have no import to write between them.
+    if l.batch!=0 {
+        literal(l,30);
+        if batch_imports(l)!=0 { return l.code; }
+        literal(l,31);
+    } else { literal(l,10); }
+    let mut i:u64=1;
+    while i<=l.count && l.code==0 {
+        if n(l,i,0)==5 {
+            if valid_name(l,i)==false { return l.code; }
+            let ord:u64=n(l,i,15);
+            if ord==0 || ord>l.count || l.functions[ord*2]!=0 { return bad(l,i,E_AST()); }
+            l.functions[ord*2]=i;
+            // THE CLOSED MODE EMITS THE REACHABLE FUNCTIONS AND NOTHING ELSE,
+            // AND A BATCH EMITS THE FUNCTIONS ITS RANKS NAME. The validation
+            // above ran for EVERY declaration, so a malformed program is
+            // refused in every mode exactly as it is in the normal one, and
+            // the ORDINAL of a declaration is kept either way: the names of
+            // the emitted functions are built from it, and they stay the
+            // global ordinals, so they stay unique and they stay the same in
+            // every batch.
+            let mut emit:bool=true;
+            if defines(l,ord)==false { emit=false; }
+            if emit {
+            // IN A BATCH EVERY DEFINED FUNCTION IS EXPORTED, because the other
+            // objects import it by name and an import names an exported
+            // symbol. The normal and the closed profiles keep their own rule:
+            // the exported ones keep their name and the others are private.
+            let mut exported:bool=false;
+            if l.abi2==0 && (is_main(l,i) || n(l,i,13)==1) { exported=true; }
+            if l.batch!=0 { exported=true; }
+            if exported { literal(l,11); }
+            // THE MONO PATH PICKS ITS MAIN HERE. THE MULTI PATH HAS ALREADY
+            // CHOSEN THE ROOT'S MAIN, by the rule that it is unique and that
+            // it belongs to the root module, so this arm must not take a
+            // second one.
+            if l.abi2!=0 && l.many.multi==0 && is_main(l,i) {
+                if l.main_node!=0 { return bad(l,i,E_AST()); }
+                l.main_node=i;
+            }
+            literal(l,12);
+            if l.abi2==0 && (is_main(l,i) || n(l,i,13)==1) { source_name(l,i); } else { private_name(l,ord); }
+            // THE SIGNATURE IS WRITTEN BY THE ONE FUNCTION THAT WRITES IT, so
+            // a definition and an import of the same function cannot drift.
+            if write_signature(l,i)!=0 { return l.code; }
+            if l.abi2==0 { literal(l,17); }else { literal(l,22); }
+            if l.sig_ret==9 { literal(l,18); } else { byte(l,48); }
+            literal(l,19);
+            }
+        }
+        i=i+1;
+    }
+    if l.abi2!=0 {
+        if l.main_node==0 { return bad(l,0,E_AST()); }
+        // THE ENTRY, THE RUNTIME SIGNATURE AND THE HELPER BELONG TO THE FIRST
+        // BATCH, and the later batches import the two of them they need. The
+        // normal and the closed profiles are one object each and they carry
+        // all three.
+        if is_first_batch(l) {
+        literal(l,23);
+        // IN A BATCH THE SYNTHETIC FUNCTIONS ARE EXPORTED, because the other
+        // objects import them by name and an import names an exported symbol.
+        if l.batch!=0 { literal(l,11); }
+        literal(l,24);
+        // THE HELPER'S DECLARATION. It is the LAST function of the unit, so the
+        // NTIR's function nodes after the runtime signature's are its own, and
+        // the lower finds it by counting them.
+        if l.batch!=0 { literal(l,11); }
+        literal(l,12);
+        helper_name(l);
+        byte(l,40);
+        literal(l,15);decimal(l,0);byte(l,58);literal(l,4);byte(l,44);
+        literal(l,15);decimal(l,1);byte(l,58);literal(l,4);byte(l,44);
+        literal(l,15);decimal(l,2);byte(l,58);literal(l,4);byte(l,44);
+        literal(l,15);decimal(l,3);byte(l,58);literal(l,4);byte(l,44);
+        literal(l,15);decimal(l,4);byte(l,58);literal(l,4);byte(l,44);
+        literal(l,15);decimal(l,5);byte(l,58);literal(l,4);
+        literal(l,16);
+        literal(l,4);
+        literal(l,29);
+        byte(l,48);
+        literal(l,19);
+        }
+    }
+    literal(l,20);
+    // THE STORAGE SECTION, AFTER THE TEXT SECTION. Every string literal of the
+    // module has its bytes here, and the address of the FIRST item of a
+    // literal is the pointer the body hands to the runtime. The names are
+    // private and cannot collide with a function: the body's functions are
+    // `main`, `nova_runtime_signature` and `native_fn_<ordinal>`.
+    if l.abi2!=0 && l.lit_count!=0 {
+        literal(l,25);
+        let mut li:u64=0;
+        while li<l.lit_count && l.code==0 {
+            let desc:u64=li*6;
+            let chunks:u64=l.lits[desc+2];let base:u64=l.lits[desc+3];
+            let mut lc:u64=0;
+            while lc<chunks && l.code==0 {
+                literal(l,26);
+                let name_start:u64=l.at;
+                byte(l,110);byte(l,111);byte(l,118);byte(l,97);byte(l,108);byte(l,105);byte(l,116);byte(l,95);
+                // THE NAME IS GLOBALLY UNIQUE. In a batch it is the literal's
+                // AST NODE and not the local counter, so two objects never
+                // carry the same storage name for two different literals.
+                if l.batch!=0 { decimal(l,l.lits[desc]); } else { decimal(l,li); }
+                byte(l,95);decimal(l,lc);
+                if lc==0 { l.lits[desc+4]=name_start;l.lits[desc+5]=l.at; }
+                literal(l,27);
+                decimal(l,l.litv[base+lc]);
+                literal(l,28);
+                lc=lc+1;
+            }
+            li=li+1;
+        }
+        literal(l,20);
+    }
+    return l.code;
+}
+fn put(l:L,r:u64,f:u64,v:u64)->u64 { return machine_ir.native_put(l.b,r,f,v); }
+fn get(l:L,r:u64,f:u64)->u64 { return machine_ir.native_get(l.b,r,f); }
+fn rec(l:L,kind:u64,node:u64)->u64 {
+    if l.code!=0 || l.b.code!=0 { return 0; }
+    return machine_ir.native_record(l.b,l.nt,l.origin,kind);
+}
+fn value_record(l:L,kind:u64,node:u64,a:u64,b:u64,taken:u64,bits:u64,signed:u64,class:u64,op:u64)->V {
+    let r:u64=rec(l,kind,node);let v:u64=machine_ir.native_value(l.b);
+    put(l,r,4,v);put(l,r,5,a);put(l,r,6,b);put(l,r,8,taken);
+    put(l,r,9,bits);put(l,r,10,signed);put(l,r,12,class);put(l,r,13,machine_ir.FLAG_PURE());put(l,r,14,op);
+    return owned(l,v,bits,signed,class);
+}
+fn constant(l:L,node:u64,amount:u64,bits:u64,signed:u64)->V {
+    let v:V=value_record(l,2058,node,amount,0,1,bits,signed,machine_ir.CLASS_CONSTANT(),0);
+    let r:u64=l.b.records;put(l,r,15,bits);return v;
+}
+fn coerce(l:L,node:u64,v:V,bits:u64,signed:u64)->V {
+    if v.id==0 || bits==0 { bad(l,node,E_AST());return empty(l); }
+    if v.width==bits && v.sign==signed && v.class!=machine_ir.CLASS_PREDICATE() { return v; }
+    let mut kind:u64=2073;let mut delta:u64=v.sign;
+    if v.width<bits { kind=2074;delta=bits-v.width; }
+    if v.width>bits { kind=2075;delta=v.width-bits; }
+    let out:V=value_record(l,kind,node,v.id,0,1,bits,signed,machine_ir.CLASS_VALUE(),v.sign);
+    put(l,l.b.records,15,delta);return out;
+}
+fn cell(l:L,node:u64,v:V,bits:u64,signed:u64)->u64 {
+    let initial:V=coerce(l,node,v,bits,signed);
+    let r:u64=rec(l,2086,node);let out:u64=machine_ir.native_value(l.b);
+    put(l,r,4,out);put(l,r,5,initial.id);put(l,r,8,1);put(l,r,9,64);
+    put(l,r,12,machine_ir.CLASS_ADDRESS());put(l,r,13,machine_ir.FLAG_SIDE_EFFECT());
+    put(l,r,14,bits);put(l,r,15,signed);return out;
+}
+fn load(l:L,node:u64,address:u64,bits:u64,signed:u64)->V {
+    let out:V=value_record(l,2067,node,address,0,1,bits,signed,machine_ir.CLASS_VALUE(),machine_ir.OP_LOAD());
+    put(l,l.b.records,13,0);return out;
+}
+fn store(l:L,node:u64,address:u64,v:V,bits:u64,signed:u64)->u64 {
+    let got:V=coerce(l,node,v,bits,signed);let r:u64=rec(l,2068,node);
+    put(l,r,5,address);put(l,r,6,got.id);put(l,r,8,2);put(l,r,9,bits);put(l,r,10,signed);
+    put(l,r,12,machine_ir.CLASS_ADDRESS());put(l,r,13,machine_ir.FLAG_SIDE_EFFECT());put(l,r,14,machine_ir.OP_STORE());return r;
+}
+fn block(l:L)->u64 { return machine_ir.native_block(l.b,l.nt,l.nt_count,l.origin); }
+fn jump(l:L,node:u64,target:u64)->u64 {
+    let r:u64=rec(l,2078,node);put(l,r,5,target);put(l,r,8,1);put(l,r,13,machine_ir.FLAG_TERMINATOR());
+    put(l,r,14,l.b.block);machine_ir.native_term(l.b,r);return r;
+}
+fn branch(l:L,node:u64,predicate:V)->u64 {
+    let r:u64=rec(l,2079,node);put(l,r,5,predicate.id);put(l,r,8,3);
+    put(l,r,12,machine_ir.CLASS_PREDICATE());put(l,r,13,machine_ir.FLAG_TERMINATOR());put(l,r,14,machine_ir.OP_BRANCH());
+    machine_ir.native_term(l.b,r);return r;
+}
+fn inferred(l:L,node:u64,depth:u64)->u64 {
+    if depth>128 { bad(l,node,E_BOUND());return 0; }
+    let ty:u64=n(l,node,14);if ty>=1 && ty<=9 { return ty; }
+    let kind:u64=n(l,node,0);
+    if kind==18 || kind==24 { return inferred(l,n(l,node,2),depth+1); }
+    return 0;
+}
+fn opcode(op:u64,signed:u64)->u64 {
+    if op==43 { return machine_ir.OP_ADD(); } if op==45 { return machine_ir.OP_SUB(); }
+    if op==42 { return machine_ir.OP_MUL(); } if op==47 { return machine_ir.OP_DIV(); }if op==37 { return machine_ir.OP_REM(); }
+    if op==38 { return machine_ir.OP_AND(); }if op==124 { return machine_ir.OP_OR(); }if op==94 { return machine_ir.OP_XOR(); }
+    if op==15420 { return machine_ir.OP_SHL(); }if op==15934 { if signed==1 { return machine_ir.OP_SAR(); }return machine_ir.OP_SHR(); }
+    if op==15677 { return machine_ir.OP_EQ(); }if op==8509 { return machine_ir.OP_NE(); }
+    if op==60 { if signed==1 { return machine_ir.OP_LT_S(); }return machine_ir.OP_LT_U(); }
+    if op==62 { if signed==1 { return machine_ir.OP_GT_S(); }return machine_ir.OP_GT_U(); }
+    if op==15421 { if signed==1 { return machine_ir.OP_LE_S(); }return machine_ir.OP_LE_U(); }
+    if op==15933 { if signed==1 { return machine_ir.OP_GE_S(); }return machine_ir.OP_GE_U(); }return 0;
+}
+fn logical(l:L,node:u64,left:u64,right:u64,op:u64)->V {
+    let a:V=expr(l,left,9);
+    let mut initial:u64=0;if op==31868 { initial=1; }
+    let c:V=constant(l,node,initial,8,0);let address:u64=cell(l,node,c,8,0);
+    let fork:u64=branch(l,node,a);let rhs:u64=block(l);
+    let b:V=expr(l,right,9);store(l,node,address,b,8,0);let end:u64=jump(l,node,0);
+    let join:u64=block(l);put(l,end,5,join);
+    if op==9766 { put(l,fork,6,rhs);put(l,fork,7,join); }
+    else { put(l,fork,6,join);put(l,fork,7,rhs); }
+    return coerce(l,node,load(l,node,address,8,0),1,0);
+}
+fn expr(l:L,node:u64,want:u64)->V {
+    if l.code!=0 || l.b.code!=0 { return empty(l); }
+    if l.depth>=128 { bad(l,node,E_BOUND());return empty(l); }l.depth=l.depth+1;
+    let out:V=expr_inner(l,node,want);l.depth=l.depth-1;return out;
+}
+fn expr_inner(l:L,node:u64,want:u64)->V {
+    let kind:u64=n(l,node,0);let first:u64=n(l,node,2);let aux:u64=n(l,node,13);
+    if kind==15 {
+        if first!=0 || n(l,node,3)!=0 { bad(l,node,E_UNSUPPORTED());return empty(l); }
+        // A STRING AND A NULL ARE ABI2 FORMS. The scalar profile keeps refusing
+        // both, so its declaration text and its verdicts do not move.
+        if aux==4 {
+            if l.abi2==0 { bad(l,node,E_UNSUPPORTED());return empty(l); }
+            return abi_string(l,node);
+        }
+        if aux==5 {
+            if l.abi2==0 { bad(l,node,E_UNSUPPORTED());return empty(l); }
+            // THE NULL IS A TYPELESS ZERO, as the reference's own `literal(0,0)`
+            // is: it takes the width of the context that reads it, and a
+            // context that wants a LENGTH refuses it, because a null buffer
+            // has none.
+            let mut nty:u64=want;if nty<1 || nty>12 { nty=4; }
+            return constant(l,node,0,bits(l,nty),sign(nty));
+        }
+        if aux>3 { bad(l,node,E_UNSUPPORTED());return empty(l); }
+        if aux==2 { return constant(l,node,1,1,0); }if aux==3 { return constant(l,node,0,1,0); }
+        let mut ty:u64=want;if ty<1 || ty>8 { ty=4; }
+        return constant(l,node,n(l,node,15),bits(l,ty),sign(ty));
+    }
+    if kind==14 {
+        let id:u64=n(l,node,15);
+        if id==0 || id>l.count || l.bindings[id*4]==0 || l.bindings[id*4+3]!=l.current_fn { bad(l,node,E_AST());return empty(l); }
+        let ty:u64=l.bindings[id*4+2];let mut bits:u64=bits(l,ty);
+        if l.bindings[id*4+1]!=0 {
+            if bits==1 { bits=8; }let got:V=load(l,node,l.bindings[id*4],bits,sign(ty));
+            if buffer_type(ty) { let size:V=load(l,node,l.lengths[id],64,0);got.length=size.id; }return got;
+        }
+        if l.abi2!=0 && buffer_type(ty) { return abi_buffer(l,node,l.bindings[id*4],ty,l.lengths[id]); }
+        return owned(l,l.bindings[id*4],bits,sign(ty),machine_ir.CLASS_VALUE());
+    }
+    if kind==18 {
+        let right:u64=n(l,first,4);
+        if first==0 || right==0 || n(l,node,3)!=right || n(l,right,4)!=0 { bad(l,node,E_AST());return empty(l); }
+        if aux==9766 || aux==31868 { return logical(l,node,first,right,aux); }
+        let compare:bool=aux==60 || aux==62 || aux==15677 || aux==8509 || aux==15421 || aux==15933;
+        let is_shift:bool=aux==15420 || aux==15934;
+        // THE OPERANDS' OWN TYPES, AND THE TYPE OF THE OPERATION. They are
+        // READ IN THE ABI2 BRANCH ONLY: the profile 0 branch below keeps its
+        // own inference and its own order, and it must not walk the tree
+        // before it.
+        let mut lty:u64=0;
+        let mut rty:u64=0;
+        let mut ty:u64=want;
+        // THE TYPE EACH OPERAND IS EVALUATED AT. It is the operand's OWN type,
+        // and it is not the type of the expression that holds it: a parent that
+        // wants a wider type does not get to narrow the operands of its child,
+        // and a comparison that promotes its two operands does not get to
+        // narrow the shift that lives inside one of them.
+        let mut eval_left:u64=ty;
+        let mut eval_right:u64=ty;
+        if l.abi2!=0 {
+            // THE TWO OPERANDS' OWN TYPES, AS THE FRONT END ANNOTATED THEM.
+            // Word 14 of a node is the lattice type the front end gave it, and
+            // the front end's rule is the C one: a comparison is a bool, a
+            // shift is the type of its LEFT operand, and an arithmetic
+            // operation is the wider of its two operands. A CONSTANT is the one
+            // thing the front end retypes, and it retypes it THERE, before this
+            // lower ever sees the tree.
+            lty=inferred(l,first,0);
+            rty=inferred(l,right,0);
+            let lb:u64=bits(l,lty);let rb:u64=bits(l,rty);
+            // THE NATURAL SELECTION IS FOR INTEGERS ALONE. A bool and a
+            // reference keep the historical inference, and their profile is
+            // not moved for this.
+            let mut ok:bool=lty>=1 && lty<=8 && rty>=1 && rty<=8 && lb!=0 && rb!=0;
+            // THE SIGNEDNESS IS THE FRONT END'S QUESTION, and it has already
+            // answered it: a mixed pair is a refusal there unless a constant
+            // was coerced there. A pair that is still mixed here is not one
+            // this lower may widen on its own, so it keeps the old inference.
+            // A SHIFT IS THE ONE EXCEPTION: its count may be unsigned while
+            // its LEFT operand is signed, and that is legal. The count keeps
+            // its own type there, so a count of 256 is 256 at the guard and
+            // not zero.
+            if ok==true && is_shift==false && sign(lty)!=sign(rty) { ok=false; }
+            if ok==true {
+                if is_shift==true {
+                    // THE SHIFT'S RESULT IS ITS REAL LEFT OPERAND.
+                    ty=lty;
+                } else if compare==true {
+                    // THE COMPARISON PROMOTES BOTH OPERANDS TO THE WIDER OF THE
+                    // TWO. The first operand's width is not the width of the
+                    // comparison: it is the width of ONE of them, and taking
+                    // it for the width of the pair is what gave a nested shift
+                    // a width of eight bits and a count of eight a refusal.
+                    if lb>=rb { ty=lty; } else { ty=rty; }
+                } else {
+                    // THE ARITHMETIC RESULT IS THE WIDER OF THE TWO, which is
+                    // what the front end annotated on this node.
+                    let nat:u64=n(l,node,14);
+                    if nat>=1 && nat<=8 { ty=nat; } else if lb>=rb { ty=lty; } else { ty=rty; }
+                }
+                eval_left=lty;eval_right=rty;
+            } else {
+                ty=inferred(l,first,0);if ty<1 || ty>8 { ty=inferred(l,right,0); }if ty<1 || ty>8 { ty=4; }
+                eval_left=ty;eval_right=ty;
+            }
+        } else {
+            if compare || ty<1 || ty>8 { ty=inferred(l,first,0);if ty<1 || ty>8 { ty=inferred(l,right,0); }if ty<1 || ty>8 { ty=4; } }
+            eval_left=ty;eval_right=ty;
+        }
+        let a:V=coerce(l,first,expr(l,first,eval_left),bits(l,ty),sign(ty));
+        // THE RIGHT OPERAND, EVALUATED ONCE, AT ITS OWN TYPE.
+        let raw:V=expr(l,right,eval_right);
+        // THE OPERATION'S RIGHT OPERAND. A comparison and an arithmetic
+        // operation promote it to the operation's width. A SHIFT'S COUNT is
+        // reduced to the width of the LEFT operand for the MIR, and the GUARD
+        // below does NOT read this one: it reads the count above, at 64 bits,
+        // so a count of 256 is 256 there and not zero.
+        let b:V=coerce(l,right,raw,bits(l,ty),sign(ty));
+        let op:u64=opcode(aux,sign(ty));if op==0 { bad(l,node,E_UNSUPPORTED());return empty(l); }
+        // THE FOUR ARITHMETIC EVENTS THE C SEED GUARDS ARE GUARDED HERE, BEFORE
+        // ANY ARITHMETIC BYTE IS EMITTED. This is a GATE, not a recovery: an x86
+        // div by zero or by MIN/-1 faults the child with SIGFPE, and a shift of
+        // 64 is masked to six bits and silently answers a different question.
+        // Only the ABI2 profile is touched, so profile 0 keeps its bytes and its
+        // verdicts. a and b are the coerced operands, each evaluated ONCE above,
+        // so every guard below reads a value instead of re-running an expression.
+        if l.abi2!=0 && l.code==0 && l.b.code==0 {
+            let divide:bool=op==machine_ir.OP_DIV() || op==machine_ir.OP_REM();
+            let shift:bool=op==machine_ir.OP_SHL() || op==machine_ir.OP_SHR() || op==machine_ir.OP_SAR();
+            if divide || shift { l.fault_node=node; }
+            if divide {
+                let divisor:V=coerce(l,node,b,64,0);
+                abi_guard(l,abi_compare(l,divisor,constant(l,node,0,64,0),machine_ir.OP_EQ()),5);
+                if sign(ty)==1 && bits(l,ty)==64 {
+                    // MIN/-1 IS DIVIDEND MIN AND DIVISOR -1, AND IT IS TWO TESTS
+                    // WITH A REAL JOIN. The divisor is tested first because a
+                    // divisor other than -1 is the common case. BOTH SIDES OF EACH
+                    // COMPARISON ARE COERCED AT 64 BITS BEFORE THE COMPARISON:
+                    // abi_compare does not coerce, and a signed 64 bit operand
+                    // compared against an unsigned 64 bit constant would be the
+                    // same bits wearing two types, which is a MIR that is not
+                    // well typed even when the machine answer would look right.
+                    // Two one-bit
+                    // predicates are not combined into a value: abi_binary is
+                    // fixed at 64 bits, so an AND of predicates would be a wider
+                    // value pretending to be a condition. The second test lives
+                    // behind the first, and both paths meet at a join that
+                    // dominates the arithmetic emitted below.
+                    let minimum:V=constant(l,node,9223372036854775808,64,0);
+                    let minusone:V=constant(l,node,18446744073709551615,64,0);
+                    let dividend:V=coerce(l,node,a,64,0);
+                    let test:u64=branch(l,node,abi_compare(l,divisor,minusone,machine_ir.OP_EQ()));
+                    let negative:u64=block(l);put(l,test,6,negative);
+                    abi_guard(l,abi_compare(l,dividend,minimum,machine_ir.OP_EQ()),11);
+                    let negative_end:u64=jump(l,node,0);
+                    let other:u64=block(l);put(l,test,7,other);
+                    let other_end:u64=jump(l,node,0);
+                    let join:u64=block(l);put(l,negative_end,5,join);put(l,other_end,5,join);
+                }
+            }
+            if shift {
+                // The count is taken at 64 bits UNSIGNED, so a negative count is
+                // a huge count and is refused as a shift instead of being
+                // sign-extended into a small, silently accepted one. The bound is
+                // the operand width in BITS, as bits() already returns it, and
+                // it is the width of the REAL LEFT OPERAND. THE COUNT IS READ
+                // FROM THE OPERAND IT WAS EVALUATED INTO, at 64 bits, and NOT
+                // FROM THE RECORD'S COUNT: that one is the width of the LEFT
+                // operand, and a count of 256 reduced to eight bits is zero.
+                let count:V=coerce(l,node,raw,64,0);
+                abi_guard(l,abi_compare(l,count,constant(l,node,bits(l,ty),64,0),machine_ir.OP_GE_U()),12);
+            }
+        }
+        let mut bits:u64=bits(l,ty);let mut class:u64=machine_ir.CLASS_VALUE();
+        if compare { bits=1;class=machine_ir.CLASS_PREDICATE(); }
+        return value_record(l,2070,node,a.id,b.id,2,bits,sign(ty),class,op);
+    }
+    if kind==24 {
+        if first==0 || n(l,node,3)!=first || n(l,first,4)!=0 { bad(l,node,E_AST());return empty(l); }
+        let mut ty:u64=want;if ty<1 || ty>9 { ty=inferred(l,first,0); }if ty<1 || ty>9 { ty=4; }
+        let v:V=expr(l,first,ty);let mut op:u64=0;let mut bits:u64=bits(l,ty);let mut signed:u64=sign(ty);
+        if aux==45 { op=machine_ir.OP_NEG(); }if aux==126 { op=machine_ir.OP_NOT(); }
+        if aux==33 { op=machine_ir.OP_LNOT();bits=1;signed=0; }
+        if op==0 { bad(l,node,E_UNSUPPORTED());return empty(l); }
+        return value_record(l,2071,node,v.id,0,1,bits,signed,machine_ir.CLASS_VALUE(),op);
+    }
+    if kind==17 {
+        if l.abi2!=0 && aux!=0 { return abi_intrinsic(l,node); }
+        let ord:u64=n(l,node,15);
+        if aux!=0 || ord==0 || ord>l.count || l.functions[ord*2]==0 { bad(l,node,E_UNSUPPORTED());return empty(l); }
+        let declaration:u64=l.functions[ord*2];let nt_fn:u64=l.functions[ord*2+1];
+        if nt_fn==0 { bad(l,node,E_AST());return empty(l); }
+        let args:buf<u64>=alloc(runtime(),64);let mut argument:u64=first;let mut param:u64=n(l,declaration,2);let mut count:u64=0;
+        while argument!=0 && l.code==0 {
+            if count>=64 || param==0 || n(l,param,0)!=6 { bad(l,node,E_AST());break; }
+            let ty:u64=n(l,param,14);let v:V=coerce(l,argument,expr(l,argument,ty),bits(l,ty),sign(ty));
+            args[count]=v.id;count=count+1;
+            if l.abi2!=0 && buffer_type(ty) {
+                if count>=64 || v.length==0 { bad(l,node,E_BOUND());break; }args[count]=v.length;count=count+1;
+            }
+            argument=n(l,argument,4);param=n(l,param,4);
+        }
+        if param!=0 && n(l,param,0)==6 { bad(l,node,E_AST()); }
+        if l.code!=0 { rt_free(runtime(),args);return empty(l); }
+        // Symbols use the actual canonical declaration's name span, whether
+        // that declaration is a definition in this object or an import.
+        let symbol:u64=rec(l,2057,node);name_symbol(l,nt_fn,symbol);
+        let ty:u64=n(l,node,14);if bits(l,ty)==0 { rt_free(runtime(),args);bad(l,node,E_UNSUPPORTED());return empty(l); }
+        let r:u64=rec(l,2076,node);let output:u64=machine_ir.native_value(l.b);
+        put(l,r,4,output);put(l,r,5,symbol);put(l,r,9,bits(l,ty));put(l,r,10,sign(ty));put(l,r,12,machine_ir.CLASS_VALUE());
+        put(l,r,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());put(l,r,14,count);put(l,r,15,machine_ir.OP_CALL());
+        let mut taken:u64=count+1;if taken>3 { taken=3; }put(l,r,8,taken);
+        let mut i:u64=0;
+        while i<count {
+            if i<2 { put(l,r,6+i,args[i]); }
+            else { let extra:u64=rec(l,2083,node);put(l,extra,5,args[i]);put(l,extra,6,r);put(l,extra,8,2);put(l,extra,14,i); }
+            i=i+1;
+        }
+        rt_free(runtime(),args);
+        if l.abi2!=0 {
+            let zero:V=constant(l,node,0,64,0);
+            abi_guard(l,abi_compare(l,abi_load(l,l.context,16),zero,machine_ir.OP_NE()),0);
+        }
+        if l.abi2!=0 && buffer_type(ty) { return abi_buffer(l,node,output,ty,0); }
+        return owned(l,output,bits(l,ty),sign(ty),machine_ir.CLASS_VALUE());
+    }
+    if l.abi2!=0 {
+        if kind==19 { return abi_record(l,node); }
+        if kind==16 || kind==21 { return abi_read_access(l,node); }
+    }
+    bad(l,node,E_UNSUPPORTED());return empty(l);
+}
+fn statements(l:L,node:u64)->u64 {
+    if n(l,node,0)!=8 { return bad(l,node,E_AST()); }
+    let mut child:u64=n(l,node,2);let mut seen:u64=0;
+    while child!=0 && l.code==0 && l.b.code==0 && l.b.term==0 && seen<l.count {
+        if n(l,child,1)!=node { return bad(l,child,E_AST()); }
+        statement(l,child);child=n(l,child,4);seen=seen+1;
+    }
+    if seen>=l.count { return bad(l,node,E_AST()); }return l.code;
+}
+fn statement(l:L,node:u64)->u64 {
+    if l.depth>=128 { return bad(l,node,E_BOUND()); }l.depth=l.depth+1;
+    let code:u64=statement_inner(l,node);l.depth=l.depth-1;return code;
+}
+fn statement_inner(l:L,node:u64)->u64 {
+    let kind:u64=n(l,node,0);let first:u64=n(l,node,2);
+    if l.abi2!=0 && kind==17 { expr(l,node,n(l,node,14));return l.code; }
+    if kind==8 { return statements(l,node); }
+    if kind==9 {
+        let id:u64=n(l,node,15);let ty:u64=n(l,node,14);
+        if id==0 || id>l.count || l.bindings[id*4]!=0 || bits(l,ty)==0 { return bad(l,node,E_AST()); }
+        let initial:V=expr(l,first,ty);let mutable:bool=n(l,node,13)==5;
+        let mut bits:u64=bits(l,ty);if mutable && bits==1 { bits=8; }
+        let got:V=coerce(l,node,initial,bits,sign(ty));let mut value:u64=got.id;
+        if l.abi2!=0 && buffer_type(ty) {
+            let mut length:u64=got.length;if length==0 { bad(l,node,E_AST());return l.code; }
+            if mutable { let size:V=owned(l,length,64,0,machine_ir.CLASS_VALUE());length=cell(l,node,size,64,0); }
+            l.lengths[id]=length;
+        }
+        if mutable { value=cell(l,node,got,bits,sign(ty));l.bindings[id*4+1]=1; }
+        l.bindings[id*4]=value;l.bindings[id*4+2]=ty;l.bindings[id*4+3]=l.current_fn;return l.code;
+    }
+    if kind==10 {
+        if l.abi2!=0 && (n(l,first,0)==16 || n(l,first,0)==21) {
+            let right:u64=n(l,first,4);let ty:u64=n(l,first,14);
+            abi_access(l,first,true);
+            let handle:u64=l.access_handle;let offset:u64=l.access_offset;let spec:u64=l.access_spec;
+            let value:V=coerce(l,node,expr(l,right,ty),bits(l,ty),sign(ty));
+            // The RHS may invoke arbitrary Nova/runtime code. Re-resolve the
+            // captured handle and byte offset after it, as the ABI2 seed does.
+            let checked_handle:V=owned(l,handle,64,0,machine_ir.CLASS_VALUE());
+            let checked_offset:V=owned(l,offset,64,0,machine_ir.CLASS_VALUE());
+            let address:V=abi_runtime(l,node,8,checked_handle,checked_offset,constant(l,node,spec,64,0));
+            let mut width:u64=bits(l,ty);if n(l,first,0)==16 { width=64; }
+            let r:u64=store(l,node,abi_address(l,address.id,0),value,width,sign(ty));put(l,r,11,1);put(l,r,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());return l.code;
+        }
+        if n(l,first,0)!=14 { return bad(l,node,E_UNSUPPORTED()); }
+        let id:u64=n(l,first,15);let right:u64=n(l,first,4);
+        if id==0 || id>l.count || l.bindings[id*4]==0 || l.bindings[id*4+1]!=1 || l.bindings[id*4+3]!=l.current_fn { return bad(l,node,E_AST()); }
+        let ty:u64=l.bindings[id*4+2];let mut bits:u64=bits(l,ty);if bits==1 { bits=8; }
+        let value:V=expr(l,right,ty);store(l,node,l.bindings[id*4],value,bits,sign(ty));
+        if l.abi2!=0 && buffer_type(ty) {
+            let size:V=owned(l,value.length,64,0,machine_ir.CLASS_VALUE());store(l,node,l.lengths[id],size,64,0);
+        }
+        return l.code;
+    }
+    if kind==11 {
+        let v:V=coerce(l,node,expr(l,first,l.return_type),bits(l,l.return_type),sign(l.return_type));
+        let r:u64=rec(l,2077,node);put(l,r,5,v.id);put(l,r,8,1);put(l,r,9,bits(l,l.return_type));put(l,r,10,sign(l.return_type));
+        put(l,r,12,machine_ir.CLASS_VALUE());put(l,r,13,machine_ir.FLAG_TERMINATOR());put(l,r,14,machine_ir.OP_RET());machine_ir.native_term(l.b,r);return l.code;
+    }
+    if kind==13 {
+        let then_node:u64=n(l,first,4);let else_node:u64=n(l,then_node,4);
+        let predicate:V=expr(l,first,9);let fork:u64=branch(l,node,predicate);
+        let yes:u64=block(l);put(l,fork,6,yes);statements(l,then_node);
+        let mut yes_end:u64=0;if l.b.term==0 { yes_end=jump(l,node,0); }
+        let no:u64=block(l);put(l,fork,7,no);
+        if else_node!=0 { if n(l,else_node,0)==8 { statements(l,else_node); }else { statement(l,else_node); } }
+        let mut no_end:u64=0;if l.b.term==0 { no_end=jump(l,node,0); }
+        if yes_end!=0 || no_end!=0 { let join:u64=block(l);if yes_end!=0 { put(l,yes_end,5,join); }if no_end!=0 { put(l,no_end,5,join); } }
+        return l.code;
+    }
+    if kind==12 {
+        let body:u64=n(l,first,4);let entry:u64=jump(l,node,0);let head:u64=block(l);put(l,entry,5,head);
+        l.heads[node]=head;l.active[node]=1;
+        let predicate:V=expr(l,first,9);let fork:u64=branch(l,node,predicate);
+        let run:u64=block(l);put(l,fork,6,run);statements(l,body);
+        if l.b.term==0 { jump(l,node,head); }
+        let end:u64=block(l);put(l,fork,7,end);
+        let mut i:u64=0;while i<l.break_count { if l.breaks[i*2]==node { put(l,l.breaks[i*2+1],5,end); }i=i+1; }
+        l.active[node]=0;return l.code;
+    }
+    if kind==22 || kind==23 {
+        let target:u64=n(l,node,15);
+        if target==0 || target>l.count || l.active[target]!=1 { return bad(l,node,E_AST()); }
+        if kind==23 { jump(l,node,l.heads[target]); }
+        else {
+            if l.break_count>=l.count { return bad(l,node,E_BOUND()); }
+            let r:u64=jump(l,node,0);l.breaks[l.break_count*2]=target;l.breaks[l.break_count*2+1]=r;l.break_count=l.break_count+1;
+        }
+        return l.code;
+    }
+    if kind==17 { expr(l,node,0);return l.code; }
+    return bad(l,node,E_UNSUPPORTED());
+}
+// ABI2 uses the existing physical-cell model. R15 is family 16, not a
+// globally allocated expression value. Each function captures its incoming
+// cell; calls restore that cell and the ordinary epilogue preserves R15.
+fn abi_context(l:L)->u64 {
+    let v:V=value_record(l,2056,0,0,0,0,64,0,machine_ir.CLASS_VALUE(),2);
+    put(l,l.b.records,20,16);put(l,l.b.records,22,1);return v.id;
+}
+fn abi_address(l:L,base:u64,offset:u64)->u64 {
+    let v:V=value_record(l,2066,0,base,0,0,64,0,machine_ir.CLASS_ADDRESS(),1);
+    put(l,l.b.records,11,1);put(l,l.b.records,15,offset);return v.id;
+}
+fn abi_load(l:L,base:u64,offset:u64)->V {
+    let address:u64=abi_address(l,base,offset);let v:V=load(l,0,address,64,0);
+    put(l,l.b.records,11,1);put(l,l.b.records,13,machine_ir.FLAG_MAY_FAULT());return v;
+}
+fn abi_store(l:L,base:u64,offset:u64,v:V)->u64 {
+    let address:u64=abi_address(l,base,offset);let r:u64=store(l,0,address,v,64,0);
+    put(l,r,11,1);put(l,r,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());return r;
+}
+fn abi_compare(l:L,a:V,b:V,op:u64)->V {
+    let v:V=value_record(l,2070,0,a.id,b.id,2,1,0,machine_ir.CLASS_PREDICATE(),op);return v;
+}
+fn abi_return(l:L,v:V)->u64 {
+    let got:V=coerce(l,0,v,bits(l,l.return_type),sign(l.return_type));let r:u64=rec(l,2077,0);
+    put(l,r,5,got.id);put(l,r,8,1);put(l,r,9,bits(l,l.return_type));put(l,r,10,sign(l.return_type));
+    put(l,r,12,machine_ir.CLASS_VALUE());put(l,r,13,machine_ir.FLAG_TERMINATOR());put(l,r,14,machine_ir.OP_RET());machine_ir.native_term(l.b,r);return r;
+}
+// Failure paths terminate before any continuation. No context store occurs
+// for null or short contexts, nor when propagating an existing error.
+fn abi_guard(l:L,predicate:V,error:u64)->u64 {
+    let br:u64=branch(l,0,predicate);let failure:u64=block(l);put(l,br,6,failure);
+    if error!=0 {
+        // THE ERROR SAYS WHERE IT IS, IN THE FILE IT IS IN. The source index
+        // and the offset inside that file are measured from the spans, so a
+        // body that came from another file is not reported as if it had come
+        // from the first one at an offset in the whole blob.
+        let mut origin:u64=l.fault_node;if origin==0 { origin=l.main_node; }
+        let src:u64=locate(l,n(l,origin,5));
+        abi_store(l,l.context,16,constant(l,0,error,64,0));
+        abi_store(l,l.context,24,constant(l,0,src,64,0));
+        abi_store(l,l.context,32,constant(l,0,l.rel_offset,64,0));
+    }
+    abi_return(l,constant(l,0,0,bits(l,l.return_type),sign(l.return_type)));
+    let continuation:u64=block(l);put(l,br,7,continuation);return continuation;
+}
+fn abi_binary(l:L,a:V,b:V,op:u64)->V {
+    return value_record(l,2070,0,a.id,b.id,2,64,0,machine_ir.CLASS_VALUE(),op);
+}
+fn abi_propagate(l:L,node:u64)->u64 {
+    let zero:V=constant(l,node,0,64,0);
+    let br:u64=branch(l,node,abi_compare(l,abi_load(l,l.context,16),zero,machine_ir.OP_NE()));
+    let failure:u64=block(l);put(l,br,6,failure);
+    let position:u64=branch(l,node,abi_compare(l,abi_load(l,l.context,24),zero,machine_ir.OP_EQ()));
+    let yes:u64=block(l);put(l,position,6,yes);
+    // THE SOURCE AND THE OFFSET INSIDE THAT SOURCE, measured from the spans.
+    let src:u64=locate(l,n(l,node,5));
+    abi_store(l,l.context,24,constant(l,node,src,64,0));abi_store(l,l.context,32,constant(l,node,l.rel_offset,64,0));
+    let yjump:u64=jump(l,node,0);let no:u64=block(l);put(l,position,7,no);let njump:u64=jump(l,node,0);
+    let done:u64=block(l);put(l,yjump,5,done);put(l,njump,5,done);
+    abi_return(l,constant(l,node,0,bits(l,l.return_type),sign(l.return_type)));
+    let continuation:u64=block(l);put(l,br,7,continuation);return continuation;
+}
+// THE CLOBBER MASK OF THE RUNTIME SIGNATURE, DERIVED ONCE FROM THE MIR.
+//
+// It is a property of the CALLEE, so it does not move between two call sites,
+// and the emitter compares it against the callee's own declared mask
+// (`declared_mask`), which is why it has to be derived and not assumed.
+//
+// THE SCAN IS BOUNDED TO THE SIGNATURE'S OWN FUNCTION: a record belongs to
+// that function when its parent chain reaches it. The image is walked
+// FORWARD from the signature and stops at the first record that belongs to
+// something else, so the cost is the size of one function and not the size of
+// the image.
+fn abi_signature_mask(l:L)->u64 {
+    let mut mask:u64=1;
+    let mut scan:u64=l.runtime_sig+1;
+    while scan<=l.b.records {
+        let mut parent:u64=get(l,scan,16);
+        let mut steps:u64=0;
+        while parent!=0 && parent!=l.runtime_sig && steps<=l.b.records { parent=get(l,parent,16);steps=steps+1; }
+        if parent!=l.runtime_sig { break; }
+        if get(l,scan,0)==2064 { mask=mask|get(l,scan,5); }
+        scan=scan+1;
+    }
+    return mask;
+}
+// THE SHARED RUNTIME HELPER.
+//
+// THE ABI2 RUNTIME CALL WAS EXPANDED AT EVERY CALL SITE: the runtime pointer,
+// the table's version, the table's size, the callback's presence, the call
+// itself, and the propagation of a fault. That expansion is FORTY RECORDS of
+// Machine IR per call, and a program that makes many runtime calls -- the
+// compiler lowering ITSELF -- cannot hold its image in the 64MiB the runtime
+// allows.
+//
+// THE HELPER HOLDS THE EXPANSION ONCE. It is a private function of the
+// generated unit, so the expansion is emitted a single time and every call
+// site is a direct call with six words.
+//
+// THE HELPER RE-READS EVERYTHING ON EVERY CALL: the runtime pointer comes from
+// the context, the table's version and size are read from the table, and the
+// callback is read from the table. A callback table MUTATED between two calls
+// is therefore seen by the second call, exactly as the inline expansion saw
+// it, and the mutable-callback rows keep their meaning.
+//
+// THE LAST TWO PARAMETERS ARE THE CALLER'S SOURCE AND BYTE OFFSET, so the
+// error location belongs to the caller rather than the generated helper.
+fn abi_call_helper(l:L,node:u64,args:buf<u64>,argc:u64)->u64 {
+    let nt_fn:u64=l.helper_origin;
+    let symbol:u64=rec(l,2057,node);name_symbol(l,nt_fn,symbol);
+    let r:u64=rec(l,2076,node);let result:u64=machine_ir.native_value(l.b);
+    put(l,r,4,result);put(l,r,5,symbol);put(l,r,9,64);put(l,r,10,0);put(l,r,12,machine_ir.CLASS_VALUE());
+    put(l,r,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());put(l,r,14,argc);put(l,r,15,machine_ir.OP_CALL());
+    let mut taken:u64=argc+1;if taken>3 { taken=3; }put(l,r,8,taken);
+    let mut i:u64=0;
+    while i<argc {
+        if i<2 { put(l,r,6+i,args[i]); } else { let extra:u64=rec(l,2083,node);put(l,extra,5,args[i]);put(l,extra,6,r);put(l,extra,8,2);put(l,extra,14,i); }
+        i=i+1;
+    }
+    // THE HELPER DECLARES THE RUNTIME SIGNATURE'S CLOBBERS, so the mask the
+    // emitter compares against the callee's own is the same one.
+    put(l,r,23,l.runtime_mask);
+    return result;
+}
+// THE ERROR A FAULT MAY HAVE SET. The helper filled the location when the
+// callback faulted; the call site only has to STOP.
+fn abi_error_return(l:L,node:u64)->u64 {
+    let zero:V=constant(l,node,0,64,0);
+    let br:u64=branch(l,node,abi_compare(l,abi_load(l,l.context,16),zero,machine_ir.OP_NE()));
+    let failure:u64=block(l);put(l,br,6,failure);
+    abi_return(l,constant(l,node,0,bits(l,l.return_type),sign(l.return_type)));
+    let continuation:u64=block(l);put(l,br,7,continuation);return continuation;
+}
+// THE HELPER'S GUARD: the runtime's own refusal, carrying the CALLER'S
+// position. The caller knows the source and the offset inside that source as
+// constants, so the helper stores the VALUES it was given -- never a constant
+// made of an identifier, and never a read of the tree by an identifier that is
+// not a tree node.
+fn abi_helper_guard(l:L,predicate:V,src:V,off:V)->u64 {
+    let br:u64=branch(l,0,predicate);let failure:u64=block(l);put(l,br,6,failure);
+    abi_store(l,l.context,16,constant(l,0,6,64,0));
+    abi_store(l,l.context,24,src);
+    abi_store(l,l.context,32,off);
+    abi_return(l,constant(l,0,0,64,0));
+    let continuation:u64=block(l);put(l,br,7,continuation);return continuation;
+}
+// THE HELPER'S PROPAGATION: a fault the CALLBACK raised keeps ITS OWN
+// position, and the caller's position is filled only when there is none.
+fn abi_helper_propagate(l:L,src:V,off:V)->u64 {
+    let zero:V=constant(l,0,0,64,0);
+    let br:u64=branch(l,0,abi_compare(l,abi_load(l,l.context,16),zero,machine_ir.OP_NE()));
+    let failure:u64=block(l);put(l,br,6,failure);
+    let position:u64=branch(l,0,abi_compare(l,abi_load(l,l.context,24),zero,machine_ir.OP_EQ()));
+    let yes:u64=block(l);put(l,position,6,yes);
+    abi_store(l,l.context,24,src);
+    abi_store(l,l.context,32,off);
+    let yjump:u64=jump(l,0,0);let no:u64=block(l);put(l,position,7,no);let njump:u64=jump(l,0,0);
+    let done:u64=block(l);put(l,yjump,5,done);put(l,njump,5,done);
+    abi_return(l,constant(l,0,0,64,0));
+    let continuation:u64=block(l);put(l,br,7,continuation);return continuation;
+}
+// THE HELPER'S BODY: the expansion, written once.
+//
+// ITS SIX PARAMETERS ARE VALUES, NOT CONSTANTS: the callback's offset, the
+// three callback arguments, the source index and the offset inside that
+// source. The offset is a VALUE the caller passed, so the callback's address
+// is COMPUTED and not displaced by a constant.
+fn abi_helper_body(l:L,f:u64)->u64 {
+    let mut mp:u64=f+1;let mut i:u64=0;
+    let mut p0:u64=0;let mut p1:u64=0;let mut p2:u64=0;let mut p3:u64=0;let mut p4:u64=0;let mut p5:u64=0;
+    while i<6 && mp<l.b.block {
+        if get(l,mp,0)==2054 {
+            if i==0 { p0=get(l,mp,4); }if i==1 { p1=get(l,mp,4); }if i==2 { p2=get(l,mp,4); }if i==3 { p3=get(l,mp,4); }if i==4 { p4=get(l,mp,4); }if i==5 { p5=get(l,mp,4); }
+            i=i+1;
+        }
+        mp=mp+1;
+    }
+    if i!=6 { bad(l,0,E_AST());return 0; }
+    // THE CONTEXT IS THE HELPER'S OWN INCOMING R15, which is the caller's R15:
+    // R15 is not in the helper's clobbers, so the call preserves it.
+    l.context=abi_context(l);
+    let zero:V=constant(l,0,0,64,0);
+    let src:V=owned(l,p4,64,0,machine_ir.CLASS_VALUE());
+    let off:V=owned(l,p5,64,0,machine_ir.CLASS_VALUE());
+    let rt:V=abi_load(l,l.context,40);
+    abi_helper_guard(l,abi_compare(l,rt,zero,machine_ir.OP_EQ()),src,off);
+    abi_helper_guard(l,abi_compare(l,abi_load(l,rt.id,0),constant(l,0,2,64,0),machine_ir.OP_NE()),src,off);
+    abi_helper_guard(l,abi_compare(l,abi_load(l,rt.id,8),constant(l,0,120,64,0),machine_ir.OP_LT_U()),src,off);
+    // THE CALLBACK'S ADDRESS IS DYNAMIC. The offset is a value, so it is added
+    // to the runtime pointer and the result is the base of the address.
+    let slot:V=owned(l,p0,64,0,machine_ir.CLASS_VALUE());
+    let addr:V=abi_binary(l,rt,slot,machine_ir.OP_ADD());
+    let target:V=abi_load(l,addr.id,0);
+    abi_helper_guard(l,abi_compare(l,target,zero,machine_ir.OP_EQ()),src,off);
+    let r:u64=rec(l,2087,0);let result:u64=machine_ir.native_value(l.b);
+    put(l,r,4,result);put(l,r,5,target.id);put(l,r,6,l.context);put(l,r,7,p1);put(l,r,8,3);
+    put(l,r,9,64);put(l,r,12,machine_ir.CLASS_VALUE());put(l,r,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());
+    put(l,r,14,4);put(l,r,15,l.runtime_sig);
+    put(l,r,23,l.runtime_mask);
+    let extra_b:u64=rec(l,2083,0);put(l,extra_b,5,p2);put(l,extra_b,6,r);put(l,extra_b,8,2);put(l,extra_b,14,2);
+    let extra_c:u64=rec(l,2083,0);put(l,extra_c,5,p3);put(l,extra_c,6,r);put(l,extra_c,8,2);put(l,extra_c,14,3);
+    abi_helper_propagate(l,src,off);
+    let out:V=owned(l,result,64,0,machine_ir.CLASS_VALUE());
+    abi_return(l,out);
+    return 0;
+}
+fn abi_runtime(l:L,node:u64,op:u64,a:V,b:V,c:V)->V {
+    // THE MASK IS DERIVED AND NEVER ASSUMED: with no signature there is no
+    // mask to publish, and a call that cannot name its callee is refused.
+    if l.runtime_sig==0 { bad(l,node,E_AST());return empty(l); }
+    if op==12 {
+        // THE COPY EXTENSION IS THE HELPER'S ONE EXCEPTION. It lives past the
+        // twelve call slots and the table must be LONGER for it -- 128 bytes
+        // and not 120 -- and one parameter cannot carry that difference
+        // without a select the language does not have. So the copy keeps the
+        // expansion, and it is ONE call site.
+        return abi_runtime_copy(l,node,a,b,c);
+    }
+    // THE CALLER'S POSITION, AS CONSTANTS: the source index and the offset
+    // inside that source, which is what the helper stores when the runtime
+    // refuses. This is the same pair the inline expansion computed.
+    let src:u64=locate(l,n(l,node,5));
+    let args:buf<u64>=alloc(runtime(),8);
+    args[0]=constant(l,node,16+op*8,64,0).id;
+    args[1]=a.id;args[2]=b.id;args[3]=c.id;
+    args[4]=constant(l,node,src,64,0).id;
+    args[5]=constant(l,node,l.rel_offset,64,0).id;
+    let result:u64=abi_call_helper(l,node,args,6);
+    rt_free(runtime(),args);
+    abi_error_return(l,node);
+    return owned(l,result,64,0,machine_ir.CLASS_VALUE());
+}
+fn abi_runtime_copy(l:L,node:u64,a:V,b:V,c:V)->V {
+    // THE INLINE EXPANSION, kept for the copy extension alone.
+    l.fault_node=node;let zero:V=constant(l,node,0,64,0);
+    let rt:V=abi_load(l,l.context,40);
+    abi_guard(l,abi_compare(l,rt,zero,machine_ir.OP_EQ()),6);
+    abi_guard(l,abi_compare(l,abi_load(l,rt.id,0),constant(l,node,2,64,0),machine_ir.OP_NE()),6);
+    abi_guard(l,abi_compare(l,abi_load(l,rt.id,8),constant(l,node,128,64,0),machine_ir.OP_LT_U()),6);
+    let target:V=abi_load(l,rt.id,120);abi_guard(l,abi_compare(l,target,zero,machine_ir.OP_EQ()),6);
+    let r:u64=rec(l,2087,node);let result:u64=machine_ir.native_value(l.b);
+    put(l,r,4,result);put(l,r,5,target.id);put(l,r,6,l.context);put(l,r,7,a.id);put(l,r,8,3);
+    put(l,r,9,64);put(l,r,12,machine_ir.CLASS_VALUE());put(l,r,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());
+    put(l,r,14,4);put(l,r,15,l.runtime_sig);
+    put(l,r,23,l.runtime_mask);
+    let extra_b:u64=rec(l,2083,node);put(l,extra_b,5,b.id);put(l,extra_b,6,r);put(l,extra_b,8,2);put(l,extra_b,14,2);
+    let extra_c:u64=rec(l,2083,node);put(l,extra_c,5,c.id);put(l,extra_c,6,r);put(l,extra_c,8,2);put(l,extra_c,14,3);
+    abi_propagate(l,node);return owned(l,result,64,0,machine_ir.CLASS_VALUE());
+}
+fn abi_length(l:L,node:u64,handle:V,ty:u64)->V {
+    let zero:V=constant(l,node,0,64,0);let size:V=abi_runtime(l,node,10,handle,zero,zero);
+    if ty==11 {
+        let eight:V=constant(l,node,8,64,0);
+        abi_guard(l,abi_compare(l,abi_binary(l,size,eight,machine_ir.OP_REM()),zero,machine_ir.OP_NE()),10);
+        return abi_binary(l,size,eight,machine_ir.OP_DIV());
+    }
+    return size;
+}
+fn abi_buffer(l:L,node:u64,id:u64,ty:u64,length:u64)->V {
+    let v:V=owned(l,id,64,0,machine_ir.CLASS_VALUE());v.length=length;
+    if length==0 { let size:V=abi_length(l,node,v,ty);v.length=size.id; }return v;
+}
+// THE STRING LITERAL: A SYMBOLIC ADDRESS AND ONE RUNTIME CALL.
+//
+// The address is a MIR `k_address` whose SYMBOL names the storage item, and
+// `machine_emit`'s `emit_address` turns that into a `lea` with a REL32
+// relocation to the item -- the same shape every other address in this module
+// has, with the symbol in the slot the base and the index would occupy.
+//
+// The call is NV2_LITERAL, the runtime table's slot 11, and its THIRD argument
+// is the WRITABLE flag and not a sign: the runtime reads it as
+// `writable = unused != 0`. A literal is READ-ONLY, so the flag is zero, and
+// a write to a literal is refused by the runtime with NV2_READONLY.
+//
+// THE EMPTY LITERAL IS THE NULL POINTER WITH A NULL LENGTH. The runtime
+// refuses a null pointer that claims a length, and refuses nothing at all
+// when the length is zero, so `NV2_LITERAL(0,0,0)` is the empty string.
+fn abi_string(l:L,node:u64)->V {
+    let index:u64=literal_index(l,node);
+    if index==0 { bad(l,node,E_UNSUPPORTED());return empty(l); }
+    let desc:u64=(index-1)*6;
+    let length:u64=l.lits[desc+1];
+    let zero:V=constant(l,node,0,64,0);
+    if length==0 {
+        let handle:V=abi_runtime(l,node,11,zero,zero,zero);
+        return abi_buffer(l,node,handle.id,10,zero.id);
+    }
+    let name_start:u64=l.lits[desc+4];let name_end:u64=l.lits[desc+5];
+    if name_end<=name_start { bad(l,node,E_AST());return empty(l); }
+    let symbol:u64=rec(l,2057,node);
+    put(l,symbol,5,name_start);put(l,symbol,6,name_end);put(l,symbol,8,2);
+    // THE SYMBOLIC BASE RIDES IN `arg_c`, AND `arg_count` BECOMES 3 SO THE SLOT
+    // IS LIVE. `machine_ir`'s own address does the same, and the verifier
+    // refuses a non-zero value in a DEAD slot: with the count left at zero the
+    // symbol would be a live value in an unused slot, which is E_SHAPE.
+    let address:V=value_record(l,2066,0,0,0,0,64,0,machine_ir.CLASS_ADDRESS(),1);
+    put(l,l.b.records,7,symbol);put(l,l.b.records,8,3);put(l,l.b.records,11,1);
+    let size:V=constant(l,node,length,64,0);
+    let handle:V=abi_runtime(l,node,11,address,size,zero);
+    return abi_buffer(l,node,handle.id,10,size.id);
+}
+fn abi_record_field(l:L,ty:u64,ordinal:u64)->u64 {
+    if ty<=12 || ty>=len(l.structs) || l.structs[ty]==0 { bad(l,0,E_AST());return 0; }
+    let owner:u64=l.structs[ty];let mut field:u64=n(l,owner,2);let mut i:u64=0;
+    while field!=0 && i<=l.count {
+        if n(l,field,0)!=4 || n(l,field,1)!=owner { bad(l,field,E_AST());return 0; }
+        if i==ordinal { return field; }field=n(l,field,4);i=i+1;
+    }
+    return 0;
+}
+fn abi_field_count(l:L,ty:u64)->u64 {
+    if ty<=12 || ty>=len(l.structs) || l.structs[ty]==0 { bad(l,0,E_AST());return 0; }
+    let mut field:u64=n(l,l.structs[ty],2);let mut count:u64=0;
+    while field!=0 && count<=l.count { count=count+1;field=n(l,field,4); }
+    if field!=0 { bad(l,field,E_AST());return 0; }return count;
+}
+fn abi_span_equal(l:L,a:u64,b:u64)->bool {
+    let start:u64=n(l,a,5);let end:u64=n(l,a,6);let other:u64=n(l,b,5);let stop:u64=n(l,b,6);
+    if start>end || end>len(l.source) || other>stop || stop>len(l.source) || end-start!=stop-other { return false; }
+    let mut i:u64=0;while i<end-start { if l.source[start+i]!=l.source[other+i] { return false; }i=i+1; }return true;
+}
+fn abi_access(l:L,node:u64,writable:bool)->u64 {
+    let first:u64=n(l,node,2);let ty:u64=n(l,first,14);let base:V=expr(l,first,ty);
+    let zero:V=constant(l,node,0,64,0);let mut offset:V=zero;let mut bytes:u64=8;
+    l.fault_node=node;
+    if n(l,node,0)==21 {
+        if buffer_type(ty)==false { bad(l,node,E_AST());return 0; }
+        let idx_node:u64=n(l,first,4);let index:V=coerce(l,idx_node,expr(l,idx_node,4),64,0);
+        let length:V=owned(l,base.length,64,0,machine_ir.CLASS_VALUE());
+        abi_guard(l,abi_compare(l,index,length,machine_ir.OP_GE_U()),4);bytes=element_bytes(ty);
+        offset=index;
+        if bytes==8 { offset=abi_binary(l,index,constant(l,node,8,64,0),machine_ir.OP_MUL()); }
+    }else if n(l,node,0)==16 {
+        let mut ordinal:u64=0;let mut field:u64=abi_record_field(l,ty,0);let mut found:bool=false;
+        while field!=0 && ordinal<=l.count {
+            if abi_span_equal(l,node,field) { found=true;break; }ordinal=ordinal+1;field=abi_record_field(l,ty,ordinal);
+        }
+        if found==false || n(l,field,14)!=n(l,node,14) { bad(l,node,E_AST());return 0; }
+        offset=constant(l,node,ordinal*8,64,0);
+    }else { bad(l,node,E_AST());return 0; }
+    let mut spec:u64=bytes;if writable { spec=spec|(1<<63); }
+    l.access_handle=base.id;l.access_offset=offset.id;l.access_spec=spec;
+    let address:V=abi_runtime(l,node,8,base,offset,constant(l,node,spec,64,0));return address.id;
+}
+fn abi_read_access(l:L,node:u64)->V {
+    let address:u64=abi_access(l,node,false);let ty:u64=n(l,node,14);
+    // THE WIDTH IS THE WIDTH THE ACCESS VALIDATED, AND IT IS NOT A RULE OF
+    // THIS FUNCTION'S OWN: `abi_access` checked the storage and published the
+    // number of BYTES it checked in `access_spec` -- one byte for an index
+    // into a `buf<u8>`, eight for an index into a `buf<u64>`, and eight for a
+    // record field, whose slot is eight bytes wide.
+    //
+    // A READ WIDER THAN THE STORAGE IT VALIDATED READS BYTES THE ACCESS NEVER
+    // PROMISED. An index at the last byte of a page, read eight bytes wide,
+    // would cross into the page after it and fault on memory the program never
+    // had, and the fault would be one the program did not deserve.
+    //
+    // THE WIDTH IS A MACHINE WIDTH: one byte is eight bits, and
+    // `machine_emit`'s `emit_load` refuses any width that is not 8, 16, 32 or
+    // 64. A BOOL FIELD IS STILL READ AS ITS EIGHT BYTE SLOT and narrowed
+    // afterwards by the coercion, exactly as it was: a one bit load is not a
+    // machine width at all, and the reference reads the byte and normalizes.
+    let mask:u64=9223372036854775807;let spec:u64=l.access_spec&mask;
+    let raw:V=load(l,node,abi_address(l,address,0),spec*8,0);
+    put(l,l.b.records,11,1);put(l,l.b.records,13,machine_ir.FLAG_MAY_FAULT());
+    let mut v:V=coerce(l,node,raw,bits(l,ty),sign(ty));
+    // THE SCALAR THAT LEAVES AN ACCESS.
+    //
+    // A LOAD THAT GOES THROUGH MEMORY carries the space of that memory, and a
+    // value that carries a space is not a plain scalar: the verifier refuses a
+    // local cell whose initial value is not one, because `local_scalar` asks
+    // for the space zero. So when the coercion did NOT build a scalar of its
+    // own -- and it does not when the width and the sign already match -- the
+    // value that leaves here is the load's own value, with the load's space.
+    //
+    // THE COPY IS WHAT FIXES IT, AND IT IS A REAL COPY: a `mir_copy` of the
+    // owner, with the same width and the same sign, in the value class, and
+    // with the space of a plain scalar, which is zero. The coercion's own
+    // result is kept when it produced one -- an extension, a truncation or a
+    // conversion is already a scalar and needs no second copy.
+    //
+    // THE LOAD IS NOT TOUCHED: it keeps its space, its MAY_FAULT and its
+    // width, and the access that produced the value is still the access,
+    // with the guard that reads the fault flag. The copy is a copy of the
+    // value, and not a second read of the memory.
+    if v.id!=0 && v.id==raw.id {
+        v=value_record(l,2069,node,raw.id,0,1,raw.width,raw.sign,machine_ir.CLASS_VALUE(),machine_ir.OP_COPY());
+    }
+    if buffer_type(ty) { return abi_buffer(l,node,v.id,ty,0); }return v;
+}
+fn abi_record(l:L,node:u64)->V {
+    let ty:u64=n(l,node,14);let count:u64=abi_field_count(l,ty);let zero:V=constant(l,node,0,64,0);
+    let handle:V=abi_runtime(l,node,0,constant(l,node,count*8,64,0),zero,zero);
+    let seen:buf<u64>=alloc(runtime(),count);let mut i:u64=0;while i<count { seen[i]=0;i=i+1; }
+    let mut child:u64=n(l,node,2);let mut supplied:u64=0;
+    while child!=0 && supplied<=count && l.code==0 {
+        let ordinal:u64=n(l,child,15);let field:u64=abi_record_field(l,ty,ordinal);
+        if n(l,child,0)!=4 || n(l,child,1)!=node || ordinal>=count || field==0 { bad(l,child,E_AST());break; }
+        if seen[ordinal]!=0 || n(l,child,14)!=n(l,field,14) { bad(l,child,E_AST());break; }seen[ordinal]=1;
+        let field_ty:u64=n(l,field,14);let v:V=coerce(l,child,expr(l,n(l,child,2),field_ty),bits(l,field_ty),sign(field_ty));
+        let wide:V=coerce(l,child,v,64,sign(field_ty));
+        let pointer:V=abi_runtime(l,child,8,handle,constant(l,child,ordinal*8,64,0),constant(l,child,(1<<63)|8,64,0));
+        let r:u64=store(l,child,abi_address(l,pointer.id,0),wide,64,sign(field_ty));put(l,r,11,1);put(l,r,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());
+        child=n(l,child,4);supplied=supplied+1;
+    }
+    if child!=0 || supplied!=count { bad(l,node,E_AST()); }
+    rt_free(runtime(),seen);return handle;
+}
+fn abi_bytes(l:L,node:u64,v:V,ty:u64)->V {
+    if buffer_type(ty) {
+        let count:V=owned(l,v.length,64,0,machine_ir.CLASS_VALUE());
+        if ty==11 { return abi_binary(l,count,constant(l,node,8,64,0),machine_ir.OP_MUL()); }return count;
+    }
+    if ty>12 { return constant(l,node,abi_field_count(l,ty)*8,64,0); }
+    bad(l,node,E_AST());return empty(l);
+}
+fn abi_intrinsic(l:L,node:u64)->V {
+    let op:u64=n(l,node,13);let first:u64=n(l,node,2);let zero:V=constant(l,node,0,64,0);
+    if op==1 { return owned(l,l.context,64,0,machine_ir.CLASS_VALUE()); }
+    if op>=13 && op<=20 {
+        let ty:u64=op-12;return coerce(l,node,expr(l,first,n(l,first,14)),bits(l,ty),sign(ty));
+    }
+    if op==2 { let base:V=expr(l,first,n(l,first,14));return abi_length(l,node,base,n(l,first,14)); }
+    if op==3 {
+        expr(l,first,12);let size_node:u64=n(l,first,4);let count:V=expr(l,size_node,4);let ty:u64=n(l,node,14);
+        let mut bytes:V=count;l.fault_node=node;
+        if ty==11 {
+            abi_guard(l,abi_compare(l,count,constant(l,node,2305843009213693951,64,0),machine_ir.OP_GT_U()),4);
+            bytes=abi_binary(l,count,constant(l,node,8,64,0),machine_ir.OP_MUL());
+        }
+        let handle:V=abi_runtime(l,node,0,bytes,zero,zero);
+        abi_guard(l,abi_compare(l,handle,zero,machine_ir.OP_EQ()),6);return abi_buffer(l,node,handle.id,ty,count.id);
+    }
+    if op==4 {
+        let ty:u64=n(l,first,14);let base:V=expr(l,first,ty);let start_node:u64=n(l,first,4);let size_node:u64=n(l,start_node,4);
+        let start:V=expr(l,start_node,4);let size:V=expr(l,size_node,4);let length:V=abi_length(l,node,base,ty);
+        l.fault_node=node;abi_guard(l,abi_compare(l,start,length,machine_ir.OP_GT_U()),4);
+        let available:V=abi_binary(l,length,start,machine_ir.OP_SUB());abi_guard(l,abi_compare(l,size,available,machine_ir.OP_GT_U()),4);
+        let mut byte_start:V=start;let mut byte_size:V=size;
+        if ty==11 { let eight:V=constant(l,node,8,64,0);byte_start=abi_binary(l,start,eight,machine_ir.OP_MUL());byte_size=abi_binary(l,size,eight,machine_ir.OP_MUL()); }
+        let handle:V=abi_runtime(l,node,9,base,byte_start,byte_size);return abi_buffer(l,node,handle.id,ty,size.id);
+    }
+    // Remaining runtime intrinsics evaluate the descriptor argument even
+    // though ABI2 selects the actual descriptor through its hidden context.
+    expr(l,first,12);let second:u64=n(l,first,4);let mut third:u64=0;let mut fourth:u64=0;
+    if second!=0 { third=n(l,second,4); }if third!=0 { fourth=n(l,third,4); }
+    if op==5 || op==6 || op==7 || op==11 {
+        let ty:u64=n(l,second,14);let handle:V=expr(l,second,ty);let bytes:V=abi_bytes(l,node,handle,ty);
+        let mut operation:u64=1;if op==6 { operation=2; }if op==7 { operation=3; }if op==11 { operation=7; }
+        return abi_runtime(l,node,operation,handle,bytes,zero);
+    }
+    if op==8 || op==9 {
+        let file:V=expr(l,second,4);let ty:u64=n(l,third,14);let handle:V=expr(l,third,ty);let bytes:V=abi_bytes(l,node,handle,ty);
+        let mut operation:u64=4;if op==9 { operation=5; }return abi_runtime(l,node,operation,file,handle,bytes);
+    }
+    if op==10 { return abi_runtime(l,node,6,expr(l,second,4),zero,zero); }
+    if op==12 {
+        let dst:V=expr(l,second,10);let src:V=expr(l,third,10);let size:V=expr(l,fourth,4);
+        return abi_runtime(l,node,12,dst,src,size);
+    }
+    bad(l,node,E_UNSUPPORTED());return empty(l);
+}
+fn abi_body_call(l:L,decl:u64,args:buf<u64>,argc:u64,ty:u64)->V {
+    let nt_fn:u64=l.functions[n(l,decl,15)*2+1];
+    let symbol:u64=rec(l,2057,0);name_symbol(l,nt_fn,symbol);
+    let r:u64=rec(l,2076,0);let result:u64=machine_ir.native_value(l.b);
+    put(l,r,4,result);put(l,r,5,symbol);put(l,r,9,bits(l,ty));put(l,r,10,sign(ty));put(l,r,12,machine_ir.CLASS_VALUE());
+    put(l,r,13,machine_ir.FLAG_SIDE_EFFECT()+machine_ir.FLAG_MAY_FAULT());put(l,r,14,argc);put(l,r,15,machine_ir.OP_CALL());
+    let mut taken:u64=argc+1;if taken>3 { taken=3; }put(l,r,8,taken);
+    let mut i:u64=0;while i<argc {
+        if i<2 { put(l,r,6+i,args[i]); }else { let extra:u64=rec(l,2083,0);put(l,extra,5,args[i]);put(l,extra,6,r);put(l,extra,8,2);put(l,extra,14,i); }
+        i=i+1;
+    }
+    return owned(l,result,bits(l,ty),sign(ty),machine_ir.CLASS_VALUE());
+}
+fn abi_wrapper(l:L,decl:buf<u8>)->u64 {
+    l.origin=l.wrapper_origin;l.current_fn=0;l.return_type=4;
+    let f:u64=machine_ir.native_callable(l.b,decl,l.nt,l.nt_count,l.origin);
+    let params:buf<u64>=alloc(runtime(),3);let mut p:u64=f+1;let mut found:u64=0;
+    while p<l.b.block && found<3 {
+        if get(l,p,0)==2054 && get(l,p,16)==f { params[found]=get(l,p,4);found=found+1; }p=p+1;
+    }
+    if found!=3 { rt_free(runtime(),params);return bad(l,0,E_AST()); }
+    l.context=params[0];let zero:V=constant(l,0,0,64,0);
+    let ctx:V=owned(l,params[0],64,0,machine_ir.CLASS_VALUE());
+    abi_guard(l,abi_compare(l,ctx,zero,machine_ir.OP_EQ()),0);
+    abi_guard(l,abi_compare(l,abi_load(l,l.context,8),constant(l,0,48,64,0),machine_ir.OP_LT_U()),0);
+    // Explicitly update the physical R15 cell. No R15 clobber is published:
+    // the ordinary frame restores the caller's saved R15 at wrapper return.
+    let set:V=value_record(l,2065,0,l.context,0,1,64,0,machine_ir.CLASS_VALUE(),machine_ir.OP_COPY());
+    put(l,l.b.records,20,16);put(l,l.b.records,22,2);
+    abi_guard(l,abi_compare(l,abi_load(l,l.context,0),constant(l,0,2,64,0),machine_ir.OP_NE()),6);
+    abi_guard(l,abi_compare(l,abi_load(l,l.context,16),zero,machine_ir.OP_NE()),0);
+    let mut node:u64=n(l,l.main_node,2);let mut argc:u64=0;let mut result_type:u64=0;
+    while node!=0 {
+        if n(l,node,0)==6 { argc=argc+1;if buffer_type(n(l,node,14)) { argc=argc+1; } }
+        if n(l,node,0)==7 { result_type=n(l,node,14); }node=n(l,node,4);
+    }
+    let count:V=owned(l,params[2],64,0,machine_ir.CLASS_VALUE());
+    abi_guard(l,abi_compare(l,count,constant(l,0,argc,64,0),machine_ir.OP_NE()),10);
+    let args:buf<u64>=alloc(runtime(),64);
+    if argc>0 {
+        let pointer:V=owned(l,params[1],64,0,machine_ir.CLASS_VALUE());
+        abi_guard(l,abi_compare(l,pointer,zero,machine_ir.OP_EQ()),10);
+    }
+    node=n(l,l.main_node,2);let mut i:u64=0;
+    while node!=0 && l.code==0 {
+        if n(l,node,0)==6 {
+            let ty:u64=n(l,node,14);let v:V=abi_load(l,params[1],i*8);let bits:u64=bits(l,ty);
+            if bits==0 || i>=64 { bad(l,node,E_UNSUPPORTED()); }else {
+                if buffer_type(ty) {
+                    if i+1>=64 { bad(l,node,E_BOUND()); }else {
+                        let length:V=abi_load(l,params[1],(i+1)*8);let actual:V=abi_length(l,node,v,ty);
+                        abi_guard(l,abi_compare(l,length,actual,machine_ir.OP_NE()),10);
+                        args[i]=v.id;args[i+1]=length.id;i=i+1;
+                    }
+                }else {
+                if bits<64 {
+                    let mut mask:u64=(1<<bits)-1;if bits==1 { mask=1; }
+                    let mask_value:V=constant(l,0,mask,64,0);
+                    let norm:V=value_record(l,2070,0,v.id,mask_value.id,2,64,0,machine_ir.CLASS_VALUE(),machine_ir.OP_AND());
+                    abi_guard(l,abi_compare(l,v,norm,machine_ir.OP_NE()),10);
+                }
+                let coerced:V=coerce(l,node,v,bits,sign(ty));args[i]=coerced.id;
+                }
+            }
+            i=i+1;
+        }
+        node=n(l,node,4);
+    }
+    if l.code==0 {
+        let result:V=abi_body_call(l,l.main_node,args,argc,result_type);
+        abi_guard(l,abi_compare(l,abi_load(l,l.context,16),zero,machine_ir.OP_NE()),0);
+        abi_return(l,result);
+    }
+    rt_free(runtime(),args);rt_free(runtime(),params);return l.code;
+}
+// THE COMMON CORE. The mono profile and the multi-source profile differ in
+// THREE THINGS and in nothing else: the root's main is chosen by a rule
+// instead of by position, the spans say which file an offset belongs to, and
+// the module table says which module a declaration belongs to. Everything
+// else -- the declaration text, the MIR, the bodies, the wrapper -- is this
+// code, so there is ONE backend and not two.
+//
+// THE `closed` FLAG IS THE CLOSED APPLICATION MODE AND IT IS NOT THE ABI.
+// `abi2` says which ABI the program speaks; `closed` says whether the program
+// is closed, that is, whether only the functions the root module's main can
+// reach are emitted. The flag is EXPLICIT: it is its own parameter and it is
+// never folded into the ABI's number.
+//
+// THE BATCH PARAMETERS ARE EXPLICIT TOO, and they are not the ABI either: a
+// batch is a RANGE OF RANKS over the reachable functions, in ordinal order,
+// and the object it produces DEFINES the functions in that range and IMPORTS
+// the rest.
+export fn lower_core(source:buf<u8>,nodes:buf<u64>,count:u64,program:u64,spans:buf<u64>,span_count:u64,modules:buf<u64>,root_idx:u64,multi:u64,text_out:buf<u8>,text_length:buf<u64>,
+                     words:buf<u64>,capacity:u64,report:buf<u64>,abi2:u64,closed:u64)->u64 {
+    return lower_core_batch(source,nodes,count,program,spans,span_count,modules,root_idx,multi,text_out,text_length,words,capacity,report,abi2,closed,0,0,0);
+}
+export fn lower_core_batch(source:buf<u8>,nodes:buf<u64>,count:u64,program:u64,spans:buf<u64>,span_count:u64,modules:buf<u64>,root_idx:u64,multi:u64,text_out:buf<u8>,text_length:buf<u64>,
+                     words:buf<u64>,capacity:u64,report:buf<u64>,abi2:u64,closed:u64,batch:u64,batch_start:u64,batch_limit:u64)->u64 {
+    // Invalidate public outputs before any early refusal, within both the
+    // actual buffers and the caller's logical MIR capacity.
+    if len(text_length)>0 { text_length[0]=0; }
+    if len(words)>=machine_ir.HEADER_WORDS() && capacity>=machine_ir.HEADER_WORDS() && capacity<=len(words) { words[3]=0; }
+    if len(text_length)<1 || len(report)<14 || count==0 || count>len(nodes)/16 || capacity>len(words) || capacity<machine_ir.HEADER_WORDS() {
+        if len(report)>=4 { report[0]=0;report[1]=0;report[2]=E_BOUND();report[3]=0; }
+        return E_BOUND();
+    }
+    let bindings:buf<u64>=alloc(runtime(),(count+1)*4);let functions:buf<u64>=alloc(runtime(),(count+1)*2);
+    let lengths:buf<u64>=alloc(runtime(),count+1);let structs:buf<u64>=alloc(runtime(),count+13);
+    let heads:buf<u64>=alloc(runtime(),count+1);let active:buf<u64>=alloc(runtime(),count+1);let breaks:buf<u64>=alloc(runtime(),count*2);
+    let no:buf<u64>=alloc(runtime(),0);
+    // THE MARKING'S OWN TABLES, IN THE CLOSED MODE ONLY. The normal profile
+    // never allocates them, so its memory and its verdicts are the ones it
+    // had. The handles are held by variables that can be REASSIGNED, and the
+    // buffers themselves are named by temporaries whose initialiser IS the
+    // allocation: a handle is never produced by an assignment to an
+    // immutable binding.
+    //
+    // SIX TABLES: the stack, the queue, the reachable flags, the ordinals,
+    // the visited nodes and the LIVE LITERALS. The last one is the marking's
+    // own answer to "which literals belong to a reachable function", and it
+    // is filled by the same walk that fills the others.
+    let mut work:buf<u64>=no;let mut queue:buf<u64>=no;let mut reach:buf<u64>=no;
+    let mut fnord:buf<u64>=no;let mut seen:buf<u64>=no;let mut litlive:buf<u64>=no;
+    // THE BATCH'S OWN TABLES: the reachable functions in ordinal order, and
+    // the ones this object defines.
+    let mut batchord:buf<u64>=no;let mut batchsel:buf<u64>=no;
+    let mut fnnodes:buf<u64>=no;let mut imports:buf<u64>=no;
+    if closed!=0 || batch!=0 {
+        let w:buf<u64>=alloc(runtime(),count+2);
+        let q:buf<u64>=alloc(runtime(),count+2);
+        let r:buf<u64>=alloc(runtime(),count+1);
+        let f:buf<u64>=alloc(runtime(),count+1);
+        let s:buf<u64>=alloc(runtime(),count+1);
+        let v:buf<u64>=alloc(runtime(),count+1);
+        work=w;queue=q;reach=r;fnord=f;seen=s;litlive=v;
+    }
+    if batch!=0 {
+        let bo:buf<u64>=alloc(runtime(),count+2);
+        let bs:buf<u64>=alloc(runtime(),count+1);
+        let bi:buf<u64>=alloc(runtime(),count+1);
+        batchord=bo;batchsel=bs;imports=bi;
+    }
+    let funcidx:FunctionIndex=FunctionIndex{nodes:no,imports:imports,declared:0,reachable:0,emitted:0};
+    let l:L=L{source:source,nodes:nodes,count:count,text:text_out,at:0,nt:no,nt_count:0,b:null,
+        bindings:bindings,functions:functions,heads:heads,active:active,breaks:breaks,break_count:0,
+        code:0,node:0,origin:0,current_fn:0,return_type:0,depth:0,owned_head:null,
+        abi2:abi2,main_node:0,wrapper_origin:0,context:0,
+        lengths:lengths,structs:structs,runtime_origin:0,runtime_sig:0,fault_node:0,
+        access_handle:0,access_offset:0,access_spec:0,
+        lits:no,litv:no,lit_count:0,lit_chunks:0,dec_byte:0,dec_next:0,runtime_mask:0,
+        many:Many{program:program,spans:spans,span_count:span_count,modules:modules,root_idx:root_idx,multi:multi},
+        src_index:1,rel_offset:0,root_module:0,helper_origin:0,
+        closed:closed,work:work,queue:queue,reach:reach,fnord:fnord,seen:seen,litlive:litlive,
+        batch:batch,batch_start:batch_start,batch_limit:batch_limit,batchord:batchord,batchsel:batchsel,
+        batch_count:0,batch_selected:0,runtime_import:0,sig_ret:0,
+        funcidx:funcidx};
+    let mut i:u64=0;while i<(count+1)*4 { bindings[i]=0;i=i+1; }
+    i=0;while i<(count+1)*2 { functions[i]=0;i=i+1; }
+    i=0;while i<=count { heads[i]=0;active[i]=0;i=i+1; }
+    i=0;while i<=count { lengths[i]=0;i=i+1; }
+    i=0;while i<count+13 { structs[i]=0;i=i+1; }
+    // THE MARKING'S TABLES ARE ZEROED IN THE CLOSED MODE ONLY. In the normal
+    // mode they are the empty buffer, and writing into the empty buffer is
+    // a write with no room.
+    if closed!=0 || batch!=0 { i=0;while i<=count { reach[i]=0;fnord[i]=0;seen[i]=0;litlive[i]=0;i=i+1; } }
+    if batch!=0 { i=0;while i<=count { batchsel[i]=0;imports[i]=0;i=i+1; } }
+    i=1;while i<=count && l.code==0 {
+        if n(l,i,0)==3 {
+            let ty:u64=n(l,i,14);
+            if ty<=12 || ty>=len(structs) || structs[ty]!=0 { bad(l,i,E_AST()); }else { structs[ty]=i; }
+        }
+        i=i+1;
+    }
+    // THE ROOT'S MODULE AND ITS MAIN. The unit table answers the module id of
+    // the root's source index, and the main must be UNIQUE and must belong to
+    // that module. The bounds are checked here and not assumed: the frontend
+    // refuses more than sixty four sources, and a root index outside the
+    // table is a refusal and not a read.
+    if l.many.multi!=0 {
+        if l.many.span_count==0 || l.many.span_count>64 { bad(l,0,E_BOUND()); }
+        else if len(l.many.spans)<l.many.span_count*2 { bad(l,0,E_BOUND()); }
+        else if len(l.many.modules)<l.many.span_count*9 { bad(l,0,E_BOUND()); }
+        else if l.many.root_idx>=l.many.span_count { bad(l,0,E_BOUND()); }
+        else if l.many.program==0 || l.many.program>l.count { bad(l,0,E_AST()); }
+        else {
+            l.root_module=l.many.modules[l.many.root_idx*9+2];
+            select_root_main(l);
+        }
+    }
+    // THE CLOSED APPLICATION MODE. The reachable functions are marked BEFORE
+    // the declaration text is written, because the text carries the
+    // declarations and the text is parsed once: a function that is not
+    // reachable must not be in it, and the marking needs the root's main,
+    // which the rule above has chosen.
+    if (l.closed!=0 || l.batch!=0) && l.code==0 {
+        index_functions(l);
+        // The count is known now. Fill exactly once in AST order, without
+        // assuming dense ordinals or filtering to the reachable functions.
+        if l.funcidx.declared!=0 {
+            let names:buf<u64>=alloc(runtime(),l.funcidx.declared);
+            fnnodes=names;l.funcidx.nodes=names;
+            let mut name_count:u64=0;i=1;
+            while i<=count {
+                if n(l,i,0)==5 { names[name_count]=i;name_count=name_count+1; }
+                i=i+1;
+            }
+        }
+        mark_reachable(l);
+    }
+    // THE BATCH'S RANKS ARE CHOSEN FROM THE REACHABLE FUNCTIONS, IN ORDINAL
+    // ORDER, and the range is refused when it names nothing.
+    if l.batch!=0 && l.code==0 {
+        select_batch(l);
+        if l.code==0 { select_imports(l); }
+    }
+    // THE STRING LITERALS ARE COUNTED AND DECODED BEFORE THE DECLARATION TEXT
+    // IS WRITTEN, because that text is parsed once and the storage items have
+    // to be inside it. A string that is not in the text has no address to take.
+    if l.abi2!=0 { count_literals(l); }
+    let lits:buf<u64>=alloc(runtime(),l.lit_count*6);
+    let litv:buf<u64>=alloc(runtime(),l.lit_chunks);
+    l.lits=lits;l.litv=litv;
+    if l.abi2!=0 { decode_literals(l); }
+    declarations(l);
+    rt_free(runtime(),no);
+    let decl:buf<u8>=alloc(runtime(),l.at);i=0;while i<l.at { decl[i]=text_out[i];i=i+1; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(decl,1);
+    let nt_words:u64=ntir.HEADER_WORDS()+tree.node_count*ntir.NODE_WORDS();let image:buf<u64>=alloc(runtime(),nt_words);
+    if l.code==0 && tree.ok==false { bad(l,0,E_AST()); }
+    if l.code==0 { let code:u64=ntir.build(decl,tree,image,nt_words);if code!=0 { bad(l,0,code); } }
+    // Match canonical declarations to the original resolved function ordinals.
+    // THE CLOSED MODE MATCHS ONLY THE EMITTED DECLARATIONS: the text carries
+    // one function per reachable declaration, so the walk pairs the same
+    // declarations with the same NTIR nodes, in the same order.
+    //
+    // A BATCH'S TEXT CARRIES IMPORTS AS WELL AS DEFINITIONS, so the walk
+    // cannot take "the next function node" for every declaration: an IMPORTED
+    // function has no function node at all. The imports are matched to the
+    // declarations this object does NOT define, in the order the text wrote
+    // them, and the definitions to the declarations it DOES define, in the
+    // order the text wrote them. Both walks read the real nodes of the real
+    // text; neither of them guesses.
+    let mut cursor:u64=1;let mut import_cursor:u64=1;i=1;
+    while i<=count && l.code==0 {
+        if n(l,i,0)==5 {
+            let ord:u64=n(l,i,15);
+            let mut live:bool=is_reachable(l,ord);
+            let mut define:bool=live;
+            if l.batch!=0 { define=defines(l,ord);live=define || imports_function(l,ord); }
+            if live && define {
+                while cursor<=tree.node_count && image[ntir.HEADER_WORDS()+(cursor-1)*ntir.NODE_WORDS()]-ntir.KIND_BASE()+1!=18 { cursor=cursor+1; }
+                if cursor>tree.node_count { bad(l,i,E_AST()); }else { functions[n(l,i,15)*2+1]=cursor;cursor=cursor+1; }
+            } else if live {
+                // AN IMPORTED FUNCTION: THE NEXT IMPORT NODE. The imports are
+                // the text's own declarations, so the walk finds them where the
+                // text put them.
+                while import_cursor<=tree.node_count && image[ntir.HEADER_WORDS()+(import_cursor-1)*ntir.NODE_WORDS()]-ntir.KIND_BASE()+1!=9 { import_cursor=import_cursor+1; }
+                if import_cursor>tree.node_count { bad(l,i,E_AST()); }else { functions[n(l,i,15)*2+1]=import_cursor;import_cursor=import_cursor+1; }
+            }
+        }
+        i=i+1;
+    }
+    if l.abi2!=0 && l.code==0 {
+        if is_first_batch(l) {
+            // THE OBJECT DEFINES THE ENTRY, THE RUNTIME SIGNATURE AND THE
+            // HELPER, so their nodes are the definitions the text wrote.
+            while cursor<=tree.node_count && image[ntir.HEADER_WORDS()+(cursor-1)*ntir.NODE_WORDS()]-ntir.KIND_BASE()+1!=18 { cursor=cursor+1; }
+            if cursor>tree.node_count { bad(l,0,E_AST()); }else { l.wrapper_origin=cursor; }
+            cursor=cursor+1;
+            while cursor<=tree.node_count && image[ntir.HEADER_WORDS()+(cursor-1)*ntir.NODE_WORDS()]-ntir.KIND_BASE()+1!=18 { cursor=cursor+1; }
+            if cursor>tree.node_count { bad(l,0,E_AST()); }else { l.runtime_origin=cursor; }
+            cursor=cursor+1;
+            // THE HELPER'S NODE: the function after the runtime signature's, which
+            // is the helper because the lower writes its declaration LAST.
+            while cursor<=tree.node_count && image[ntir.HEADER_WORDS()+(cursor-1)*ntir.NODE_WORDS()]-ntir.KIND_BASE()+1!=18 { cursor=cursor+1; }
+            if cursor>tree.node_count { bad(l,0,E_AST()); }else { l.helper_origin=cursor; }
+        } else {
+            // A BATCH THAT DOES NOT DEFINE THE ENTRY IMPORTS THE RUNTIME
+            // SIGNATURE AND THE HELPER, and their nodes are the import nodes
+            // the text wrote after the functions' own imports.
+            while import_cursor<=tree.node_count && image[ntir.HEADER_WORDS()+(import_cursor-1)*ntir.NODE_WORDS()]-ntir.KIND_BASE()+1!=9 { import_cursor=import_cursor+1; }
+            if import_cursor>tree.node_count { bad(l,0,E_AST()); }else { l.runtime_origin=import_cursor;l.runtime_import=import_cursor; }
+            import_cursor=import_cursor+1;
+            while import_cursor<=tree.node_count && image[ntir.HEADER_WORDS()+(import_cursor-1)*ntir.NODE_WORDS()]-ntir.KIND_BASE()+1!=9 { import_cursor=import_cursor+1; }
+            if import_cursor>tree.node_count { bad(l,0,E_AST()); }else { l.helper_origin=import_cursor; }
+        }
+    }
+    // Legacy scratch holds declaration facts only. Native body values/blocks
+    // live in caller-owned MIR and the AST-sized tables above, not this limit.
+    let mut builder:machine_ir.Builder=null;
+    if l.code==0 {
+        builder=machine_ir.native_writer(words,capacity,tree.node_count);
+        l.b=builder;
+        machine_ir.native_declarations(builder,decl,image,tree.node_count);
+    }
+    l.nt=image;l.nt_count=tree.node_count;
+    if l.abi2!=0 && l.code==0 && builder.code==0 && is_first_batch(l) {
+        l.origin=l.runtime_origin;l.current_fn=0;l.return_type=4;
+        l.runtime_sig=machine_ir.native_callable(builder,decl,image,tree.node_count,l.origin);
+        // THE CLOBBER MASK IS TAKEN FROM THE MIR RIGHT HERE, where the
+        // signature's own records exist, and every call site publishes that
+        // one answer.
+        l.runtime_mask=abi_signature_mask(l);
+        // THE RUNTIME SIGNATURE'S OWN RETURN, and it is here and not after the
+        // helper: the builder's current function is the signature's only until
+        // the helper's callable is created, and a return that lands in the
+        // wrong function is a function with two terminators.
+        abi_return(l,constant(l,0,0,64,0));release_values(l);
+        // THE HELPER'S OWN FUNCTION AND ITS BODY, EMITTED ONCE. The helper is
+        // a function of the generated unit, so its records live in the image
+        // like any other function's, and the call sites reach it by name.
+        l.origin=l.helper_origin;l.current_fn=0;l.return_type=4;
+        let helper:u64=machine_ir.native_callable(builder,decl,image,tree.node_count,l.origin);
+        abi_helper_body(l,helper);
+        l.origin=l.runtime_origin;
+    }
+    if l.abi2!=0 && l.code==0 && builder.code==0 && is_later_batch(l) {
+        // A LATER BATCH DOES NOT DEFINE THE RUNTIME SIGNATURE, and it FINDS
+        // ITS RECORD: the unit walk emitted the import, and the record that
+        // came from the import's own node is the one the call sites name.
+        l.runtime_sig=record_of_origin(l,l.runtime_import);
+        if l.runtime_sig==0 { bad(l,0,E_AST()); }
+        else { l.runtime_mask=abi_signature_mask(l); }
+    }
+    i=1;
+    while i<=count && l.code==0 && builder.code==0 {
+        if n(l,i,0)==5 {
+            let ord:u64=n(l,i,15);
+            // THE CLOSED MODE EMITS NO BODY FOR AN UNREACHABLE FUNCTION, AND A
+            // BATCH EMITS NO BODY FOR A FUNCTION IT DOES NOT DEFINE. The
+            // declaration is not in the text either, so there is no NTIR node
+            // for it and no callable to create.
+            let mut live:bool=defines(l,ord);
+            if live {
+            l.origin=functions[ord*2+1];l.current_fn=i;
+            let f:u64=machine_ir.native_callable(builder,decl,image,tree.node_count,l.origin);
+            if l.abi2!=0 { l.context=abi_context(l); }
+            let mut p:u64=n(l,i,2);let mut mir_param:u64=f+1;let mut body:u64=0;
+            while p!=0 && l.code==0 {
+                let kind:u64=n(l,p,0);
+                if kind==6 {
+                    while mir_param<builder.block && get(l,mir_param,0)!=2054 { mir_param=mir_param+1; }
+                    let binding:u64=n(l,p,15);
+                    if mir_param>=builder.block || binding==0 || binding>count || bindings[binding*4]!=0 { bad(l,p,E_AST()); }
+                    else {
+                        bindings[binding*4]=get(l,mir_param,4);bindings[binding*4+2]=n(l,p,14);bindings[binding*4+3]=i;mir_param=mir_param+1;
+                        if l.abi2!=0 && buffer_type(n(l,p,14)) {
+                            while mir_param<builder.block && get(l,mir_param,0)!=2054 { mir_param=mir_param+1; }
+                            if mir_param>=builder.block { bad(l,p,E_AST()); }else { lengths[binding]=get(l,mir_param,4);mir_param=mir_param+1; }
+                        }
+                    }
+                }else if kind==7 { l.return_type=n(l,p,14); }else if kind==8 { body=p; }
+                p=n(l,p,4);
+            }
+            if body==0 || bits(l,l.return_type)==0 { bad(l,i,E_UNSUPPORTED()); }
+            else { statements(l,body);if builder.term==0 && l.code==0 { bad(l,i,E_AST()); } }
+            release_values(l);
+            }
+        }
+        i=i+1;
+    }
+    if l.abi2!=0 && l.code==0 && builder.code==0 && is_first_batch(l) {
+        // THE ENTRY BELONGS TO THE FIRST BATCH: the other batches are parts of
+        // the program and a part has no entry of its own.
+        abi_wrapper(l,decl);release_values(l);
+    }
+    if l.code==0 && builder.code!=0 { bad(l,l.node,builder.code); }
+    if l.code==0 { let code:u64=machine_ir.native_finish(builder,image,tree.node_count);if code!=0 { bad(l,0,code); } }
+    if l.code==0 { let code:u64=machine_pipeline.finalize_native(decl,tree,words,report);if code!=0 { l.code=code; } }
+    else {
+        report[0]=l.node;report[1]=0;report[2]=l.code;report[3]=0;
+        if l.node!=0 {
+            report[1]=n(l,l.node,11);report[3]=n(l,l.node,12);
+            // THE SOURCE INDEX AND THE OFFSET INSIDE THAT SOURCE, so a reader
+            // knows which FILE the refusal is in and where in it.
+            locate(l,n(l,l.node,5));report[9]=l.src_index;report[10]=l.rel_offset;
+        }
+    }
+    if l.code==0 { text_length[0]=l.at; }
+    // THE CLOSED MODE'S THREE COUNTS, PUBLISHED FOR THE READER THAT MEASURES
+    // THE MODE. [4] is the number of FUNCTIONS THE PROGRAM DECLARES, [5] the
+    // number of them the root module's main can REACH, and [6] the number of
+    // DECLARATIONS THE EMITTED UNIT CARRIES: reachable ones in closed mode,
+    // or selected definitions and their direct imports in batch mode, plus
+    // synthetic declarations (three in the first object, two in later ones).
+    // The three counts are different things and they have three names.
+    // [7] is the number of functions THIS OBJECT DEFINES, which is the batch's
+    // own count and is zero in the other modes.
+    //
+    // THE COUNTS ARE READ BY THE CALLER BEFORE THE EMISSION STAGE RUNS: the
+    // object stage clears the report, so a count read after it would be a
+    // count of something else.
+    if (l.closed!=0 || l.batch!=0) && len(report)>=8 {
+        report[4]=l.funcidx.declared;report[5]=l.funcidx.reachable;report[6]=l.funcidx.emitted;report[7]=l.batch_selected;
+    }
+    release_values(l);
+    if builder!=null { machine_ir.native_release(builder); }
+    rt_free(runtime(),image);ntasm_ast.release(tree);rt_free(runtime(),tree);rt_free(runtime(),decl);
+    rt_free(runtime(),breaks);rt_free(runtime(),active);rt_free(runtime(),heads);rt_free(runtime(),functions);rt_free(runtime(),bindings);
+    rt_free(runtime(),lengths);rt_free(runtime(),structs);
+    rt_free(runtime(),litv);rt_free(runtime(),lits); // through the LOCALS: a runtime buffer argument must NAME a buffer, and the seed refuses a field access there (E400).
+    if l.funcidx.declared!=0 { rt_free(runtime(),fnnodes); }
+    if l.closed!=0 || l.batch!=0 {
+        rt_free(runtime(),litlive);rt_free(runtime(),seen);rt_free(runtime(),fnord);rt_free(runtime(),reach);
+        rt_free(runtime(),queue);rt_free(runtime(),work);
+    }
+    if l.batch!=0 { rt_free(runtime(),imports);rt_free(runtime(),batchsel);rt_free(runtime(),batchord); }
+    let result:u64=l.code;rt_free(runtime(),funcidx);rt_free(runtime(),l);return result;
+}
+// THE MONO PROFILE. One source, one module, no spans: the core reads an
+// empty multi context, and the scalar and the ABI2 mono paths keep the
+// behaviour they had.
+export fn lower_profile(source:buf<u8>,nodes:buf<u64>,count:u64,text_out:buf<u8>,text_length:buf<u64>,
+                       words:buf<u64>,capacity:u64,report:buf<u64>,abi2:u64)->u64 {
+    // THE MULTI CONTEXT IS EMPTY HERE: one source, one module and no spans. The two table slots hold the caller's own buffers, which are then never read, and no buffer is allocated for a context that will not be read.
+    return lower_core(source,nodes,count,0,nodes,0,nodes,0,0,text_out,text_length,words,capacity,report,abi2,0);
+}
+export fn lower(source:buf<u8>,nodes:buf<u64>,count:u64,text_out:buf<u8>,text_length:buf<u64>,
+                words:buf<u64>,capacity:u64,report:buf<u64>)->u64 {
+    return lower_profile(source,nodes,count,text_out,text_length,words,capacity,report,0);
+}

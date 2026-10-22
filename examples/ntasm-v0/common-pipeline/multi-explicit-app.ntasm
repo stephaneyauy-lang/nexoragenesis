@@ -1,0 +1,15 @@
+module app_explicit
+target x86_64-nexora-uefi
+import math.add as add: fn(in a:u64 @rcx,in b:u64 @rdx)->u64
+effects {}
+clobbers {}
+macro result(v:ast.expr)->ast.stmt {
+    return quote(stmt) { return $v; };
+}
+section .text {
+    export fn main()->u64
+    effects {}
+    clobbers {rax} {
+        expand result(add(21,21))
+    }
+}

@@ -1,0 +1,526 @@
+module effects;
+
+import ntasm_ast;
+
+// Node kinds: effects set 20, qualified name 91, name 90.
+
+fn same_bytes(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    if start>end || end>len(source) || (end-start)!=len(text) { return false; }
+    let mut i:u64=0;
+    while i<len(text) {
+        if source[start+i]!=text[i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// THE WORD AND THE COMPARISON, AND THE WORD IS CONSUMED.
+//
+// A STRING LITERAL IN THIS DIALECT IS NOT STATIC: `let w:buf<u8>="..."`
+// allocates a handle, and a handle nobody frees is a live handle for the
+// rest of the run. `same_bytes` BORROWS its text -- it reads it and frees
+// nothing -- so the owner of a word keeps the ownership until it has no more
+// use of it. This helper is the consuming one: the comparison happens first
+// and the word is freed AFTER it, never before the last use of it.
+//
+// The two contracts are named apart on purpose. A caller that owns a word
+// and does not want to give it away calls `same_bytes` and frees the word
+// itself; a caller that is done with the word calls this one.
+fn same_word(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    let same:bool=same_bytes(source,start,end,text);
+    rt_free(runtime(),text);
+    return same;
+}
+
+fn same_span(source:buf<u8>,a_start:u64,a_end:u64,
+             b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+fn skip_space(source:buf<u8>,start:u64,limit:u64)->u64 {
+    let mut at:u64=start;
+    while at<limit {
+        let byte:u64=source[at];
+        if byte!=32 && byte!=9 && byte!=10 && byte!=13 { return at; }
+        at=at+1;
+    }
+    return at;
+}
+
+// 0 is structurally invalid, 1 is one name, 2 is a valid qualified name with
+// multiple components (forbidden by the v0 effect vocabulary).
+// THE SHAPE OF A QUALIFIED NAME, AND THE SNAPSHOTS ARE THIS FUNCTION'S OWN.
+//
+// A node snapshot is a fresh cell, so it is freed here once the fields it
+// was read for are copied into scalars. The cell is never freed before its
+// last use, and the shape is the same number it was before.
+fn qualified_shape(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let qualified:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let kind:u64=qualified.kind;
+    let first:u64=qualified.first_child;
+    let last:u64=qualified.last_child;
+    if kind!=91 || first==0 || last==0
+       || first>tree.node_count || last>tree.node_count {
+        rt_free(runtime(),qualified);return 0;
+    }
+    if first!=last { rt_free(runtime(),qualified);return 2; }
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,first);
+    let name_kind:u64=name.kind;
+    rt_free(runtime(),name);
+    rt_free(runtime(),qualified);
+    if name_kind!=90 { return 0; }
+    return 1;
+}
+
+// THE NAME OF A SINGLE COMPONENT, AND THE CALLER OWNS THE COPY.
+//
+// The returned node is a fresh cell, like every node snapshot: the caller
+// frees it once it has read the fields it needs. The intermediate snapshots
+// are this function's own and are freed here. The refusal below is a cell
+// too, and the caller owns it as well.
+fn single_name(tree:ntasm_ast.Tree,id:u64)->ntasm_ast.Node {
+    if id==0 || id>tree.node_count {
+        return ntasm_ast.Node{kind:0,token_begin:0,token_end:0,source:0,
+            line:0,column:0,start:0,end:0,first_child:0,last_child:0,
+            next_sibling:0,aux:0};
+    }
+    let qualified:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let first:u64=qualified.first_child;
+    rt_free(runtime(),qualified);
+    if qualified_shape(tree,id)!=1 {
+        return ntasm_ast.Node{kind:0,token_begin:0,token_end:0,source:0,
+            line:0,column:0,start:0,end:0,first_child:0,last_child:0,
+            next_sibling:0,aux:0};
+    }
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,first);
+    if name.kind!=90 {
+        rt_free(runtime(),name);
+        return ntasm_ast.Node{kind:0,token_begin:0,token_end:0,source:0,
+            line:0,column:0,start:0,end:0,first_child:0,last_child:0,
+            next_sibling:0,aux:0};
+    }
+    return name;
+}
+
+// WHY gsbase AND fsbase ARE NOT ATOMS HERE, AND WHY 321 REASON 1 IS THE WRONG
+// ANSWER FOR THEM. This is the verdict of the wave-22 lot, and it is a
+// measurement rather than a preference. Three questions, three answers.
+//
+// Q1  IS THE CHANNEL MISSING, DELIBERATELY ABSENT, OR JUST UNGATED?
+//     The channel is DELIBERATELY ABSENT, and it is absent in BOTH of the two
+//     places a base register could have been declared, not one.
+//
+//     `effects` is not the channel that was left out. The oracle's effect
+//     channel is a uint32_t of ELEVEN named positions, x64.h:92-104, and this
+//     function's eleven rows are those eleven. A sweep of 31 forms asked
+//     nt_x64_effects for its `effects` field and found NO bit outside those
+//     eleven: novel=0x000, every time. So the effect vocabulary is a COMPLETE
+//     projection of the oracle's effect channel, not a truncated one, and
+//     `gsbase` is not a missing row of this table. It is a member of a
+//     different space: bits 18 and 19 of `registers_read`/`registers_written`,
+//     which x64.h:79 documents beside the eleven and which is a REGISTER
+//     footprint, not an EFFECT one. Asking this function for gsbase is asking
+//     the effects table a register question, and 321 reason 1 is the truthful
+//     answer to a question asked in the wrong vocabulary.
+//
+//     The register space is `clobbers`, and there the absence is a decision
+//     with a stated reason rather than a hole: register_widths.clobber_bit
+//     answers 0 for gsbase and fsbase on purpose (register_widths.nova:234
+//     to :237), and clobbers.check turns that 0 into 330 (clobbers.nova:141
+//     to :148). The reason is on the record: a set naming one would carry a
+//     bit no consumer of the mask can discharge.
+//
+// Q2  CAN A FUNCTION DECLARE THAT IT MOVES A BASE REGISTER TODAY?
+//     No, in either channel, and the reason it is SAFE today is a separate
+//     measurement from the reason it is refused. It is refused because the
+//     channel is deliberately empty. It is SAFE because the only form in the
+//     whole encoder catalogue that WRITES a base register is refused by the
+//     product: a sweep of 265 (mnemonic, operand-shape) pairs -- every shape
+//     the drift corpus enumerates, plus all three segment values on every
+//     memory-taking shape -- found exactly ONE form with bit 18 or 19 set in
+//     `registers_written`, and it is `swapgs` (x64.c:1017 to :1019, which sets
+//     registers_read = registers_written = 1<<18). body_clobbers refuses
+//     swapgs with 336 (body_clobbers.nova:626, form 4). So every form that
+//     could need the channel is refused, and every form the product ACCEPTS
+//     writes no base register. The channel would be needed only by a form
+//     that does not exist.
+//
+//     The sixty base-READ forms the same sweep found -- mov, load, store, lea,
+//     add, inc, push and cmp over an `fs:` or `gs:` operand -- are ACCEPTED by
+//     the product, and that is correct rather than a gap. A base READ destroys
+//     nothing the caller saved, so it is not a caller-visible obligation and
+//     owes no declaration. This is the same shape as the bit-17 argument the
+//     A4-FLAGS sweep already makes: a channel nobody sees can be a channel
+//     verified elsewhere, and here it is a channel that owes nothing.
+//
+// Q3  DOES THE REFUSAL MESSAGE DISTINGUISH A CORRECT NAME FROM A TYPO?
+//     NO, in BOTH channels, and this is the part of the finding that survives
+//     every measurement above. Measured, byte for byte:
+//
+//       effects {gsbase}   -> 321 | 5 10 1 0
+//       effects {fsbase}   -> 321 | 5 10 1 0
+//       effects {gsbas}    -> 321 | 5 10 1 0     <- a typo
+//       effects {telepathy}-> 321 | 5 10 1 0     <- a typo
+//     and
+//       clobbers {gsbase}  -> 330 | 6 11 0 <guard>
+//       clobbers {gsbas}   -> 330 | 6 11 0 <guard>  <- a typo
+//       clobbers {foo}     -> 330 | 6 11 0 <guard>  <- a typo
+//
+//     Five identical lines in one channel and three in the other. A user who
+//     writes `gsbase` correctly receives exactly the diagnostic a user who
+//     writes `gsbas` receives, which is the defect this project has been
+//     eliminating for two days: a failure that cannot name itself.
+//
+//     The clobbers half is the sharper of the two, because 330's own
+//     specification row (spec/ntasm/ntasm.md:2434) reads "nom de registre inconnu"
+//     -- UNKNOWN REGISTER -- and for gsbase that sentence is FALSE.
+//     nt_frontend_register("gsbase") answers 18 and ("fsbase") answers 19
+//     (frontend.c:771-774, documented at frontend.h:95). The diagnostic denies
+//     the existence of a register the reference numbers. It is the same shape
+//     as the refused `321`, one channel over, and the finding named only the
+//     first.
+//
+// WHAT WOULD IT TAKE. A fifth reason on 321 and a second reason on 330, each
+// naming a name the reference KNOWS and this product declines to honour, is
+// enough to separate the two populations; nothing in the architecture has to
+// change. That is a specification decision and NOT this lot's to make: both
+// rows are enumerated in the 17.6 table and the registry gate checks that
+// table against the tree in both directions, so a new reason is a row to add
+// there first. What is delivered here instead is the part that needed no
+// decision -- the reason above, written where the refusal is emitted, and a
+// gate that confronts nt_x64_effects at run time so that Q2's answer cannot
+// rot silently. The message is named as the open half.
+//
+// A RETRACTION, LEFT VISIBLE. The gate this comment points at was first
+// written claiming it held the eleven in BOTH directions, and it did not. Its
+// sweep reads the ORACLE's effect bits, so a twelfth row added here for an
+// effect the oracle never publishes is invisible to it: the oracle simply
+// never sets that bit and "no form set a bit outside the eleven" stays true.
+// A mutation adding exactly such a row -- `teleports`, returning 12 -- left
+// the gate GREEN at 104 checks and zero failures. The claim was false, it is
+// withdrawn, and the gate now asserts the product's own direction directly
+// (a name outside the eleven must be refused 321) rather than inferring it
+// from the oracle. That is the same defect the project has been eliminating
+// all week, committed by the instrument written to look for it: a count about
+// the oracle's vocabulary, read as a statement about this module's. The
+// corrected gate goes red on that mutation, at 113 checks and one failure.
+fn atom_kind(source:buf<u8>,start:u64,end:u64)->u64 {
+    // EACH WORD IS A FRESH LITERAL AND A FRESH HANDLE, and each one is
+    // consumed by the comparison that reads it. The words are not static, so
+    // a word that is not freed is a live handle: the eleven of this function
+    // were the largest single source of live handles in the whole
+    // reconstruction.
+    let w1:buf<u8>="privileged";if same_word(source,start,end,w1) { return 1; }
+    let w2:buf<u8>="changes_flags";if same_word(source,start,end,w2) { return 2; }
+    let w3:buf<u8>="mmio";if same_word(source,start,end,w3) { return 3; }
+    let w4:buf<u8>="io_port";if same_word(source,start,end,w4) { return 4; }
+    let w5:buf<u8>="msr";if same_word(source,start,end,w5) { return 5; }
+    let w6:buf<u8>="control";if same_word(source,start,end,w6) { return 6; }
+    let w7:buf<u8>="interrupt_state";if same_word(source,start,end,w7) { return 7; }
+    let w8:buf<u8>="no_return";if same_word(source,start,end,w8) { return 8; }
+    let w9:buf<u8>="memory_ordering";if same_word(source,start,end,w9) { return 9; }
+    let w10:buf<u8>="reads_clock";if same_word(source,start,end,w10) { return 10; }
+    let w11:buf<u8>="suspends";if same_word(source,start,end,w11) { return 11; }
+    return 0;
+}
+
+fn memory_kind(source:buf<u8>,start:u64,end:u64)->u64 {
+    let reads:buf<u8>="reads_mem";
+    if same_word(source,start,end,reads) { return 1; }
+    let writes:buf<u8>="writes_mem";
+    if same_word(source,start,end,writes) { return 2; }
+    return 0;
+}
+
+fn valid_space(source:buf<u8>,start:u64,end:u64)->bool {
+    let user:buf<u8>="user";if same_word(source,start,end,user) { return true; }
+    let kernel:buf<u8>="kernel";if same_word(source,start,end,kernel) { return true; }
+    let physical:buf<u8>="physical";
+    if same_word(source,start,end,physical) { return true; }
+    let mmio:buf<u8>="mmio";if same_word(source,start,end,mmio) { return true; }
+    let device:buf<u8>="device";if same_word(source,start,end,device) { return true; }
+    let firmware:buf<u8>="firmware";
+    return same_word(source,start,end,firmware);
+}
+
+fn space_bit(source:buf<u8>,start:u64,end:u64)->u64 {
+    let user:buf<u8>="user";if same_word(source,start,end,user) { return 1; }
+    let kernel:buf<u8>="kernel";if same_word(source,start,end,kernel) { return 2; }
+    let physical:buf<u8>="physical";
+    if same_word(source,start,end,physical) { return 4; }
+    let mmio:buf<u8>="mmio";if same_word(source,start,end,mmio) { return 8; }
+    let device:buf<u8>="device";if same_word(source,start,end,device) { return 16; }
+    let firmware:buf<u8>="firmware";
+    if same_word(source,start,end,firmware) { return 32; }
+    return 0;
+}
+
+// THE VOCABULARY, PUBLISHED FOR A CONSUMER THAT HAS NO TREE. machine_emit.nova
+// describes a function's effects in an object contract from the Machine IR,
+// which keeps each effect entry as a `mir_symbol` span and no AST. It asks
+// these three instead of carrying a second copy of the eleven atoms and the
+// six spaces, so the contract and this pass cannot disagree about a spelling.
+// atom: 1..11 in frontend.c's bit order, 0 for none; memory: 1 reads_mem,
+// 2 writes_mem, 0 for none; space: user 1 ... firmware 32, 0 for none.
+export fn atom_of(source:buf<u8>,start:u64,end:u64)->u64 { return atom_kind(source,start,end); }
+export fn memory_of(source:buf<u8>,start:u64,end:u64)->u64 { return memory_kind(source,start,end); }
+export fn space_of(source:buf<u8>,start:u64,end:u64)->u64 { return space_bit(source,start,end); }
+
+// Summarize one already validated kind20 set as atom flags, read spaces,
+// write spaces and entry count. Unscoped memory effects cover all six v0
+// spaces. This helper does not own source, tree or out.
+export fn summarize(source:buf<u8>,tree:ntasm_ast.Tree,set_id:u64,
+                    out:buf<u64>)->u64 {
+    if tree.ok==false || set_id==0 || set_id>tree.node_count || len(out)<4 {
+        return 800;
+    }
+    // EVERY SNAPSHOT IS A FRESH CELL AND IS FREED HERE, once the fields it
+    // was read for are copied into scalars. The copy that `single_name`
+    // returns is the caller's, and it is freed here too, after its fields
+    // are read.
+    let set:ntasm_ast.Node=ntasm_ast.node_at(tree,set_id);
+    let set_kind:u64=set.kind;let set_start:u64=set.start;let set_end:u64=set.end;
+    let set_first:u64=set.first_child;
+    rt_free(runtime(),set);
+    if set_kind!=20 || set_start>set_end || set_end>len(source) { return 800; }
+    let mut flags:u64=0;let mut reads:u64=0;let mut writes:u64=0;
+    let mut entries:u64=0;let mut code:u64=0;
+    let mut child_id:u64=set_first;
+    while child_id!=0 && code==0 {
+        if child_id>tree.node_count || qualified_shape(tree,child_id)!=1 {
+            code=800;
+        } else {
+            let effect_node:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+            let effect_next:u64=effect_node.next_sibling;
+            rt_free(runtime(),effect_node);
+            let effect:ntasm_ast.Node=single_name(tree,child_id);
+            let effect_start:u64=effect.start;let effect_end:u64=effect.end;
+            rt_free(runtime(),effect);
+            if effect_start>effect_end || effect_end>len(source) { code=800; }
+            else {
+                let atom:u64=atom_kind(source,effect_start,effect_end);
+                let memory:u64=memory_kind(source,effect_start,effect_end);
+                let mut scope:u64=63;
+                let mut has_scope:u64=0;
+                let after_effect:u64=skip_space(source,effect_end,set_end);
+                if after_effect<set_end && source[after_effect]==40 {
+                    has_scope=1;
+                    let scope_id:u64=effect_next;
+                    if qualified_shape(tree,scope_id)!=1 { code=800; }
+                    else {
+                        let space:ntasm_ast.Node=single_name(tree,scope_id);
+                        let space_start:u64=space.start;let space_end:u64=space.end;
+                        rt_free(runtime(),space);
+                        if space_start>space_end || space_end>len(source) {
+                            code=800;
+                        } else {
+                            scope=space_bit(source,space_start,space_end);
+                            if scope==0 { code=800; }
+                            else {
+                                let scope_node:ntasm_ast.Node=
+                                    ntasm_ast.node_at(tree,scope_id);
+                                child_id=scope_node.next_sibling;
+                                rt_free(runtime(),scope_node);
+                            }
+                        }
+                    }
+                } else { child_id=effect_next; }
+                if code==0 {
+                    if atom!=0 && has_scope==0 {
+                        flags=flags|(1<<(atom-1));
+                    } else if memory==1 {
+                        reads=reads|scope;
+                    } else if memory==2 {
+                        writes=writes|scope;
+                    } else { code=800; }
+                    if code==0 { entries=entries+1; }
+                }
+            }
+        }
+    }
+    if code==0 {
+        out[0]=flags;out[1]=reads;out[2]=writes;out[3]=entries;
+    }
+    return code;
+}
+
+// Validate the closed v0 effect vocabulary and exact duplicates per set.
+// Success writes sets, entries, memory entries and scoped memory entries.
+// 321 reports an invalid effect with reason 1 unknown, 2 argument on an atom,
+// 3 invalid memory space, 4 malformed AST/source grouping. 322 reports the
+// second exact duplicate. 800 is transactional for invalid input/out shape.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    let n_effects:u64=20;
+    let entry_words:u64=5;
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+
+    let scratch:buf<u64>=alloc(runtime(),tree.node_count*entry_words);
+    let mut sets:u64=0;
+    let mut entries:u64=0;
+    let mut memory_entries:u64=0;
+    let mut scoped_entries:u64=0;
+    let mut used:u64=0;
+    let mut code:u64=0;
+    let mut reason:u64=0;
+    let mut bad_line:u64=0;
+    let mut bad_column:u64=0;
+
+    let mut id:u64=1;
+    while id<=tree.node_count && code==0 {
+        // EVERY SNAPSHOT IS A FRESH CELL AND IS FREED HERE, once the fields it
+        // was read for are copied into scalars. The copies that `single_name`
+        // returns are the caller's, and they are freed here too, after their
+        // fields are read. The codes, the reasons and the positions are the
+        // ones this function has always answered.
+        let set:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        let set_kind:u64=set.kind;let set_start:u64=set.start;let set_end:u64=set.end;
+        let set_first:u64=set.first_child;
+        rt_free(runtime(),set);
+        if set_kind==n_effects {
+            if set_start>set_end || set_end>len(source) { code=800; }
+            else {
+                sets=sets+1;used=0;
+                let mut child_id:u64=set_first;
+                while child_id!=0 && code==0 {
+                    if child_id>tree.node_count { code=800; }
+                    else {
+                        let effect_node:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+                        let effect_next:u64=effect_node.next_sibling;
+                        let effect_line:u64=effect_node.line;
+                        let effect_column:u64=effect_node.column;
+                        rt_free(runtime(),effect_node);
+                        let effect_shape:u64=qualified_shape(tree,child_id);
+                        if effect_shape==0 { code=800; }
+                        else if effect_shape==2 {
+                            code=321;reason=4;bad_line=effect_line;
+                            bad_column=effect_column;
+                        } else {
+                            let effect:ntasm_ast.Node=single_name(tree,child_id);
+                            let effect_start:u64=effect.start;let effect_end:u64=effect.end;
+                            let effect_line2:u64=effect.line;
+                            let effect_column2:u64=effect.column;
+                            rt_free(runtime(),effect);
+                            if effect_start>effect_end || effect_end>len(source) {
+                                code=800;
+                            } else {
+                            let atom:u64=atom_kind(source,effect_start,effect_end);
+                            let memory:u64=memory_kind(source,effect_start,effect_end);
+                            let mut has_scope:u64=0;
+                            let mut scope_start:u64=0;
+                            let mut scope_end:u64=0;
+                            let after_effect:u64=skip_space(source,effect_end,set_end);
+                            if after_effect<set_end && source[after_effect]==40 {
+                                has_scope=1;
+                                let scope_id:u64=effect_next;
+                                let scope_shape:u64=qualified_shape(tree,scope_id);
+                                if scope_shape==0 { code=800; }
+                                else if scope_shape==2 {
+                                    let scope_node:ntasm_ast.Node=
+                                        ntasm_ast.node_at(tree,scope_id);
+                                    let scope_line:u64=scope_node.line;
+                                    let scope_column:u64=scope_node.column;
+                                    rt_free(runtime(),scope_node);
+                                    code=321;reason=4;bad_line=scope_line;
+                                    bad_column=scope_column;
+                                } else {
+                                    let scope:ntasm_ast.Node=single_name(tree,scope_id);
+                                    let scope_start2:u64=scope.start;let scope_end2:u64=scope.end;
+                                    let scope_line2:u64=scope.line;
+                                    let scope_column2:u64=scope.column;
+                                    rt_free(runtime(),scope);
+                                    if scope_start2>scope_end2 || scope_end2>len(source) {
+                                        code=800;
+                                    } else {
+                                    scope_start=scope_start2;scope_end=scope_end2;
+                                    let after_scope:u64=skip_space(source,scope_end2,set_end);
+                                    if after_scope>=set_end || source[after_scope]!=41 {
+                                        code=800;
+                                    } else if atom!=0 {
+                                        code=321;reason=2;bad_line=effect_line2;
+                                        bad_column=effect_column2;
+                                    } else if memory!=0
+                                              && valid_space(source,scope_start2,
+                                                             scope_end2)==false {
+                                        code=321;reason=3;bad_line=scope_line2;
+                                        bad_column=scope_column2;
+                                    }
+                                    }
+                                }
+                            }
+                            if code==0 && atom==0 && memory==0 {
+                                code=321;reason=1;bad_line=effect_line2;
+                                bad_column=effect_column2;
+                            }
+                            if code==0 && memory!=0 && has_scope!=0
+                               && valid_space(source,scope_start,scope_end)==false {
+                                code=321;reason=3;bad_line=effect_line2;
+                                bad_column=effect_column2;
+                            }
+                            if code==0 {
+                                let mut seen:u64=0;
+                                let mut j:u64=0;
+                                while j<used && seen==0 {
+                                    let at:u64=j*entry_words;
+                                    if same_span(source,scratch[at],scratch[at+1],
+                                                 effect_start,effect_end)
+                                       && scratch[at+2]==has_scope {
+                                        if has_scope==0
+                                           || same_span(source,scratch[at+3],
+                                                scratch[at+4],scope_start,scope_end) {
+                                            seen=1;
+                                        }
+                                    }
+                                    j=j+1;
+                                }
+                                if seen!=0 {
+                                    code=322;bad_line=effect_line2;
+                                    bad_column=effect_column2;
+                                } else {
+                                    let at:u64=used*entry_words;
+                                    scratch[at]=effect_start;
+                                    scratch[at+1]=effect_end;
+                                    scratch[at+2]=has_scope;
+                                    scratch[at+3]=scope_start;
+                                    scratch[at+4]=scope_end;
+                                    used=used+1;entries=entries+1;
+                                    if memory!=0 { memory_entries=memory_entries+1; }
+                                    if memory!=0 && has_scope!=0 {
+                                        scoped_entries=scoped_entries+1;
+                                    }
+                                }
+                            }
+                            if code==0 {
+                                if has_scope!=0 {
+                                    let scope_node:ntasm_ast.Node=
+                                        ntasm_ast.node_at(tree,effect_next);
+                                    child_id=scope_node.next_sibling;
+                                    rt_free(runtime(),scope_node);
+                                } else { child_id=effect_next; }
+                            }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if code==0 { id=id+1; }
+    }
+
+    if code==0 {
+        out[0]=sets;out[1]=entries;out[2]=memory_entries;out[3]=scoped_entries;
+    } else if code==321 || code==322 {
+        out[0]=bad_line;out[1]=bad_column;out[2]=reason;out[3]=0;
+    }
+    rt_free(runtime(),scratch);
+    return code;
+}

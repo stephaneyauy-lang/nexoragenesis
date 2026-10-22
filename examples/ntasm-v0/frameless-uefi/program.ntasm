@@ -1,0 +1,34 @@
+module m
+target x86_64-nexora-uefi
+section .text {
+export fn main()->u64
+effects {}
+clobbers {} {
+call seed()
+call twice()
+mov rcx, 4
+jmp body
+dead:
+mov rax, 99
+body:
+top:
+add rax, 10
+sub rcx, 1
+jne top
+jmp done
+done:
+return
+}
+fn seed()->u64
+effects {}
+clobbers {} {
+return 2
+}
+fn twice()->u64
+effects {}
+clobbers {} {
+mov rax, 1
+add rax, 1
+return
+}
+}

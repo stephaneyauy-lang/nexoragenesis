@@ -1,0 +1,16 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+addresses,AD0,file,legacy/ntasm-s0/addresses/AD0.ntasm,131,03f3fd39e803dd871b6e0dad96c89ad1fc4709a1b4ae31e20f053e2bd54210d5,NG_S0_T12_OK
+addresses,AD1,file,legacy/ntasm-s0/addresses/AD1.ntasm,128,3ae626f1356bc52649f4a15e9dabde2f2078d4ab79dc245c2bbf5f6d35522685,NG_S0_T12_OK
+addresses,AD2,file,legacy/ntasm-s0/addresses/AD2.ntasm,128,63fd17033ad51fda835b7c30348f7c1b1bea8298f4dd7f9ddc603137bf4b3882,NG_S0_T12_OK
+addresses,AD3,file,legacy/ntasm-s0/addresses/AD3.ntasm,133,ee9274e16ce6ebfff37889c7a407b91f8e83c3e4a7cebccbb6ee19a47c74e536,NG_S0_T12_OK
+addresses,AD4,file,legacy/ntasm-s0/addresses/AD4.ntasm,141,69871ef324d74cacb4c48c2d87208f34e882dc6df4e2266fdbd39e1cb9faab14,NG_S0_T12_OK
+addresses,AD5,file,legacy/ntasm-s0/addresses/AD5.ntasm,150,c23fb9a6a0becbb57ed13047869dafb3dce56a93feea61b4b80b7b7480460fd7,NG_S0_T12_OK
+addresses,AD6,file,legacy/ntasm-s0/addresses/AD6.ntasm,127,2791391ed49b10f8f098b7072fa6496af59699af98654d500f9075adf0a161f3,NG_S0_T12_OK
+addresses,AR0,file,legacy/ntasm-s0/addresses/AR0.ntasm,129,79bb5eb493c544ba163ec60dac78953d078a8e3e1cf68254538610e55563d759,NGS0 E301 L0008 C000C O0000005C
+addresses,AR1,file,legacy/ntasm-s0/addresses/AR1.ntasm,135,c640f20e94409e8bf7b2cebd7111ee2eb6e88af62ba6d69c0165b6dd846ef897,NGS0 E301 L0009 C000C O00000068
+addresses,AR2,file,legacy/ntasm-s0/addresses/AR2.ntasm,126,bfd0eaf5371d6628357ae7e2425c7fcbd54324ecfc9a9f6db6713408a4be7cb9,NGS0 E400 L0008 C0006 O00000056
+addresses,AR3,file,legacy/ntasm-s0/addresses/AR3.ntasm,123,0f41e3a9299de0d93346eca259e74ddf9e81cb040dd2e48f748749f5d0675ea6,NGS0 E400 L0008 C000C O0000005C
+addresses,AR4,file,legacy/ntasm-s0/addresses/AR4.ntasm,126,b031a2278cdb0312c669e8bc1f24882a2a7cc1e94a4912d0eb4c8cbdfc6d96b4,NGS0 E201 L0008 C0011 O00000061
+addresses,AR5,file,legacy/ntasm-s0/addresses/AR5.ntasm,122,fb4039323beb4cf566d2e0086409a43698791923d49f6b91fa270c652c75d1de,NGS0 E400 L0008 C000C O0000005C
+addresses,AR6,file,legacy/ntasm-s0/addresses/AR6.ntasm,130,fc8ad778d956b9a00817cb316a6f10ee2ef5eecd57bb66c29e2613bd840988fc,NGS0 E201 L0008 C0011 O00000061
+addresses,AR7,file,legacy/ntasm-s0/addresses/AR7.ntasm,129,e92232719d7051fcf4f47207bd2bafcef523f9693cb5e583c29942dedbdd208e,NGS0 E201 L0008 C0013 O00000063

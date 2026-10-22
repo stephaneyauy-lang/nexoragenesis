@@ -1,0 +1,187 @@
+module nova_native_driver;
+import nova_language_parse;
+import nova_machine_lower;
+import machine_pipeline;
+import machine_ir;
+
+// Driver-private limits/codes, not additions to the NTASM diagnostic registry.
+export fn SOURCE_BYTES_LIMIT()->u64 { return 65535; }
+export fn SOURCE_COUNT_LIMIT()->u64 { return 1; }
+export fn AST_NODES_LIMIT()->u64 { return 8192; }
+export fn MIR_WORDS_LIMIT()->u64 { return 524288; }
+export fn OUTPUT_BYTES_LIMIT()->u64 { return 4194304; }
+export fn DECLARATION_BYTES_LIMIT()->u64 { return 262144; }
+export fn REPORT_WORDS()->u64 { return 32; }
+export fn E_INPUT_BOUND()->u64 { return 1101; }
+export fn E_SOURCE_SET()->u64 { return 1102; }
+export fn E_EMPTY_INPUT()->u64 { return 1103; }
+export fn E_IO_COUNT()->u64 { return 1104; }
+export fn E_INTERFACE()->u64 { return 1105; }
+
+// All normal refusals close the file and release transient slices. A runtime
+// fault propagates through ABI2; the native host then destroys the context.
+fn read_source(path:buf<u8>,storage:buf<u8>,length:buf<u64>)->u64 {
+    if len(length)<1 || len(storage)!=SOURCE_BYTES_LIMIT()+1 { return E_INTERFACE(); }
+    length[0]=0;
+    let reader:u64=rt_open_read(runtime(),path);
+    let mut used:u64=0;let mut code:u64=0;let mut done:bool=false;
+    while done==false && code==0 {
+        let room:u64=len(storage)-used;
+        let tail:buf<u8>=slice(storage,used,room);
+        let got:u64=rt_read(runtime(),reader,tail);
+        rt_free(runtime(),tail);
+        if got>room { code=E_IO_COUNT(); }
+        else if got==0 { done=true; }
+        else {
+            used=used+got;
+            if used>SOURCE_BYTES_LIMIT() { code=E_INPUT_BOUND(); }
+        }
+    }
+    rt_close(runtime(),reader);
+    if code==0 && used==0 { code=E_EMPTY_INPUT(); }
+    if code==0 { length[0]=used; }
+    return code;
+}
+
+fn detail_to_report(detail:buf<u64>,report:buf<u64>)->u64 {
+    let mut i:u64=0;
+    while i<len(detail) && i<14 { report[16+i]=detail[i];i=i+1; }
+    return 0;
+}
+
+// Refuse syntax the scalar/monomodule lower cannot implement. Its own checks
+// still run; this guard does not convert unsupported constructs into stubs.
+fn scalar_surface(nodes:buf<u64>,count:u64)->u64 {
+    let stride:u64=nova_language_parse.NODE_WORDS();
+    let mut i:u64=0;let mut modules:u64=0;
+    while i<count {
+        let base:u64=i*stride;let kind:u64=nodes[base];
+        if kind==nova_language_parse.K_MODULE() { modules=modules+1; }
+        if kind==nova_language_parse.K_IMPORT() || kind==nova_language_parse.K_STRUCT() ||
+           kind==nova_language_parse.K_FIELD() || kind==nova_language_parse.K_FIELD_ACCESS() ||
+           kind==nova_language_parse.K_RECORD() || kind==nova_language_parse.K_INDEX() {
+            return nova_machine_lower.E_UNSUPPORTED();
+        }
+        if nodes[base+14]>nova_language_parse.T_BOOL() { return nova_machine_lower.E_UNSUPPORTED(); }
+        if kind==nova_language_parse.K_LITERAL() && nodes[base+13]==4 {
+            return nova_machine_lower.E_UNSUPPORTED();
+        }
+        if kind==nova_language_parse.K_CALL() && nodes[base+13]!=0 {
+            return nova_machine_lower.E_UNSUPPORTED();
+        }
+        i=i+1;
+    }
+    if modules!=1 { return E_SOURCE_SET(); }
+    return 0;
+}
+
+// Future manifest boundary: explicit blob/spans/count/root. Version1 accepts
+// ONE source only. Increasing a buffer does not enable multimodule lowering.
+// report[0..6]=phase,code,AST nodes,MIR records,declaration bytes,PE bytes,count.
+// report[16..29] copies the actual refusing stage's report, without relabeling it.
+export fn compile_blob(blob:buf<u8>,spans:buf<u64>,source_count:u64,root:u64,
+                       out:buf<u8>,length:buf<u64>,report:buf<u64>)->u64 {
+    if len(length)>0 { length[0]=0; }
+    if len(report)<REPORT_WORDS() || len(length)<1 { return E_INTERFACE(); }
+    let mut i:u64=0;while i<REPORT_WORDS() { report[i]=0;i=i+1; }
+    report[6]=source_count;
+    if source_count!=SOURCE_COUNT_LIMIT() || root!=0 || len(spans)<2 {
+        report[1]=E_SOURCE_SET();return E_SOURCE_SET();
+    }
+    let off:u64=spans[0];let size:u64=spans[1];
+    if size==0 { report[1]=E_EMPTY_INPUT();return E_EMPTY_INPUT(); }
+    if off>len(blob) || size>len(blob)-off || size>SOURCE_BYTES_LIMIT() {
+        report[1]=E_INPUT_BOUND();return E_INPUT_BOUND();
+    }
+    let source:buf<u8>=slice(blob,off,size);
+    let nodes:buf<u64>=alloc(runtime(),AST_NODES_LIMIT()*nova_language_parse.NODE_WORDS());
+    let scopes:buf<u64>=alloc(runtime(),8192);
+    let binds:buf<u64>=alloc(runtime(),32768);
+    let fields:buf<u64>=alloc(runtime(),16384);
+    let detail:buf<u64>=alloc(runtime(),14);
+    let declaration:buf<u8>=alloc(runtime(),DECLARATION_BYTES_LIMIT());
+    let declaration_length:buf<u64>=alloc(runtime(),1);
+    let words:buf<u64>=alloc(runtime(),MIR_WORDS_LIMIT());
+    report[0]=1;
+    let mut code:u64=nova_language_parse.parse(source,nodes,scopes,binds,fields,detail);
+    detail_to_report(detail,report);
+    let count:u64=detail[5];
+    if code==0 {
+        report[2]=count;report[0]=2;
+        code=scalar_surface(nodes,count);
+        if code==0 {
+            i=0;while i<14 { detail[i]=0;i=i+1; }
+            code=nova_machine_lower.lower(source,nodes,count,declaration,declaration_length,
+                                         words,MIR_WORDS_LIMIT(),detail);
+            detail_to_report(detail,report);
+        }
+        if code==0 {
+            report[3]=words[3];report[4]=declaration_length[0];report[0]=3;
+            let exact_declaration:buf<u8>=slice(declaration,0,declaration_length[0]);
+            code=machine_pipeline.build_pe_from_image(words,words[3],exact_declaration,
+                                                     out,length,detail);
+            rt_free(runtime(),exact_declaration);
+            detail_to_report(detail,report);
+            if code==0 && (length[0]==0 || length[0]>len(out)) { code=E_IO_COUNT(); }
+        }
+    }
+    if code==0 { report[5]=length[0]; }
+    else { length[0]=0; }
+    report[1]=code;
+    rt_free(runtime(),words);rt_free(runtime(),declaration_length);
+    rt_free(runtime(),declaration);rt_free(runtime(),detail);rt_free(runtime(),fields);
+    rt_free(runtime(),binds);rt_free(runtime(),scopes);rt_free(runtime(),nodes);
+    rt_free(runtime(),source);
+    return code;
+}
+
+fn diagnostic_number(value:u64)->u64 {
+    let digits:buf<u8>=alloc(runtime(),20);
+    let mut cursor:u64=20;let mut current:u64=value;let mut done:bool=false;
+    while done==false {
+        cursor=cursor-1;digits[cursor]=u8(48+current%10);current=current/10;
+        if current==0 { done=true; }
+    }
+    let exact:buf<u8>=slice(digits,cursor,20-cursor);
+    rt_diag(runtime(),exact);
+    let newline:buf<u8>="\r\n";rt_diag(runtime(),newline);
+    rt_free(runtime(),newline);rt_free(runtime(),exact);rt_free(runtime(),digits);
+    return 0;
+}
+
+export fn main()->u64 {
+    let input_path:buf<u8>="INPUT.NOVA";
+    let storage:buf<u8>=alloc(runtime(),SOURCE_BYTES_LIMIT()+1);
+    let input_length:buf<u64>=alloc(runtime(),1);
+    let spans:buf<u64>=alloc(runtime(),2);
+    let output:buf<u8>=alloc(runtime(),OUTPUT_BYTES_LIMIT());
+    let output_length:buf<u64>=alloc(runtime(),1);
+    let report:buf<u64>=alloc(runtime(),REPORT_WORDS());
+    let mut code:u64=read_source(input_path,storage,input_length);
+    if code==0 {
+        spans[0]=0;spans[1]=input_length[0];
+        code=compile_blob(storage,spans,1,0,output,output_length,report);
+    }
+    if code==0 {
+        let exact:buf<u8>=slice(output,0,output_length[0]);
+        let output_path:buf<u8>="OUTPUT.EFI";
+        let writer:u64=rt_open_new(runtime(),output_path);
+        let wrote:u64=rt_write(runtime(),writer,exact);
+        rt_close(runtime(),writer);
+        if wrote!=output_length[0] { code=E_IO_COUNT(); }
+        rt_free(runtime(),output_path);rt_free(runtime(),exact);
+    }
+    rt_free(runtime(),report);rt_free(runtime(),output_length);rt_free(runtime(),output);
+    rt_free(runtime(),spans);rt_free(runtime(),input_length);
+    rt_free(runtime(),storage);rt_free(runtime(),input_path);
+    if code==0 {
+        let ok:buf<u8>="NG_NOVA_NATIVE_DRIVER_OK\r\n";
+        rt_diag(runtime(),ok);rt_free(runtime(),ok);
+    } else {
+        let refused:buf<u8>="NG_NOVA_NATIVE_DRIVER_REFUSED\r\n";
+        rt_diag(runtime(),refused);rt_free(runtime(),refused);
+        diagnostic_number(code);
+    }
+    return code;
+}
+

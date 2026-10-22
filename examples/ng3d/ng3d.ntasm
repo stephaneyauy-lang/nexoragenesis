@@ -1,0 +1,604 @@
+module ng3d
+target x86_64-nexora-none
+
+// NG3D - moteur 3D au niveau machine, en NTASM.
+//
+// Meme pipeline entierement fixe que examples/ng3d/ng3d.nova et que la
+// reference out/ng3d/ref/ng3d_ref.py : rotation Y puis X, projection
+// perspective par division signee ecrite a la main (NTASM v0 refuse div et
+// idiv), elimination des faces arriere par l'aire signee, rasterisation par
+// fonctions de bord, eclairage de Lambert, digest FNV-1a de l'image.
+//
+// Le rendu se fait ligne par ligne : une seule ligne de 320 pixels tient en
+// memoire, donc aucun tampon d'image complet n'est necessaire.  Le cube est
+// convexe et ses faces visibles ne se recouvrent pas : le z-buffer de la
+// reference ne changerait donc aucun pixel de ce profil.
+//
+// NTASM v0 n'a pas de variables locales : tout l'etat vit dans des symboles
+// .data a un seul element, ou dans des registres.
+
+section .data {
+data v0:i64=0
+data v1:i64=0
+data v2:i64=0
+data v3:i64=0
+data v4:i64=0
+data v5:i64=0
+data v6:i64=0
+data v7:i64=0
+data v8:i64=0
+data nx:i64=0
+data ny:i64=0
+data nz:i64=0
+data ri:i64=0
+data cr:i64=0
+data cg:i64=0
+data cb:i64=0
+data x0:i64=0
+data y0:i64=0
+data x1:i64=0
+data y1:i64=0
+data x2:i64=0
+data y2:i64=0
+data area:i64=0
+data colr:i64=0
+data ry:i64=0
+data rh:i64=0
+data sxp:i64=0
+data syp:i64=0
+data t1:i64=0
+data t2:i64=0
+data t3:i64=0
+data t4:i64=0
+data t5:i64=0
+data t6:i64=0
+data e1:i64=0
+data e2:i64=0
+data e3:i64=0
+data f1:i64=0
+data f2:i64=0
+data f3:i64=0
+data rowbuf:array<u8,960> ="012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
+}
+
+section .text {
+
+// Division signee tronquee vers zero, diviseur strictement positif.
+// NTASM v0 refuse idiv : la preuve de securite au-division n'existe pas dans
+// le modele de contrats, donc la boucle de restauration est ecrite ici.
+fn sdiv(in a:i64 @rdi,in b:i64 @rsi)->i64
+effects {changes_flags}
+clobbers {rax,rcx,rdx,r8,r9,r10,r11,r12,rflags} {
+mov rax, rdi
+mov r12, rsi
+xor rdx, rdx
+xor r8, r8
+xor r9, r9
+xor r10, r10
+cmp rax, 0
+jge sdiv_a_pos
+mov rcx, 0
+sub rcx, rax
+mov rax, rcx
+mov r10, 1
+sdiv_a_pos:
+cmp r12, 0
+jle sdiv_done
+mov r9, 63
+sdiv_bit:
+mov rcx, r9
+mov r11, rax
+shr r11, cl
+and r11, 1
+shl rdx, 1
+add rdx, r11
+cmp rdx, r12
+jb sdiv_no_sub
+sub rdx, r12
+mov rcx, r9
+mov r11, 1
+shl r11, cl
+or r8, r11
+sdiv_no_sub:
+cmp r9, 0
+je sdiv_loop_done
+sub r9, 1
+jmp sdiv_bit
+sdiv_loop_done:
+mov rax, r8
+cmp r10, 0
+je sdiv_ret
+neg rax
+sdiv_ret:
+return rax
+sdiv_done:
+mov rax, 0
+return rax
+}
+
+// Projette un sommet monde : rotation puis perspective.  Le resultat revient
+// dans rcx (x) et r8 (y), en Q16.16 pixels.
+fn project(in x:i64 @rdi,in y:i64 @rsi,in z:i64 @rdx, out sx:i64 @rcx, out sy:i64 @r8)->u64
+effects {reads_mem(user),writes_mem(user),changes_flags}
+clobbers {rax,rdx,r9,r10,r11,r12,rdi,rsi,rflags} {
+imul rax, rdi, 56756
+imul r9, rdx, 32768
+add rax, r9
+sar rax, 16
+mov r9, rax
+imul rax, rdx, 56756
+imul r10, rdi, 32768
+sub rax, r10
+sar rax, 16
+mov r10, rax
+imul rax, rsi, 61566
+imul r11, r10, 22416
+sub rax, r11
+sar rax, 16
+mov r11, rax
+imul rax, rsi, 22416
+imul r12, r10, 61566
+add rax, r12
+sar rax, 16
+mov r12, 524288
+sub r12, rax
+cmp r12, 0
+jle project_behind
+mov rdi, r9
+mov rsi, r12
+imul rdi, rdi, 22937600
+store [t1]:ptr<user,i64>,r11
+store [t2]:ptr<user,i64>,r12
+call sdiv(rdi,rsi)
+add rax, 10485760
+store [sxp]:ptr<user,i64>,rax
+load rdi,[t1]:ptr<user,i64>
+load rsi,[t2]:ptr<user,i64>
+imul rdi, rdi, 22937600
+call sdiv(rdi,rsi)
+mov r9, 6553600
+sub r9, rax
+store [syp]:ptr<user,i64>,r9
+load rcx,[sxp]:ptr<user,i64>
+load r8,[syp]:ptr<user,i64>
+return 0
+project_behind:
+mov rcx, 0
+mov r8, 0
+return 0
+}
+
+// Lambert sur la normale monde : rotation, produit scalaire, mise a l'echelle,
+// puis RVB packs dans un mot.  Renvoie le mot packs dans rax.
+fn shade()->u64
+effects {reads_mem(user),changes_flags}
+clobbers {rax,rcx,rdx,rsi,rdi,r8,r9,r10,r11,r12,rflags} {
+load rdi,[nx]:ptr<user,i64>
+load rsi,[ny]:ptr<user,i64>
+load rdx,[nz]:ptr<user,i64>
+imul rax, rdi, 56756
+imul r9, rdx, 32768
+add rax, r9
+sar rax, 16
+mov r9, rax
+imul rax, rdx, 56756
+imul r10, rdi, 32768
+sub rax, r10
+sar rax, 16
+mov r10, rax
+imul rax, rsi, 61566
+imul r11, r10, 22416
+sub rax, r11
+sar rax, 16
+mov r11, rax
+imul rax, rsi, 22416
+imul r12, r10, 61566
+add rax, r12
+sar rax, 16
+mov r10, rax
+imul rax, r9, 37837
+imul r12, r11, 45000
+add rax, r12
+imul r12, r10, 37837
+add rax, r12
+sar rax, 16
+cmp rax, 0
+jge shade_pos
+mov rax, 0
+shade_pos:
+imul rax, rax, 49152
+sar rax, 16
+add rax, 16384
+load rcx,[cr]:ptr<user,i64>
+imul rcx, rax
+sar rcx, 16
+load r9,[cg]:ptr<user,i64>
+imul r9, rax
+sar r9, 16
+load r10,[cb]:ptr<user,i64>
+imul r10, rax
+sar r10, 16
+and rcx, 255
+and r9, 255
+and r10, 255
+shl r9, 8
+shl r10, 16
+or rcx, r9
+or rcx, r10
+mov rax, rcx
+return rax
+}
+
+// Trace un triangle sur la ligne courante.  rbx pointe sur la ligne, dont les
+// 960 octets sont ecrits en place.
+fn draw(in row:ptr<user,array<u8,960> > @rbx)->u64
+effects {reads_mem(user),writes_mem(user),changes_flags}
+clobbers {rax,rcx,rdx,rsi,rdi,r8,r9,r10,r11,r12,r13,r14,r15,rflags} {
+load rdi,[v0]:ptr<user,i64>
+load rsi,[v1]:ptr<user,i64>
+load rdx,[v2]:ptr<user,i64>
+call project(rdi,rsi,rdx)
+store [x0]:ptr<user,i64>,rcx
+store [y0]:ptr<user,i64>,r8
+load rdi,[v3]:ptr<user,i64>
+load rsi,[v4]:ptr<user,i64>
+load rdx,[v5]:ptr<user,i64>
+call project(rdi,rsi,rdx)
+store [x1]:ptr<user,i64>,rcx
+store [y1]:ptr<user,i64>,r8
+load rdi,[v6]:ptr<user,i64>
+load rsi,[v7]:ptr<user,i64>
+load rdx,[v8]:ptr<user,i64>
+call project(rdi,rsi,rdx)
+store [x2]:ptr<user,i64>,rcx
+store [y2]:ptr<user,i64>,r8
+load rax,[x1]:ptr<user,i64>
+sub rax,[x0]:ptr<user,i64>
+load rcx,[y2]:ptr<user,i64>
+sub rcx,[y0]:ptr<user,i64>
+imul rax, rcx
+load rdx,[x2]:ptr<user,i64>
+sub rdx,[x0]:ptr<user,i64>
+load rsi,[y1]:ptr<user,i64>
+sub rsi,[y0]:ptr<user,i64>
+imul rdx, rsi
+sub rax, rdx
+store [area]:ptr<user,i64>,rax
+cmp rax, 0
+jle draw_done
+call shade()
+store [colr]:ptr<user,i64>,rax
+load rax,[x1]:ptr<user,i64>
+sub rax,[x0]:ptr<user,i64>
+store [t1]:ptr<user,i64>,rax
+load rax,[y1]:ptr<user,i64>
+sub rax,[y0]:ptr<user,i64>
+store [t2]:ptr<user,i64>,rax
+load rax,[x2]:ptr<user,i64>
+sub rax,[x1]:ptr<user,i64>
+store [t3]:ptr<user,i64>,rax
+load rax,[y2]:ptr<user,i64>
+sub rax,[y1]:ptr<user,i64>
+store [t4]:ptr<user,i64>,rax
+load rax,[x0]:ptr<user,i64>
+sub rax,[x2]:ptr<user,i64>
+store [t5]:ptr<user,i64>,rax
+load rax,[y0]:ptr<user,i64>
+sub rax,[y2]:ptr<user,i64>
+store [t6]:ptr<user,i64>,rax
+load rax,[t1]:ptr<user,i64>
+load rcx,[ry]:ptr<user,i64>
+sub rcx,[y0]:ptr<user,i64>
+imul rax, rcx
+load rdx,[t2]:ptr<user,i64>
+load rcx,[x0]:ptr<user,i64>
+imul rdx, rcx
+add rax, rdx
+store [e1]:ptr<user,i64>,rax
+load rdx,[t2]:ptr<user,i64>
+shl rdx, 16
+neg rdx
+store [f1]:ptr<user,i64>,rdx
+load rax,[t3]:ptr<user,i64>
+load rcx,[ry]:ptr<user,i64>
+sub rcx,[y1]:ptr<user,i64>
+imul rax, rcx
+load rdx,[t4]:ptr<user,i64>
+load rcx,[x1]:ptr<user,i64>
+imul rdx, rcx
+add rax, rdx
+store [e2]:ptr<user,i64>,rax
+load rdx,[t4]:ptr<user,i64>
+shl rdx, 16
+neg rdx
+store [f2]:ptr<user,i64>,rdx
+load rax,[t5]:ptr<user,i64>
+load rcx,[ry]:ptr<user,i64>
+sub rcx,[y2]:ptr<user,i64>
+imul rax, rcx
+load rdx,[t6]:ptr<user,i64>
+load rcx,[x2]:ptr<user,i64>
+imul rdx, rcx
+add rax, rdx
+store [e3]:ptr<user,i64>,rax
+load rdx,[t6]:ptr<user,i64>
+shl rdx, 16
+neg rdx
+store [f3]:ptr<user,i64>,rdx
+load r8,[e1]:ptr<user,i64>
+load r9,[e2]:ptr<user,i64>
+load r10,[e3]:ptr<user,i64>
+load r11,[f1]:ptr<user,i64>
+load r12,[f2]:ptr<user,i64>
+load r13,[f3]:ptr<user,i64>
+load r14,[colr]:ptr<user,i64>
+mov rcx, 0
+mov rdx, 0
+draw_px:
+cmp rcx, 320
+jae draw_done
+cmp r8, 0
+jl draw_next
+cmp r9, 0
+jl draw_next
+cmp r10, 0
+jl draw_next
+mov rsi, r14
+and esi, 255
+store [rbx+rdx]:ptr<user,u8>,sil
+mov rsi, r14
+shr rsi, 8
+and esi, 255
+mov r15, rdx
+add r15, 1
+store [rbx+r15]:ptr<user,u8>,sil
+mov rsi, r14
+shr rsi, 16
+and esi, 255
+mov r15, rdx
+add r15, 2
+store [rbx+r15]:ptr<user,u8>,sil
+draw_next:
+add r8, r11
+add r9, r12
+add r10, r13
+add rdx, 3
+add rcx, 1
+jmp draw_px
+draw_done:
+mov rax, 0
+return rax
+}
+
+export fn main()->u64
+effects {reads_mem(user),writes_mem(user),changes_flags}
+clobbers {rax,rcx,rdx,rsi,rdi,rbx,r8,r9,r10,r11,r12,r13,r14,r15,rflags} {
+lea rbx,[rowbuf]:ptr<user,array<u8,960> >
+mov rax, 14695981039346656037
+store [rh]:ptr<user,i64>,rax
+mov rax, 0
+store [ri]:ptr<user,i64>,rax
+main_row:
+load rax,[ri]:ptr<user,i64>
+shl rax, 16
+store [ry]:ptr<user,i64>,rax
+mov rcx, 0
+mov rdx, 0
+main_clear:
+cmp rcx, 960
+jae main_cleared
+mov esi, 0
+store [rbx+rdx]:ptr<user,u8>,sil
+add rdx, 1
+add rcx, 1
+jmp main_clear
+main_cleared:
+mov rax, 65536
+store [v0]:ptr<user,i64>,rax
+mov rax, 18446744073709499188
+store [v1]:ptr<user,i64>,rax
+mov rax, 65536
+store [v2]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v3]:ptr<user,i64>,rax
+mov rax, 18446744073709499188
+store [v4]:ptr<user,i64>,rax
+mov rax, 65536
+store [v5]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v6]:ptr<user,i64>,rax
+mov rax, 78643
+store [v7]:ptr<user,i64>,rax
+mov rax, 65536
+store [v8]:ptr<user,i64>,rax
+mov rax, 0
+store [nx]:ptr<user,i64>,rax
+mov rax, 0
+store [ny]:ptr<user,i64>,rax
+mov rax, 65536
+store [nz]:ptr<user,i64>,rax
+mov rax, 208
+store [cr]:ptr<user,i64>,rax
+mov rax, 82
+store [cg]:ptr<user,i64>,rax
+mov rax, 74
+store [cb]:ptr<user,i64>,rax
+call draw(rbx)
+mov rax, 65536
+store [v0]:ptr<user,i64>,rax
+mov rax, 18446744073709499188
+store [v1]:ptr<user,i64>,rax
+mov rax, 65536
+store [v2]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v3]:ptr<user,i64>,rax
+mov rax, 78643
+store [v4]:ptr<user,i64>,rax
+mov rax, 65536
+store [v5]:ptr<user,i64>,rax
+mov rax, 65536
+store [v6]:ptr<user,i64>,rax
+mov rax, 78643
+store [v7]:ptr<user,i64>,rax
+mov rax, 65536
+store [v8]:ptr<user,i64>,rax
+mov rax, 0
+store [nx]:ptr<user,i64>,rax
+mov rax, 0
+store [ny]:ptr<user,i64>,rax
+mov rax, 65536
+store [nz]:ptr<user,i64>,rax
+mov rax, 208
+store [cr]:ptr<user,i64>,rax
+mov rax, 82
+store [cg]:ptr<user,i64>,rax
+mov rax, 74
+store [cb]:ptr<user,i64>,rax
+call draw(rbx)
+mov rax, 18446744073709486080
+store [v0]:ptr<user,i64>,rax
+mov rax, 18446744073709499188
+store [v1]:ptr<user,i64>,rax
+mov rax, 65536
+store [v2]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v3]:ptr<user,i64>,rax
+mov rax, 18446744073709499188
+store [v4]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v5]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v6]:ptr<user,i64>,rax
+mov rax, 78643
+store [v7]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v8]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [nx]:ptr<user,i64>,rax
+mov rax, 0
+store [ny]:ptr<user,i64>,rax
+mov rax, 0
+store [nz]:ptr<user,i64>,rax
+mov rax, 84
+store [cr]:ptr<user,i64>,rax
+mov rax, 170
+store [cg]:ptr<user,i64>,rax
+mov rax, 96
+store [cb]:ptr<user,i64>,rax
+call draw(rbx)
+mov rax, 18446744073709486080
+store [v0]:ptr<user,i64>,rax
+mov rax, 18446744073709499188
+store [v1]:ptr<user,i64>,rax
+mov rax, 65536
+store [v2]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v3]:ptr<user,i64>,rax
+mov rax, 78643
+store [v4]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v5]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v6]:ptr<user,i64>,rax
+mov rax, 78643
+store [v7]:ptr<user,i64>,rax
+mov rax, 65536
+store [v8]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [nx]:ptr<user,i64>,rax
+mov rax, 0
+store [ny]:ptr<user,i64>,rax
+mov rax, 0
+store [nz]:ptr<user,i64>,rax
+mov rax, 84
+store [cr]:ptr<user,i64>,rax
+mov rax, 170
+store [cg]:ptr<user,i64>,rax
+mov rax, 96
+store [cb]:ptr<user,i64>,rax
+call draw(rbx)
+mov rax, 18446744073709486080
+store [v0]:ptr<user,i64>,rax
+mov rax, 78643
+store [v1]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v2]:ptr<user,i64>,rax
+mov rax, 65536
+store [v3]:ptr<user,i64>,rax
+mov rax, 78643
+store [v4]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v5]:ptr<user,i64>,rax
+mov rax, 65536
+store [v6]:ptr<user,i64>,rax
+mov rax, 78643
+store [v7]:ptr<user,i64>,rax
+mov rax, 65536
+store [v8]:ptr<user,i64>,rax
+mov rax, 0
+store [nx]:ptr<user,i64>,rax
+mov rax, 65536
+store [ny]:ptr<user,i64>,rax
+mov rax, 0
+store [nz]:ptr<user,i64>,rax
+mov rax, 98
+store [cr]:ptr<user,i64>,rax
+mov rax, 142
+store [cg]:ptr<user,i64>,rax
+mov rax, 216
+store [cb]:ptr<user,i64>,rax
+call draw(rbx)
+mov rax, 18446744073709486080
+store [v0]:ptr<user,i64>,rax
+mov rax, 78643
+store [v1]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v2]:ptr<user,i64>,rax
+mov rax, 65536
+store [v3]:ptr<user,i64>,rax
+mov rax, 78643
+store [v4]:ptr<user,i64>,rax
+mov rax, 65536
+store [v5]:ptr<user,i64>,rax
+mov rax, 18446744073709486080
+store [v6]:ptr<user,i64>,rax
+mov rax, 78643
+store [v7]:ptr<user,i64>,rax
+mov rax, 65536
+store [v8]:ptr<user,i64>,rax
+mov rax, 0
+store [nx]:ptr<user,i64>,rax
+mov rax, 65536
+store [ny]:ptr<user,i64>,rax
+mov rax, 0
+store [nz]:ptr<user,i64>,rax
+mov rax, 98
+store [cr]:ptr<user,i64>,rax
+mov rax, 142
+store [cg]:ptr<user,i64>,rax
+mov rax, 216
+store [cb]:ptr<user,i64>,rax
+call draw(rbx)
+load rax,[rh]:ptr<user,i64>
+mov r12, 1099511628211
+mov rcx, 0
+main_fold:
+cmp rcx, 960
+jae main_folded
+mov esi, 0
+load sil,[rbx+rcx]:ptr<user,u8>
+xor rax, rsi
+imul rax, r12
+add rcx, 1
+jmp main_fold
+main_folded:
+store [rh]:ptr<user,i64>,rax
+load rax,[ri]:ptr<user,i64>
+add rax, 1
+store [ri]:ptr<user,i64>,rax
+cmp rax, 200
+jb main_row
+load rax,[rh]:ptr<user,i64>
+return rax
+}
+}

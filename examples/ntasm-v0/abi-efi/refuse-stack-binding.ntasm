@@ -1,0 +1,9 @@
+module efi.bad
+target x86_64-nexora-none
+default_abi efi-x64-v0
+section .text {
+fn leaf(in a:u64,in b:u64,in c:u64,in d:u64,in e:u64 @r8)->u64
+effects {}
+clobbers {} { return 0
+}
+}

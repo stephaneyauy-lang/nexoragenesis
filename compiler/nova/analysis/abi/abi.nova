@@ -1,0 +1,2202 @@
+module abi;
+
+import ntasm_ast;
+import register_widths;
+import clobbers;
+
+// Kinds: default ABI6, import9, function18, parameter19, ABI clause28,
+// dashed name92.
+
+fn same_bytes(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    if start>end || end>len(source) || (end-start)!=len(text) { return false; }
+    let mut i:u64=0;
+    while i<len(text) {
+        if source[start+i]!=text[i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Only the locally allocated literal comparators below transfer ownership.
+// same_bytes remains available for borrowed text.
+fn same_bytes_owned(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    let result:bool=same_bytes(source,start,end,text);
+    rt_free(runtime(),text);return result;
+}
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:u64=parent;
+    let mut id:u64=ntasm_ast.node_first_child(tree,p);let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:u64=id;
+        id=ntasm_ast.node_next_sibling(tree,n);index=index+1;
+    }
+    if id>tree.node_count { return 0; }
+    return id;
+}
+
+fn clobber_set_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+    let declaration:u64=id;
+    let mut child_id:u64=ntasm_ast.node_first_child(tree,declaration);
+    while child_id!=0 {
+        if child_id>tree.node_count { return 0; }
+        let child_:u64=child_id;
+        if ntasm_ast.node_kind(tree,child_)==21 { return child_id; }
+        child_id=ntasm_ast.node_next_sibling(tree,child_);
+    }
+    return 0;
+}
+
+fn is_nx64(source:buf<u8>,node:ntasm_ast.Node)->bool {
+    let name:buf<u8>="nx64-abi-v0";
+    return same_bytes_owned(source,node.start,node.end,name);
+}
+
+// THE PROFILE, AND THE TWO NAMES IT HAS. 1 is nx64-abi-v0, 2 is efi-x64-v0,
+// and there is no third. This is not a product decision: the oracle branches
+// on the profile name exactly once, in validate_parameter_abi
+// (frontend.c:2827), in three arms -- frontend.c:2830 `if (!strcmp(abi,
+// "nx64-abi-v0"))`, frontend.c:2894 `if (!strcmp(abi, "efi-x64-v0"))`, and
+// frontend.c:2946, which refuses every other spelling with 403 "unsupported
+// ABI '%s'". Measured against nt_frontend_compile: `nx64-abi-v0`,
+// `efi-x64-v0` and `alien-abi` on a declaration answer ACCEPT, ACCEPT and
+// REFUSE E403, and the same three through `default_abi` answer the same three
+// ways. A third profile name in this file would be a language the reference
+// does not have.
+fn is_efi(source:buf<u8>,node:ntasm_ast.Node)->bool {
+    let name:buf<u8>="efi-x64-v0";
+    return same_bytes_owned(source,node.start,node.end,name);
+}
+
+// 1 nx64-abi-v0, 2 efi-x64-v0, 0 for a name that is neither.
+fn profile_of(source:buf<u8>,node:ntasm_ast.Node)->u64 {
+    if is_nx64(source,node) { return 1; }
+    if is_efi(source,node) { return 2; }
+    return 0;
+}
+
+// The profile a MODULE defaults its declarations to. 2 when the module names
+// `default_abi efi-x64-v0`, 1 otherwise.
+//
+// 1 IS NOT A FALLBACK, IT IS THE ORACLE'S INITIALISATION: frontend.c:5087
+// writes "nx64-abi-v0" into every module before its body is read, and each
+// declaration starts from it (frontend.c:2984 for an import, :3059 for a
+// function). A module that names no `default_abi` is therefore nx64 by the
+// reference's own act, not by this file's guess.
+//
+// THE LAST CLAUSE WINS, because that is what the oracle does: frontend.c:5098
+// is an assignment inside the module's own loop and states no duplicate rule,
+// and a module with `default_abi efi-x64-v0` then `default_abi nx64-abi-v0`
+// measures as ACCEPT with abi=nx64-abi-v0. (check refuses a duplicated
+// default_abi with 327 reason 3 before this is consulted, so the two answers
+// cannot disagree through check; this states the reference's rule for the
+// callers that read a tree directly.)
+fn module_profile(source:buf<u8>,tree:ntasm_ast.Tree)->u64 {
+    let mut answer:u64=1;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==6 {
+            let dashed_id:u64=child(tree,id,0);
+            if dashed_id!=0 {
+                let dashed:ntasm_ast.Node=ntasm_ast.node_at(tree,dashed_id);
+                if dashed.kind==92 {
+                    let named:u64=profile_of(source,dashed);
+                    if named!=0 { answer=named; }
+                }
+            }
+        }
+        id=id+1;
+    }
+    return answer;
+}
+
+// The EFFECTIVE profile of one declaration: its own `abi` clause when it has
+// one, the module default otherwise. That precedence is the oracle's, because
+// the clause is parsed after the initialisation and overwrites it
+// (frontend.c:3072 for a function, :2993 for an import), and it is measured:
+// a module with `default_abi efi-x64-v0` whose function then reads
+// `abi nx64-abi-v0` and takes a fifth unbound parameter is refused with 403
+// "nx64 parameter five and later require explicit @GPR", so the clause wins.
+//
+// A NAME THIS FILE CANNOT READ ANSWERS 1, and that is the fail-closed
+// direction: 1 is the profile whose two rules are a superset, so a profile
+// that cannot be read refuses rather than accepts. It cannot change any
+// verdict reached through check, which refuses every name but these two with
+// 327 before any rule runs; it is here so a caller that reads a tree
+// directly is not handed a profile it may apply.
+fn declaration_profile(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->u64 {
+    let mut child_id:u64=ntasm_ast.node_first_child(tree,id);
+    while child_id!=0 {
+        if child_id>tree.node_count { break; }
+        let item:u64=child_id;
+        if ntasm_ast.node_kind(tree,item)==28 {
+            let dashed_id:u64=child(tree,child_id,0);
+            if dashed_id!=0 {
+                let dashed:ntasm_ast.Node=ntasm_ast.node_at(tree,dashed_id);
+                if dashed.kind==92 {
+                    let named:u64=profile_of(source,dashed);
+                    if named!=0 { return named; }
+                }
+            }
+        }
+        child_id=ntasm_ast.node_next_sibling(tree,item);
+    }
+    return module_profile(source,tree);
+}
+
+// OWNER of the parameter direction rule.
+//
+// 1 in, 2 out, 3 inout, 0 when the parameter span carries no known direction.
+// The direction is the FIRST whitespace-delimited word of the span:
+// parser.nova:336 creates the kind 19 node before it steps over the direction
+// keyword, so the span opens on that keyword. Leading blanks are skipped, then
+// the word is compared WHOLE, so a longer word that merely starts with a
+// direction keyword (outbound, outer, input, inx, inoutbox) is never read as
+// a direction. This is the rule of the C oracle: frontend.c:469 matches a
+// whole NAME token and frontend.c:2741-2748 accepts only in, out or inout as
+// that token, so every other first word is a syntax error in the reference.
+// The blank set {32,9,10,13} is exactly the whitespace lexer.nova:75,78
+// accepts, so this first word is the first NAME token of the span.
+// A zero answer is a refusal, never an out: abi.check:203 and
+// parameter_families:352 both turn it into 800.
+//
+// Four copies of this rule exist and this one owns it: calls.nova:74
+// (fn direction), call_types.nova:21 (fn direction) and x64_lower_nxo.nova:2056
+// (fn param_direction). The function name is the durable anchor; the line
+// numbers are those of this revision. A change here must be applied to all
+// three. The conformance table in
+// tests/c/nova/tests_ntasm_abi.c drives the four readers over
+// one forged parameter span table, so a copy that drifts turns that gate red:
+// that table is the only gate in the suite that can see the difference, and
+// the revert that proves it is recorded in
+// out/c-bootstrap/nova/w5-lot4-negative-familyA.log.
+// What the replaced prefix comparison got wrong: it read `out` out of
+// `outbound` and `in` out of `inx`, which is defect H4 of the W4-8 audit.
+fn direction(source:buf<u8>,parameter:ntasm_ast.Node)->u64 {
+    if parameter.start>=parameter.end || parameter.end>len(source) { return 0; }
+    let mut at:u64=parameter.start;
+    while at<parameter.end {
+        let c:u8=source[at];
+        if c!=32 && c!=9 && c!=10 && c!=13 { break; }
+        at=at+1;
+    }
+    let mut stop:u64=at;
+    while stop<parameter.end {
+        let c:u8=source[stop];
+        if c==32 || c==9 || c==10 || c==13 { break; }
+        stop=stop+1;
+    }
+    let inout_:buf<u8>="inout";
+    if same_bytes_owned(source,at,stop,inout_) { return 3; }
+    let out_:buf<u8>="out";
+    if same_bytes_owned(source,at,stop,out_) { return 2; }
+    let in_:buf<u8>="in";
+    if same_bytes_owned(source,at,stop,in_) { return 1; }
+    return 0;
+}
+
+// THE EXPORT OF THE RULE, and it carries none of it. machine_pipeline.nova
+// (A7, 7 October 2026) and c_conversion.nova's direction_in_span read
+// parameter modes through this instead of becoming copies. The owner above
+// stayed a module-private `fn` because the copy census of tests_ntasm_abi.c
+// then read only `fn <name>` lines (measured: an `export fn direction` was
+// reported MISSING); since 7 October 2026 it reads `export fn` too, so the
+// owner's visibility is a choice now, not a constraint of the census.
+export fn parameter_mode(source:buf<u8>,parameter:ntasm_ast.Node)->u64 {
+    return direction(source,parameter);
+}
+
+fn is_pointer(source:buf<u8>,node:ntasm_ast.Node)->bool {
+    if node.start>node.end || node.end>len(source) || node.end-node.start<3 {
+        return false;
+    }
+    let word:buf<u8>="ptr";
+    return same_bytes_owned(source,node.start,node.start+3,word);
+}
+
+fn is_integer(source:buf<u8>,node:ntasm_ast.Node)->bool {
+    let u8_:buf<u8>="u8";if same_bytes_owned(source,node.start,node.end,u8_) { return true; }
+    let u16_:buf<u8>="u16";if same_bytes_owned(source,node.start,node.end,u16_) { return true; }
+    let u32_:buf<u8>="u32";if same_bytes_owned(source,node.start,node.end,u32_) { return true; }
+    let u64_:buf<u8>="u64";return same_bytes_owned(source,node.start,node.end,u64_);
+}
+
+// EFI accepts scalar/pointer values, with fixed register positions and then
+// stack arguments. This is independent of nx64 OUT/INOUT bindings.
+fn efi_scalar(source:buf<u8>,node:ntasm_ast.Node)->bool {
+    if is_integer(source,node) || is_pointer(source,node) { return true; }
+    let a:buf<u8>="i8";let b:buf<u8>="i16";let d:buf<u8>="i32";
+    let e:buf<u8>="i64";let f:buf<u8>="bool";
+    let result:bool=same_bytes(source,node.start,node.end,a) || same_bytes(source,node.start,node.end,b)
+        || same_bytes(source,node.start,node.end,d) || same_bytes(source,node.start,node.end,e)
+        || same_bytes(source,node.start,node.end,f);
+    rt_free(runtime(),a);rt_free(runtime(),b);rt_free(runtime(),d);rt_free(runtime(),e);rt_free(runtime(),f);
+    return result;
+}
+fn efi_family(index:u64)->u64 {
+    if index==0 { return 2; } if index==1 { return 3; }
+    if index==2 { return 9; } if index==3 { return 10; } return 0;
+}
+
+// THE PROFILE-SCOPED HALF of the parameter pass, over ONE declaration, and
+// the only place in this file where the two rules whose SCOPE depends on the
+// ABI profile are written. It is exported so that half can be confronted at
+// run time against a tree carrying a profile this product would not
+// otherwise construct, which is the only way to measure it today: check
+// refuses every profile name but the two the rules distinguish with 327
+// before this runs, so the efi arm is unreachable through check until the
+// name itself is accepted.
+//
+// REASONS 1 AND 2 EXIST ONLY UNDER nx64-abi-v0. Both refusals sit inside the
+// oracle's own nx64 block and neither has a counterpart in the efi block
+// that follows it:
+//
+//   reason 1, count > 14. frontend.c:2832-2837, the first statement of the
+//   nx64 arm, and the efi arm (frontend.c:2894-2944) has no count test at
+//   all. Measured against nt_frontend_compile: fifteen unbound parameters
+//   answer REFUSE 403 "nx64-abi-v0 supports at most 14 register parameters"
+//   and the same fifteen under `abi efi-x64-v0` answer ACCEPT; so do fifty
+//   and sixty-four, and sixty-five answers REFUSE 403 for both profiles.
+//
+//   reason 2, the fifth and later parameter carries no register binding.
+//   frontend.c:2849-2855, inside the nx64 arm's own loop. The efi arm inverts
+//   it: frontend.c:2937-2942 refuses a parameter of the fifth and later that
+//   DOES carry a binding, "EFI parameter five and later must use stack
+//   binding", and says nothing about one that does not. Measured: a fifth
+//   unbound parameter answers REFUSE 403 "nx64 parameter five and later
+//   require explicit @GPR" under nx64 and ACCEPT under efi.
+//
+// THE 64 IS NOT THIS RULE. The hard limit lives in parse_parameters
+// (frontend.c:2734-2739), once, before any profile is consulted, and it
+// measures identically for both profiles, so it belongs to the parser and no
+// profile-scoping here may claim or deny it. Scoping reason 1 to nx64 is
+// therefore not a licence to accept a sixty-fifth parameter.
+//
+// Returns 0, writing out[0]=parameters counted, out[1]=the output register
+// mask, out[2]=0, out[3]=THE PROFILE THE RULES READ, so an acceptance
+// carries the profile it was accepted under and a caller that cannot see the
+// tree's spans can still tell nx64 from efi. Returns 328 or 329 writing
+// out[0]=line, out[1]=column, out[2]=reason, out[3]=the zero-based parameter
+// index, the same shape check reports. Returns 800 with no write to out on
+// an invalid tree, a node that is neither a function (kind 18) nor an import
+// (kind 9), or an output buffer shorter than four words. It allocates ONE
+// four-word scratch, and only on the efi clause below and only when the
+// declaration carries a clobbers set, and it releases that scratch on every
+// path out of the clause including the refusing one. It releases neither
+// source nor tree.
+//
+// THE EFI CLAUSE IS INSIDE THIS FUNCTION AND NOT IN check, and the reason is
+// reachability rather than taste: check refuses the NAME efi-x64-v0 with 327
+// before it reaches any rule, by design and with six rows of the abi gate
+// pinning it (tests_ntasm_abi.c:726-733, "which is what keeps the arm
+// latent"). A clause written in check would therefore be correct and
+// unexercisable. Here it is reached, and the same six rows exercise it on
+// every run without turning red, because their fixture is `clobbers {}` and
+// an empty set masks to zero. The two facts are not in tension: the rule is
+// LIVE in this pass and LATENT in the pipeline, and a reader who is told
+// only that the efi arm is latent will not know that the rule is already
+// running underneath it.
+//
+// This function does NOT decide whether a profile name is one of the two the
+// oracle implements. check owns that refusal and runs it first; a name the
+// classifier cannot read is answered the stricter profile by
+// declaration_profile rather than by a third answer here.
+
+// THE EFI NON-VOLATILE MASK. This is the REFERENCE'S SET, not a new one.
+// frontend.c:2958-2960 reads
+//
+//   const uint64_t nonvolatile =
+//       BIT(3) | BIT(5) | BIT(6) | BIT(7) | BIT(12) | BIT(13) | BIT(14) |
+//       BIT(15);
+//
+// over the same family numbering clobbers.summarize charges, so the terms
+// below are those terms under those names, one per line. It is written this
+// way and not as one hex literal because a literal cannot be confronted with
+// the reference term by term, and a rule that cannot be confronted with the
+// reference is a rule that has quietly become a second table.
+//
+// The eight, in family order, are rbx rbp rsi rdi r12 r13 r14 r15. The other
+// eight -- rax rcx rdx rsp r8 r9 r10 r11 -- are caller-saved under the
+// Microsoft convention the efi profile is, and are NOT refused. Neither is
+// rflags: it is family 17, outside the sixteen and outside the mask.
+fn efi_nonvolatile()->u64 {
+    return (1<<3)|(1<<5)|(1<<6)|(1<<7)|(1<<12)|(1<<13)|(1<<14)|(1<<15);
+}
+
+export fn parameter_rules(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                          out:buf<u64>)->u64 {
+    if tree.ok==false || len(out)<4 { return 800; }
+    if id==0 || id>tree.node_count { return 800; }
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if declaration.kind!=18 && declaration.kind!=9 { return 800; }
+    let profile:u64=declaration_profile(source,tree,id);
+    let mut code:u64=0;let mut reason:u64=0;
+    let mut bad_line:u64=0;let mut bad_column:u64=0;let mut bad_index:u64=0;
+    let mut count:u64=0;let mut output_mask:u64=0;
+
+    let mut child_id:u64=declaration.first_child;
+    while child_id!=0 && code==0 {
+        if child_id>tree.node_count { code=800; }
+        else {
+            let item:u64=child_id;
+            if ntasm_ast.node_kind(tree,item)==19 { count=count+1; }
+            child_id=ntasm_ast.node_next_sibling(tree,item);
+        }
+    }
+    // Match the C frontend hard bound; EFI cannot bypass the64 limit.
+    if code==0 && count>64 && profile==2 {
+        code=328;reason=13;bad_line=declaration.line;bad_column=declaration.column;bad_index=64;
+    }
+    if code==0 && count>14 && profile==1 {
+        code=328;reason=1;bad_line=declaration.line;
+        bad_column=declaration.column;bad_index=14;
+    }
+    if code==0 {
+        child_id=declaration.first_child;let mut index:u64=0;
+        while child_id!=0 && code==0 {
+            let parameter:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+            if parameter.kind==19 {
+                let type_id:u64=child(tree,child_id,1);
+                let reg_id:u64=child(tree,child_id,2);
+                if type_id==0 { code=800; }
+                else {
+                    let type_node:ntasm_ast.Node=ntasm_ast.node_at(tree,type_id);
+                    let dir:u64=direction(source,parameter);
+                    if dir==0 || type_node.start>type_node.end
+                       || type_node.end>len(source) { code=800; }
+                    else if profile==2 && dir!=1 {
+                        code=328;reason=9;bad_line=parameter.line;bad_column=parameter.column;bad_index=index;
+                    } else if profile==2 && efi_scalar(source,type_node)==false {
+                        code=329;reason=3;bad_line=type_node.line;bad_column=type_node.column;bad_index=index;
+                    } else if profile==2 && reg_id!=0 && index>=4 {
+                        let reg:ntasm_ast.Node=ntasm_ast.node_at(tree,reg_id);
+                        code=328;reason=10;bad_line=reg.line;bad_column=reg.column;bad_index=index;
+                    } else if profile==2 && reg_id!=0 {
+                        let reg:ntasm_ast.Node=ntasm_ast.node_at(tree,reg_id);
+                        let family:u64=register_widths.family(source,reg.start,reg.end);
+                        if family!=efi_family(index) {
+                            code=328;reason=11;bad_line=reg.line;bad_column=reg.column;bad_index=index;
+                        }
+                        else if register_widths.width(source,reg.start,reg.end)==8
+                            && reg.end==reg.start+2 && source[reg.end-1]==104 {
+                            code=328;reason=12;bad_line=reg.line;bad_column=reg.column;bad_index=index;
+                        }
+                        // CH/DH share the fixed families but EFI forbids high8.
+                        else if is_pointer(source,type_node) && register_widths.width(source,reg.start,reg.end)!=64 {
+                            code=329;reason=2;bad_line=reg.line;bad_column=reg.column;bad_index=index;
+                        }
+                    } else if (dir==2 || dir==3) && reg_id==0 {
+                        code=328;reason=3;bad_line=parameter.line;
+                        bad_column=parameter.column;bad_index=index;
+                    } else if index>=4 && reg_id==0 && profile==1 {
+                        code=328;reason=2;bad_line=parameter.line;
+                        bad_column=parameter.column;bad_index=index;
+                    } else if (dir==2 || dir==3)
+                              && is_integer(source,type_node)==false
+                              && is_pointer(source,type_node)==false {
+                        code=329;reason=1;bad_line=parameter.line;
+                        bad_column=parameter.column;bad_index=index;
+                    } else if reg_id!=0 {
+                        let reg:ntasm_ast.Node=ntasm_ast.node_at(tree,reg_id);
+                        let family:u64=register_widths.family(
+                            source,reg.start,reg.end);
+                        let width:u64=register_widths.width(
+                            source,reg.start,reg.end);
+                        if family==0 || width==0 {
+                            code=328;reason=4;bad_line=reg.line;
+                            bad_column=reg.column;bad_index=index;
+                        } else if is_pointer(source,type_node) && width!=64 {
+                            code=329;reason=2;bad_line=reg.line;
+                            bad_column=reg.column;bad_index=index;
+                        } else if (dir==2 || dir==3)
+                                  && (family==1 || family==5 || family==6) {
+                            code=328;reason=5;bad_line=reg.line;
+                            bad_column=reg.column;bad_index=index;
+                        } else if dir==2 || dir==3 {
+                            output_mask=output_mask|(1<<(family-1));
+                        }
+                    }
+                    if code==0 { index=index+1; }
+                }
+            }
+            child_id=parameter.next_sibling;
+        }
+    }
+    // THE EFI CLAUSE, and it is the THIRD profile-scoped rule: reasons 1 and 2
+    // above belong to nx64, this one to efi, and it is the only rule in this
+    // function whose body is a clobbers set rather than a parameter.
+    //
+    // A declaration that names a non-volatile family, in a declaration whose
+    // profile declares non-volatility, is a promise the frame cannot keep:
+    // codegen.c:899-906 answers a declared clobber by replacing that
+    // family's `pop` with `lea rsp,[rbp+8]`, so the restore is skipped
+    // exactly for a family whose restore the caller was entitled to rely on.
+    // The reference refuses this at frontend.c:2967 with 403 at the position
+    // of the DECLARATION, which is what this writes: reason 8, the
+    // declaration's own line and column, index 0, because no parameter is
+    // implicated. That is the shape reason 6 already uses for the other
+    // clobbers-set refusal, so a reader gets one position convention.
+    //
+    // IT IS PROFILE-SCOPED AND IT STAYS THAT WAY. Extending it to nx64 would
+    // refuse, on this product alone, sources the reference accepts: measured
+    // against nt_frontend_compile, the reference answers 0 for every one of
+    // the sixteen under an nx64 module and 403 for eight of them under an
+    // efi one. A product that refuses what the reference builds is the
+    // direction every byte-parity gate in this tree is blind to by
+    // construction, so this does not reach nx64, and the corpus, which is
+    // nx64 throughout, is untouched by it. That is not an oversight; the
+    // section on the corpus below says which member wanted this to reach it.
+    if code==0 && profile==2 {
+        let mut result:u64=declaration.first_child;
+        while result!=0 && code==0 {
+            let node:ntasm_ast.Node=ntasm_ast.node_at(tree,result);
+            if node.kind==36 && efi_scalar(source,node)==false {
+                code=329;reason=3;bad_line=node.line;bad_column=node.column;bad_index=0;
+            }
+            result=node.next_sibling;
+        }
+    }
+    if code==0 && profile==2 {
+        let set_id:u64=clobber_set_id(tree,id);
+        // NO SET, NOTHING TO REFUSE. A declaration carrying no clobbers set
+        // at all is ordinary, so an absent set is not the 800 that check
+        // raises when an output parameter obliges one to exist.
+        if set_id!=0 {
+            let summary:buf<u64>=alloc(runtime(),4);
+            let mut k:u64=0;
+            while k<4 { summary[k]=0; k=k+1; }
+            let summarized:u64=clobbers.summarize(source,tree,set_id,summary);
+            if summarized!=0 { code=summarized; }
+            else if (summary[0]&efi_nonvolatile())!=0 {
+                code=328;reason=8;bad_line=declaration.line;
+                bad_column=declaration.column;bad_index=0;
+            }
+            rt_free(runtime(),summary);
+        }
+    }
+    if code==0 {
+        out[0]=count;out[1]=output_mask;out[2]=0;out[3]=profile;
+    } else if code==328 || code==329 {
+        out[0]=bad_line;out[1]=bad_column;out[2]=reason;out[3]=bad_index;
+    }
+    return code;
+}
+
+// EFI additions: 328/9 non-IN, /10 stack parameter bound to GPR, /11 wrong
+// fixed input GPR; 329/3 non-scalar/pointer. Existing nx64 reasons unchanged.
+// Validate declaration boundaries. Success writes functions,
+// imports, checked parameters,0. 327 rejects unknown/duplicate ABI names
+// (reason1 default,2 explicit,3 duplicate default). 328 rejects parameter
+// count/binding rules (reason1 >14,2 fifth unbound,3 out/inout unbound,
+// 4 unknown explicit GPR,5 reserved output family,6 output also clobber,
+// 7 default assignment colliding with an explicit binding,
+// 8 AN EFI NON-VOLATILE FAMILY DECLARED AS A CLOBBER). 329 rejects out
+// type (reason1) or pointer width
+// (reason2). out[3] is the zero-based parameter index, or 0 for declarations.
+// Reason 7 runs after reasons 1 to 6, so no diagnostic this pass already
+// reported can change code, reason or position. Reason 8 is written by
+// parameter_rules, not here, and for the same reason it is there: see its
+// own header. It is the ONLY reason that is efi-scoped; the other seven are
+// nx64-scoped or profile-independent.
+//
+// REASON 8 WAS A DIFFERENT RULE, AND A READER SIX WEEKS OUT WILL MEET BOTH.
+// An earlier revision refused rbp in ANY profile's clobbers set under this
+// same ordinal, on the argument that a body cannot keep the promise. That
+// rule was measured and removed as wrong, for the two reasons recorded
+// below. What occupies the ordinal now is the same subject -- a family
+// declared as a clobber that the frame cannot restore -- with the scope the
+// decision fixed: the EFI mask, under the EFI profile, and nothing else. The
+// removed rule would have refused rbp under nx64, which the reference
+// accepts; the rule that replaced it refuses rbx under efi, which the
+// reference also refuses. The ordinal was not reused to imply a continuity
+// that does not exist, and it was not skipped to imply the gap was an
+// oversight.
+//
+// 327 is the NAME gate and it runs first, before parameter_rules is reached,
+// so a profile this file does not implement is refused here and never
+// reaches a rule. Reasons 1, 2, 3, 4 and 5 are written in parameter_rules;
+// reasons 6 and 7 are below, because they need the output mask and the
+// parameter count that pass reports.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+    let clobber_summary:buf<u64>=alloc(runtime(),4);
+    let collision:buf<u64>=alloc(runtime(),4);
+    let mut default_count:u64=0;let mut functions:u64=0;let mut imports:u64=0;
+    let mut checked:u64=0;let mut code:u64=0;let mut reason:u64=0;
+    let mut bad_line:u64=0;let mut bad_column:u64=0;let mut bad_index:u64=0;
+
+    let mut id:u64=1;
+    while id<=tree.node_count && code==0 {
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==6 {
+            default_count=default_count+1;
+            let dashed_id:u64=child(tree,id,0);
+            if dashed_id==0 { code=800; }
+            else {
+                let dashed:ntasm_ast.Node=ntasm_ast.node_at(tree,dashed_id);
+                if dashed.kind!=92 || dashed.start>dashed.end
+                   || dashed.end>len(source) { code=800; }
+                else if default_count>1 {
+                    code=327;reason=3;bad_line=dashed.line;bad_column=dashed.column;
+                } else if profile_of(source,dashed)==0 {
+                    code=327;reason=1;bad_line=dashed.line;bad_column=dashed.column;
+                }
+            }
+        }
+        id=id+1;
+    }
+
+    id=1;
+    while id<=tree.node_count && code==0 {
+        let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if declaration.kind==18 || declaration.kind==9 {
+            if declaration.kind==18 { functions=functions+1; }
+            else { imports=imports+1; }
+            let mut child_id:u64=declaration.first_child;
+            let mut explicit_abi:u64=0;
+            while child_id!=0 && code==0 {
+                if child_id>tree.node_count { code=800; }
+                else {
+                    let item:u64=child_id;
+                    if ntasm_ast.node_kind(tree,item)==28 {
+                        let dashed_id:u64=child(tree,child_id,0);
+                        if dashed_id!=0 {
+                            let dashed:ntasm_ast.Node=ntasm_ast.node_at(tree,dashed_id);
+                            if dashed.kind==92 {
+                                explicit_abi=explicit_abi+1;
+                                if profile_of(source,dashed)==0 {
+                                    code=327;reason=2;bad_line=dashed.line;
+                                    bad_column=dashed.column;
+                                }
+                            }
+                        }
+                    }
+                    child_id=ntasm_ast.node_next_sibling(tree,item);
+                }
+            }
+            if code==0 && explicit_abi>1 {
+                code=327;reason=2;bad_line=declaration.line;
+                bad_column=declaration.column;
+            }
+            if code==0 {
+                let ruled:u64=parameter_rules(source,tree,id,out);
+                if ruled!=0 {
+                    code=ruled;reason=out[2];bad_line=out[0];
+                    bad_column=out[1];bad_index=out[3];
+                } else {
+                    let count:u64=out[0];
+                    let output_mask:u64=out[1];
+                    checked=checked+count;
+                    if output_mask!=0 {
+                        let set_id:u64=clobber_set_id(tree,id);
+                        if set_id==0 { code=800; }
+                        else {
+                            code=clobbers.summarize(
+                                source,tree,set_id,clobber_summary);
+                            if code==0 && (clobber_summary[0]&output_mask)!=0 {
+                                code=328;reason=6;bad_line=declaration.line;
+                                bad_column=declaration.column;bad_index=0;
+                            }
+                        }
+                    }
+                    if code==0 {
+                        if declaration_collision(
+                            source,tree,id,count,collision)!=0 {
+                            code=328;reason=7;bad_line=collision[0];
+                            bad_column=collision[1];bad_index=collision[3];
+                        }
+                    }
+                }
+            }
+        }
+        id=id+1;
+    }
+
+    if code==0 { out[0]=functions;out[1]=imports;out[2]=checked;out[3]=0; }
+    else if code==327 || code==328 || code==329 {
+        out[0]=bad_line;out[1]=bad_column;out[2]=reason;out[3]=bad_index;
+    }
+    rt_free(runtime(),clobber_summary);
+    rt_free(runtime(),collision);
+    return code;
+}
+
+// THE THIRTEEN: WHICH FAMILIES A CLOBBERS SET MAY NAME. All sixteen. This
+// section records the set because nothing else does, and because the set is
+// what a reader needs in order to see WHERE the real rule is.
+//
+// THE SET, BY MEASUREMENT. codegen.c declares the thirteen it pushes
+// unconditionally on entry and whose restore the epilogue can skip for a
+// declared clobber. Its complement over the sixteen families is exactly
+// {rax, rsp, rbp}, and those three are the very families reason 5 already
+// refuses for an out/inout binding.
+//
+// AND THE EFI PROFILE HAS A DIFFERENT SET, WHICH IS NOT THIS ONE. This is the
+// part wave 9 warned about, so it is stated here rather than left to be
+// inferred. The oracle's efi arm refuses a clobber set that names a
+// NONVOLATILE register of the Microsoft x64 convention
+// (frontend.c:2895-2909), and that set is
+//
+//   rbx rbp rsi rdi r12 r13 r14 r15          (families 4,6,7,8,13,14,15,16)
+//
+// measured one family at a time against nt_frontend_compile: those eight
+// answer REFUSE 403 "EFI function cannot declare a nonvolatile register
+// clobber" and the other eight -- rax, rcx, rdx, r8, r9, r10, r11, rsp --
+// answer ACCEPT. rflags answers ACCEPT under efi exactly as under nx64,
+// because the mask is eight BIT() terms over families 0..15 and rflags is
+// family 17, outside it.
+//
+// SO THE TWO SETS MUST NOT BE CONFLATED, in either direction, and the
+// complement reading is the dangerous one. Complementing the thirteen over
+// the sixteen gives {rax, rsp, rbp}; complementing the efi eight gives
+// {rax, rcx, rdx, rsp, r8, r9, r10, r11}. A rule written as "not in the
+// thirteen" would refuse rax under efi, and the oracle ACCEPTS rax -- the
+// `rax accepted` case in tests_ntasm_abi.c is exactly that assertion, and
+// `return42.ntasm` and the other shipped modules declare it. A rule written
+// as "not in the efi eight" applied to nx64 would refuse rbx, and the
+// `rbx accepted` case is exactly that. The thirteen is a fact about what
+// codegen.c PUSHES; the efi eight is a fact about a CALLING CONVENTION.
+// They are independent, they overlap in eight of sixteen, and neither is a
+// refinement of the other.
+//
+// The profile scoping written for reasons 1 and 2 did not touch any of this,
+// and was not extended to it by analogy. The efi nonvolatile rule is a THIRD
+// profile-scoped rule, it belongs to efi only, and it is now written: 328
+// reason 8, in parameter_rules, over the mask at efi_nonvolatile() above,
+// which is the reference's mask term for term. The clause that carries it in
+// the reference is frontend.c:2967, not the :2904 this paragraph used to
+// name, and the refusal is 403 there and 328 reason 8 here, which is the
+// same refusal in this product's own code space.
+//
+// IT IS WRITTEN AND IT IS STILL LATENT IN THE PIPELINE, and the two facts
+// have to be carried together or a reader draws the wrong conclusion from
+// either. check refuses the NAME efi-x64-v0 with 327 before it reaches any
+// rule, deliberately and with six rows of tests_ntasm_abi.c pinning it, so
+// the pipeline never delivers a tree to this clause. The clause is live
+// inside parameter_rules, which the abi gate's own profile probe calls
+// directly and on every run. So: no shipped .ntasm has ever been refused by
+// reason 8, and any claim that this rule has changed what the product
+// refuses is false. What it has changed is that the product and the
+// reference now HOLD THE SAME RULE, so the day the efi name is un-latened
+// there is no second decision to make and no one-sided patch to discover
+// late. That is the whole of what it bought, and it is worth stating that
+// plainly rather than letting a green row imply more.
+//
+// WHICH IS ALSO WHY IT CLOSES NO CORPUS ROW, and this is the finding rather
+// than a shortfall. Every .ntasm on the tree, all twenty-one of them,
+// carries target x86_64-nexora-uefi and NOT one of them names a
+// default_abi, so frontend.c:5150 gives every one of them the module
+// default "nx64-abi-v0" and the reference's own NtFFunction::abi reads
+// nx64-abi-v0 for every entry. The target name does not select the profile;
+// it is checked and discarded at frontend.c:5151. The single corpus member
+// that names a family in the efi mask is memory-space-user-data.ntasm, which
+// declares rbx, and it is an nx64 module, so the rule does not reach it and
+// the reference accepts it: measured, the reference answers 0 for that file
+// and 0 for every one of the other twenty. Making this rule nx64-scoped
+// would turn that member red on this product alone -- the direction every
+// byte-parity gate here is blind to by construction -- and would not make it
+// run correctly. It would only make it fail to build.
+//
+// rflags IS NOT A MEMBER OF THAT DOMAIN IN EITHER DIRECTION, and the safe
+// reading of "not in the set" for it is NOT APPLICABLE, never "therefore
+// refuse". It is not a seventeenth family to be subtracted from: it has no
+// register slot, no width, no encoder form and no frame push to skip. What
+// honours an rflags clobber is suppressing the flags save, which is a
+// different act from the thirteen skipping a restore, and it is honoured
+// already. So a set difference over the sixteen GPRs is a rule rflags was
+// never in, not one it escapes.
+//
+// NO DECLARATION IS REFUSED. All sixteen families are accepted in a clobbers
+// set, including rax, rsp and rbp, and that is deliberate: it is what the C
+// oracle does. Measured with nt_frontend_compile, a clobbers set naming any
+// one of the sixteen compiles with zero diagnostics. An earlier revision of
+// this file refused rbp here as 328 reason 8, on the argument that a body
+// cannot keep the promise. That was WRONG and it has been removed, for two
+// measured reasons.
+//
+// First, the oracle puts the rule on the WRITE, not on the declaration, and
+// the write rule is GENERAL. Measured across forms, every destination write
+// to rbp or rsp is refused with 503 and the oracle's own words, "requires
+// unavailable stack/frame balance proof": mov (direct and register), add,
+// xor, pop, lea and inc all refuse, for rbp and for rsp alike, while the same
+// writes to an ordinary callee-saved register draw only the normal 501 and
+// 502 accounting. So the reference protects the frame register on every
+// attempt to write it, and leaves the declaration free.
+//
+// Second, a declaration of rbp is not a false promise. A function that
+// genuinely does not restore rbp is describing itself accurately, and
+// refusing it would forbid a TRUE statement in a program the reference
+// compiles. Two fixtures in this tree already say so: one declares
+// clobbers {rsp,rbp} on a body the gate refuses because `leave` writes the
+// frame registers, and one declares clobbers {rsi,rdi,rbp,rsp} on a body that
+// writes nothing and is accepted. The first is a witness FOR the write rule
+// and the second would have been made red by a declaration rule.
+//
+// WHERE THE REAL RULE LIVES, and it is not in this file. The write-position
+// refusal belongs to the pass that checks a machine instruction's operands,
+// which is where the oracle raises it. Nothing in this file can see a
+// mnemonic, so nothing in this file can enforce it, and a rule here would
+// have been the wrong rule in the wrong place. As of this revision NO Nova
+// pass refuses a write to rbp or rsp: grep for 503, for "frame balance", and
+// for rbp in machine_ir.nova and the x64 lowering modules returns nothing.
+// That gap is real, it is not this lot's to close, and it is the one that
+// matters.
+//
+// The set is derived from codegen.c and confronted against both other
+// spellings of it by scan_saved_register_copies in tests_ntasm_abi.c, so this
+// paragraph cannot drift from the reference without that gate turning red.
+
+// nx64-abi-v0 default incoming argument registers. spec/ntasm/ntasm.md section 5:
+// "Les quatre premiers paramètres in sans liaison explicite utilisent, dans
+// l'ordre, rcx, rdx, r8, r9; le cinquième et les suivants exigent un @GPR."
+// The ordinal is the raw parameter index, the same index the existing 328
+// reason 2 boundary counts, so the default table and the fifth-unbound
+// refusal can never disagree. Families follow register_widths.family, so the
+// table is 2=rcx, 3=rdx, 9=r8, 10=r9; architectural numbers are family-1.
+// Zero past the fourth, which reason 2 refuses under nx64 and which is the
+// truth under efi, where such a parameter is a legal stack parameter.
+//
+// AND THIS TABLE IS ALREADY CORRECT FOR THE EFI PROFILE, which is worth
+// saying because the fifth-and-later refusal is what the wave 10 lot 4 brief
+// points at, and the two are not the same thing. The oracle gives its first
+// four INTEGER parameters the same four registers under both profiles: the
+// table `static const unsigned fixed[] = {1, 2, 8, 9}` at frontend.c:2828 is
+// declared once, before the two arms, and both read it (frontend.c:2856 for
+// nx64, frontend.c:2931 for efi). Measured: four parameters bound to rcx,
+// rdx, r8, r9 answer ACCEPT under `efi-x64-v0`, and the same four bound to
+// rdx, r8, r9, r10 answer REFUSE 403 "EFI register parameter does not match
+// RCX/RDX/R8/R9". Past the fourth this table answers 0, and under efi that is
+// not a refusal to be worked around but the truth: the parameter arrives on
+// the incoming stack and owns no register at all, which is what
+// frontend.c:2937-2942 states and what the sixty-four parameter fixture at
+// tests_conformance_efi.c:182-214 executes.
+fn default_family(index:u64)->u64 {
+    if index==0 { return 2; }
+    if index==1 { return 3; }
+    if index==2 { return 9; }
+    if index==3 { return 10; }
+    return 0;
+}
+
+// Node id of the ordinal-th parameter (kind 19) among the direct children of
+// a function or import, 0 when the parent is unknown or the child chain ends
+// first. The ordinal is the raw parameter index: an out parameter consumes no
+// call argument yet still shifts the ordinal of the parameters after it.
+fn parameter_at(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:u64=parent;
+    let mut id:u64=ntasm_ast.node_first_child(tree,p);let mut seen:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==19 {
+            if seen==ordinal { return id; }
+            seen=seen+1;
+        }
+        id=ntasm_ast.node_next_sibling(tree,n);
+    }
+    return 0;
+}
+
+// Node id of the ordinal-th function (kind 18) or import (kind 9) in node
+// order, 0 when the tree is empty or holds fewer declarations. This is the
+// fn_or_import_id the argument queries take, so a caller holding a source
+// order index does not have to know the internal node numbering.
+export fn declaration_at(tree:ntasm_ast.Tree,ordinal:u64)->u64 {
+    if tree.ok==false || tree.node_count==0 { return 0; }
+    let mut seen:u64=0;let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==18 || ntasm_ast.node_kind(tree,n)==9 {
+            if seen==ordinal { return id; }
+            seen=seen+1;
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// Effective register assignment of one parameter. An explicit @register
+// always wins; an unbound in or inout parameter takes the default family of
+// its raw ordinal; an unbound out parameter takes none, because spec/ntasm/ntasm.md
+// section 5 gives an out parameter no call argument. A register spelling this
+// pass cannot resolve contributes no family, so the default then applies to
+// the effective assignment and to the collision comparison.
+// Writes out[0]=effective family, out[1]=bound family, out[2]=default family,
+// out[3]=direction, and returns 0. A parameter ordinal past the end of the
+// signature is not an error: it answers the same four zeros as an unbound out
+// parameter, so argument_register returns 0 for an out of range index.
+// Returns 800 with no write to out on an invalid tree, an output buffer
+// shorter than four words, a node that is not a function or import, or a
+// parameter whose direction word is malformed. Neither source nor tree is
+// released.
+fn parameter_families(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,index:u64,
+                      out:buf<u64>)->u64 {
+    if tree.ok==false || len(out)<4 { return 800; }
+    if id==0 || id>tree.node_count { return 800; }
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if declaration.kind!=18 && declaration.kind!=9 { return 800; }
+    let parameter_id:u64=parameter_at(tree,id,index);
+    if parameter_id==0 { out[0]=0;out[1]=0;out[2]=0;out[3]=0;return 0; }
+    let parameter:ntasm_ast.Node=ntasm_ast.node_at(tree,parameter_id);
+    let dir:u64=direction(source,parameter);
+    if dir==0 { return 800; }
+    let reg_id:u64=child(tree,parameter_id,2);
+    let mut bound:u64=0;
+    if reg_id!=0 {
+        let reg:u64=reg_id;
+        bound=register_widths.family(source,ntasm_ast.node_start(tree,reg),ntasm_ast.node_end(tree,reg));
+    }
+    let mut by_default:u64=0;
+    if dir==1 || dir==3 { by_default=default_family(index); }
+    let mut effective:u64=bound;
+    if effective==0 { effective=by_default; }
+    out[0]=effective;out[1]=bound;out[2]=by_default;out[3]=dir;
+    return 0;
+}
+
+// Whole parameter record of one declaration parameter: out[0]=architectural
+// GPR number of the default incoming register (0 when the parameter is
+// explicitly bound, is an out, or is past the fourth), out[1]=its physical
+// family (0 when there is no default), out[2]=bound family (0 when unbound),
+// out[3]=1 when the direction consumes a call argument. Returns 800 with no
+// write to out under the same conditions as parameter_families, in which case
+// every answer stays the zero the caller must prefill.
+export fn argument(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,param_index:u64,
+                   out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    let code:u64=parameter_families(source,tree,id,param_index,out);
+    if code!=0 { return code; }
+    let bound:u64=out[1];let by_default:u64=out[2];let dir:u64=out[3];
+    let mut family:u64=0;let mut arch:u64=0;
+    if bound==0 {
+        family=by_default;
+        if by_default!=0 { arch=by_default-1; }
+    }
+    let mut consumes:u64=0;
+    if dir==1 || dir==3 { consumes=1; }
+    out[0]=arch;out[1]=family;out[2]=bound;out[3]=consumes;
+    return 0;
+}
+
+// Architectural GPR number 0..15 of the default incoming register of the
+// parameter at the raw ordinal, per spec/ntasm/ntasm.md section 5. Zero means the
+// parameter has no default: it is explicitly bound, it is an out, it is past
+// the fourth. Invalid trees, declarations or directions return 800.
+export fn argument_register(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                            param_index:u64)->u64 {
+    if tree.ok==false { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut answer:u64=0;
+    let code:u64=argument(source,tree,id,param_index,scratch);
+    if code==0 { answer=scratch[0]; }
+    rt_free(runtime(),scratch);
+    if code!=0 { return code; }
+    return answer;
+}
+
+// Physical family 1..16 of the default incoming register of the parameter, 0
+// when it has no default. Same domain and error channel as argument_register.
+export fn argument_family(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                          param_index:u64)->u64 {
+    if tree.ok==false { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut answer:u64=0;
+    let code:u64=argument(source,tree,id,param_index,scratch);
+    if code==0 { answer=scratch[1]; }
+    rt_free(runtime(),scratch);
+    if code!=0 { return code; }
+    return answer;
+}
+
+// Family 1..16 of the explicit @register of the parameter, 0 when unbound or
+// when the spelling is outside the x86_64 catalogue. Invalid queries return 800.
+export fn bound_family(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                       param_index:u64)->u64 {
+    if tree.ok==false { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut answer:u64=0;
+    let code:u64=parameter_families(source,tree,id,param_index,scratch);
+    if code==0 {
+        answer=scratch[1];
+    }
+    rt_free(runtime(),scratch);
+    if code!=0 { return code; }
+    return answer;
+}
+
+// 1 when the parameter direction consumes a call argument, that is in or
+// inout; 0 when the direction reads exactly out. spec/ntasm/ntasm.md section 5:
+// "Au call, les paramètres in et inout consomment un argument dans l'ordre
+// de la signature; un paramètre out n'en consomme aucun."
+// 800, propagated and never absorbed, when the direction cannot be read at
+// all: an invalid tree, a declaration id outside the tree, a node that is
+// neither a function nor an import, or a parameter whose direction word is
+// absent or is not exactly in, out or inout (direction:78). The 800 of
+// parameter_families:344 is returned as it stands; this export used to drop
+// it and answer 0, which is the out answer, so an unreadable direction was
+// silently reported as "consumes no argument" and a caller could accept a
+// call it should have refused. That fail-open path is defect H5 of the W4-8
+// audit. Zero is now only ever the out direction.
+// This is not the boolean of calls.nova:98 or call_types.nova:25, and must not
+// be read as one: those two answer a yes/no question with no error channel and
+// deliberately keep the argument of a span they cannot read, so the argument
+// is still checked, while this export has an error channel and refuses. All
+// three read the direction with the rule of direction:78, which is the part
+// this lot unified.
+// argument_register, argument_family and bound_family propagate the same 800.
+export fn consumes_argument(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                            param_index:u64)->u64 {
+    if tree.ok==false { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let code:u64=parameter_families(source,tree,id,param_index,scratch);
+    let mut answer:u64=0;
+    if code==0 {
+        if scratch[3]==1 || scratch[3]==3 { answer=1; }
+    }
+    rt_free(runtime(),scratch);
+    if code!=0 { return code; }
+    return answer;
+}
+
+// First default-versus-explicit register collision inside one declaration.
+// Parameters are compared in signature order: parameter i is reported when an
+// earlier parameter j<i already holds the same physical family and at least
+// one of the two took that family by default assignment, which spec/ntasm/ntasm.md
+// section 5 forbids ("Deux paramètres simultanément vivants ne peuvent
+// occuper le même registre"). A parameter explicitly bound to the register it
+// would have received by default is a no-op, not a collision, and a
+// duplicate pair of explicit bindings is left to register_bindings.
+// Writes out[0]=line, out[1]=column of the offending token, out[2]=reason 7,
+// out[3]=offending parameter index, and returns 7. Returns 0 with no write to
+// out when the declaration is clean or cannot be read, so this helper can
+// never turn a readable declaration into an 800.
+fn declaration_collision(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,count:u64,
+                         out:buf<u64>)->u64 {
+    if tree.ok==false || len(out)<4 { return 0; }
+    if id==0 || id>tree.node_count { return 0; }
+    let mine:buf<u64>=alloc(runtime(),4);
+    let mut theirs:buf<u64>=alloc(runtime(),4);
+    let mut code:u64=0;let mut i:u64=0;
+    while i<count && code==0 {
+        if parameter_families(source,tree,id,i,mine)==0 {
+            let family:u64=mine[0];
+            let mut j:u64=0;
+            // A stack-only parameter cannot collide with a GPR. Avoid the
+            // repeated parameter_at scans (and Node return allocations).
+            while family!=0 && j<i && code==0 {
+                if parameter_families(source,tree,id,j,theirs)==0 {
+                    if family!=0 && family==theirs[0]
+                       && (mine[1]==0 || theirs[1]==0) {
+                        let parameter_id:u64=parameter_at(tree,id,i);
+                        let reg_id:u64=child(tree,parameter_id,2);
+                        let mut at:u64=parameter_id;
+                        if reg_id!=0 { at=reg_id; }
+                        if at>tree.node_count { code=0; }
+                        else {
+                            let node:u64=at;
+                            out[0]=ntasm_ast.node_line(tree,node);out[1]=ntasm_ast.node_column(tree,node);out[2]=7;
+                            out[3]=i;code=7;
+                        }
+                    }
+                }
+                j=j+1;
+            }
+        }
+        i=i+1;
+    }
+    rt_free(runtime(),mine);rt_free(runtime(),theirs);
+    return code;
+}
+
+// Default-versus-explicit register collisions of a whole module. Every
+// function (kind 18) and import (kind 9) is scanned in source order, so the
+// first collision of the first offending declaration is reported.
+// Returns 0 writing out[0]=declarations, out[1]=parameters, out[2]=0,
+// out[3]=0 when no declaration collides. Returns 328 writing out[0]=line,
+// out[1]=column, out[2]=reason 7, out[3]=parameter index, the same shape and
+// the same out[3] slot as check. Returns 800 with no write to out on an
+// invalid tree, an unreadable child chain or an output buffer shorter than
+// four words. The scratch buffer is always freed; neither source nor tree is
+// released.
+export fn collisions(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut declarations:u64=0;let mut parameters:u64=0;
+    let mut code:u64=0;let mut id:u64=1;
+    while id<=tree.node_count && code==0 {
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==18 || ntasm_ast.node_kind(tree,n)==9 {
+            declarations=declarations+1;
+            let mut count:u64=0;let mut child_id:u64=ntasm_ast.node_first_child(tree,n);
+            while child_id!=0 && code==0 {
+                if child_id>tree.node_count { code=800; }
+                else {
+                    let c:u64=child_id;
+                    if ntasm_ast.node_kind(tree,c)==19 { count=count+1; }
+                    child_id=ntasm_ast.node_next_sibling(tree,c);
+                }
+            }
+            if code==0 {
+                parameters=parameters+count;
+                if declaration_collision(
+                    source,tree,id,count,scratch)!=0 { code=328; }
+            }
+        }
+        id=id+1;
+    }
+    if code==0 {
+        out[0]=declarations;out[1]=parameters;out[2]=0;out[3]=0;
+    } else if code==328 {
+        out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3];
+    }
+    rt_free(runtime(),scratch);
+    return code;
+}
+
+// ===========================================================================
+// DIRECTION BINDING -- how a formal parameter becomes the SUBJECT of a
+// direction. Written by lot 27 (IN / OUT / INOUT).
+//
+// The rule above answers ONE question -- what is this parameter's direction
+// word. Everything below answers what that direction then OWES. Three
+// obligations, and they are three and not one, because a gate that counts
+// bindings sees only the first:
+//
+//   LIAISON      the subject of a predicate is a parameter of THIS
+//                declaration, and its direction is read from that parameter.
+//                A subject that is a literal, or a name of another
+//                declaration, is not a direction subject at all.
+//   CONSOMMATION  the bound `in` is actually READ somewhere in the body. A
+//                parameter that binds correctly and is never read satisfies
+//                liaison and nothing else.
+//   RESTITUTION   the bound `out` is actually WRITTEN BACK before the
+//                return. An `out` nobody writes is the shape most likely to
+//                be green and wrong, so it is refused rather than reported
+//                as a note.
+//
+// Everything is read from the SOURCE BYTES of the body, not from the tree,
+// for the reason macro_expand.nova:908-918 records: no AST field carries a
+// parameter's direction, so a rule that wanted one would have to invent it.
+//
+// The three refusals are kept DISTINCT, because the reader has to know which
+// rule fired:
+//   366 reason 1  the subject is not a parameter of this declaration
+//   366 reason 2  the parameter's direction word is not one of in/out/inout
+//   366 reason 3  the parameter is an out or inout with no explicit register,
+//                 so there is no location to write the restitution into
+//   314           a body that reads or writes a parameter this module cannot
+//                 resolve, and 800 for a malformed tree, as everywhere here.
+// 366 was chosen because spec/ntasm/ntasm.md's code table leaves it unallocated and
+// names it as MUST NOT be emitted until something claims it in that table;
+// this section is that claim, and the table row is written with the change.
+// ===========================================================================
+
+// Byte-wise equality of two source spans, both bounds-checked. NOT a value
+// comparison: it says the two spans are THE SAME TEXT, which is what an alias
+// is in this language -- two names for one location are two spellings of one
+// span here, and a location that merely holds an equal value is a different
+// span and is not an alias. See alias_parameters for the rule that uses this.
+fn same_span(source:buf<u8>,a:ntasm_ast.Node,b:ntasm_ast.Node)->bool {
+    if a.start>a.end || b.start>b.end { return false; }
+    if a.end>len(source) || b.end>len(source) { return false; }
+    if (a.end-a.start)!=(b.end-b.start) { return false; }
+    let mut i:u64=0;
+    while i<(a.end-a.start) {
+        if source[a.start+i]!=source[b.start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// The NAME CHILD ID of a parameter node (kind 19). 0 when the node is not a
+// parameter or carries no name.
+//
+// IT RETURNS AN ID AND NOT A NODE, and that is not a style choice.
+//
+// HISTORY, kept because it is the reason this file reads the way it does.
+// ntasm_ast.node_at used to compute `(id-1)*12` with no guard, so
+// node_at(tree,0) underflowed to a huge offset and read outside the node
+// array: MEASURED as runtime error NV2_BOUNDS on every case whose body
+// carries a `mov` whose operand is not a bare name.
+//
+// THE ACCESSOR IS NOW GUARDED (ast.nova:129-142), so the fault this comment
+// describes cannot recur through this function. THE GUARDS BELOW STAY ANYWAY,
+// and that is a deliberate choice rather than leftover caution:
+//
+//   1 this function's CONTRACT is "0 when there is no such name". A guard
+//     here is how that contract is kept: node_at REFUSES an id outside
+//     1<=id<=node_count, so without the tests below this function would ABORT
+//     the whole run where it is supposed to answer 0 and carry on. The guard
+//     and the accessor are not redundant -- they answer different questions.
+//   2 the sentinel is the ID 0 and the caller must test it BEFORE asking for
+//     a node, because there is no node 0 to return and inventing one is
+//     precisely the shape this project refuses.
+fn parameter_name_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let n:u64=id;
+    if ntasm_ast.node_kind(tree,n)!=19 { return 0; }
+    let name_id:u64=child(tree,id,0);
+    if name_id==0 || name_id>tree.node_count { return 0; }
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+    if name.kind!=90 { return 0; }
+    return name_id;
+}
+
+// The NAME CHILD ID of the simple-name expression at `id`, or 0. The shape is
+// kind 35 with aux 0 carrying one qualified node with one name -- the shape
+// `mov rax, p` and `non_null(p)` both have, MEASURED on the fixture
+// out/c-bootstrap/nova/W66Directions/fixture.nova and not read off a comment.
+// 0 for every other expression: a literal, a call, a parenthesised form, a
+// qualified path. An expression that is not a bare name names no location and
+// can therefore be neither an alias nor a consumption.
+fn simple_name_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let e:u64=id;
+    if ntasm_ast.node_kind(tree,e)!=35 || ntasm_ast.node_aux(tree,e)!=0 { return 0; }
+    if ntasm_ast.node_first_child(tree,e)==0 || ntasm_ast.node_first_child(tree,e)!=ntasm_ast.node_last_child(tree,e) { return 0; }
+    let q:u64=ntasm_ast.node_first_child(tree,e);
+    if ntasm_ast.node_kind(tree,q)!=91 || ntasm_ast.node_first_child(tree,q)==0 || ntasm_ast.node_first_child(tree,q)!=ntasm_ast.node_last_child(tree,q) { return 0; }
+    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,ntasm_ast.node_first_child(tree,q));
+    if name.kind!=90 { return 0; }
+    return ntasm_ast.node_first_child(tree,q);
+}
+
+// The bare TOKEN of an operand, whatever it is: the kind 90 name under a
+// kind 35 expression, the kind 94 literal on its own, or 0.
+//
+// The operand of an instruction is either an expression wrapping one name or a
+// bare literal, and the two are spelled by DIFFERENT node kinds -- MEASURED
+// on out/c-bootstrap/nova/W66Directions/mov-fixture.nova, where `mov rdx, 9`
+// gives a kind 35 holding a kind 90 for `rdx` and a bare kind 94 for `9`. A
+// rule that read only the expression shape sees half the operands in the
+// language, which is why this unwraps one level and keeps the literal.
+fn operand_token(tree:ntasm_ast.Tree,id:u64)->ntasm_ast.Node {
+    if id==0 || id>tree.node_count { return ntasm_ast.node_at(tree,1); }
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    if n.kind==90 || n.kind==94 { return n; }
+    if n.kind==35 && n.aux==0 && n.first_child!=0 && n.first_child==n.last_child {
+        let q:u64=n.first_child;
+        if ntasm_ast.node_kind(tree,q)==91 && ntasm_ast.node_first_child(tree,q)!=0 && ntasm_ast.node_first_child(tree,q)==ntasm_ast.node_last_child(tree,q) {
+            return ntasm_ast.node_at(tree,ntasm_ast.node_first_child(tree,q));
+        }
+    }
+    return ntasm_ast.node_at(tree,1);
+}
+
+// First instruction node (kind 32) at or below `id` whose FORM writes the
+// LOCATION bound to `parameter`, which is its REGISTER. Returns the
+// instruction node id, 0 when no such instruction exists in the subtree.
+//
+// THE AXIS IS THE REGISTER, NOT THE NAME, and getting that wrong is what my
+// first version of this rule did, so the error is recorded here rather than
+// only fixed. MEASURED on the fixture named above: in `mov rdx, 9` the
+// destination is a kind 90 node spelling the REGISTER `rdx`, while in
+// `mov rax, p` the source is a kind 90 node spelling the VARIABLE `p`. A
+// parameter's location IS the register it is bound to -- that is what
+// parameter_families reports and what alias_parameters compares -- so a
+// restitution is found by matching the destination REGISTER SPAN against the
+// parameter's BOUND REGISTER SPAN. A rule that matched the parameter's NAME
+// found the `in` case and missed every `out` case, which is the difference
+// between an `out` that is restituted and an `out` that is silently dropped.
+//
+// Only two shapes write a destination in this language and they are the only
+// two this counts: `mov` with a register first operand, and `store` with its
+// first operand naming the location. Every other mnemonic is a READ of its
+// first operand and is counted by reads_parameter instead. A form this
+// function cannot classify contributes NOTHING, which is the direction that
+// cannot invent a restitution: an unclassifiable write is an absent one.
+fn writes_parameter(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                    register:ntasm_ast.Node,
+                    name:ntasm_ast.Node)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let n:u64=id;
+    if ntasm_ast.node_kind(tree,n)==32 {
+        let name_id:u64=child(tree,id,0);
+        if name_id!=0 && name_id<=tree.node_count {
+            let mnemonic:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+            let dest_id:u64=child(tree,id,1);
+            if dest_id!=0 && dest_id<=tree.node_count {
+                let dest:ntasm_ast.Node=operand_token(tree,dest_id);
+                if dest.start<dest.end {
+                    let mov:buf<u8>="mov";let store:buf<u8>="store";
+                    let is_mov:bool=same_bytes(source,mnemonic.start,mnemonic.end,mov);
+                    let is_store:bool=same_bytes(
+                        source,mnemonic.start,mnemonic.end,store);
+                    if is_mov || is_store {
+                        if same_span(source,dest,register) { return id; }
+                        if same_span(source,dest,name) { return id; }
+                    }
+                }
+            }
+        }
+    }
+    let mut c:u64=ntasm_ast.node_first_child(tree,n);
+    while c!=0 {
+        if c>tree.node_count { return 0; }
+        let hit:u64=writes_parameter(source,tree,c,register,name);
+        if hit!=0 { return hit; }
+        c=ntasm_ast.node_next_sibling(tree,c);
+    }
+    return 0;
+}
+
+// First instruction node at or below `id` that READS the location bound to
+// `parameter`. Returns the instruction node id, 0 when none does.
+//
+// AN OBLIGATION MATCHES EITHER SPELLING OF ITS LOCATION, and that is the one
+// thing this rule and writes_parameter must agree on. A location has two names
+// in the source: the REGISTER it is bound to and the VARIABLE the parameter
+// introduces, and a body may use either -- `mov rax, p` reads `p` out of its
+// register, `mov rax, rcx` reads the register directly, and both consume the
+// same `in`. MEASURED on the fixture: `mov rax, p` gives a kind 90 spelling
+// the variable, `mov rdx, 9` a kind 90 spelling the register. An obligation
+// that matched only one of them would call a consumed parameter unconsumed,
+// or a restituted one unrestituted, depending on which way the body happened
+// to spell it -- a verdict that changed with the spelling rather than with the
+// meaning.
+//
+// Which OPERAND counts is a separate question and the two rules answer it
+// differently on purpose: a `mov` READS its second operand and WRITES its
+// first, so `mov rax, p` reads p and writes rax, and reads_parameter and
+// writes_parameter disagree about that instruction by design. Every other
+// mnemonic reads its first operand -- `add rax, 1` reads rax -- so a form
+// that is neither `mov` nor `store` is a read of operand one and a write of
+// nothing this function can classify.
+fn reads_parameter(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                   register:ntasm_ast.Node,
+                   name:ntasm_ast.Node)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let n:u64=id;
+    if ntasm_ast.node_kind(tree,n)==32 {
+        let name_id:u64=child(tree,id,0);
+        if name_id!=0 && name_id<=tree.node_count {
+            let mnemonic:u64=name_id;
+            let first:u64=child(tree,id,1);
+            let second:u64=child(tree,id,2);
+            let mov:buf<u8>="mov";let store:buf<u8>="store";
+            let is_mov:bool=same_bytes(source,ntasm_ast.node_start(tree,mnemonic),ntasm_ast.node_end(tree,mnemonic),mov);
+            let is_store:bool=same_bytes(source,ntasm_ast.node_start(tree,mnemonic),ntasm_ast.node_end(tree,mnemonic),store);
+            let mut slot:u64=0;
+            if is_mov { slot=second; }
+            else if is_store { slot=first; }
+            else { slot=first; }
+            if slot!=0 && slot<=tree.node_count {
+                let token:ntasm_ast.Node=operand_token(tree,slot);
+                if token.start<token.end {
+                    if same_span(source,token,register) { return id; }
+                    if same_span(source,token,name) { return id; }
+                }
+            }
+        }
+    }
+    let mut c:u64=ntasm_ast.node_first_child(tree,n);
+    while c!=0 {
+        if c>tree.node_count { return 0; }
+        let hit:u64=reads_parameter(source,tree,c,register,name);
+        if hit!=0 { return hit; }
+        c=ntasm_ast.node_next_sibling(tree,c);
+    }
+    return 0;
+}
+
+// The body block (kind 25) of a declaration, 0 for an import and for a
+// function that spells no block. A declaration with no body has no body to
+// read a parameter from and no return to restitute into, so both obligations
+// answer absent rather than unproven.
+fn body_block(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let n:u64=id;
+    let mut c:u64=ntasm_ast.node_first_child(tree,n);
+    while c!=0 {
+        if c>tree.node_count { return 0; }
+        let item:u64=c;
+        if ntasm_ast.node_kind(tree,item)==25 { return c; }
+        c=ntasm_ast.node_next_sibling(tree,item);
+    }
+    return 0;
+}
+
+// Does any predicate under the set at `set_id` take `parameter` as an argument?
+fn names_a_subject(source:buf<u8>,tree:ntasm_ast.Tree,set_id:u64,
+                   parameter:ntasm_ast.Node)->bool {
+    if set_id==0 || set_id>tree.node_count { return false; }
+    let set:ntasm_ast.Node=ntasm_ast.node_at(tree,set_id);
+    let mut predicate:u64=set.first_child;
+    while predicate!=0 {
+        if predicate>tree.node_count { return false; }
+        let p:ntasm_ast.Node=ntasm_ast.node_at(tree,predicate);
+        if p.kind==33 {
+            // Arguments are the predicate's children AFTER the qualified
+            // predicate name, so the walk starts at the second child.
+            let mut argument:u64=p.first_child;
+            if argument!=0 && argument<=tree.node_count {
+                argument=ntasm_ast.node_next_sibling(tree,argument);
+            }
+            while argument!=0 {
+                if argument>tree.node_count { return false; }
+                let subject_id:u64=simple_name_id(tree,argument);
+                if subject_id!=0
+                   && same_span(source,ntasm_ast.node_at(tree,subject_id),
+                                parameter) { return true; }
+                argument=ntasm_ast.node_next_sibling(tree,argument);
+            }
+        }
+        predicate=p.next_sibling;
+    }
+    return false;
+}
+
+// LIAISON: is `parameter` the subject of a predicate in this declaration's
+// requires or ensures set? 1 when some predicate argument is a bare NAME whose
+// span is this parameter's name span, 0 otherwise.
+//
+// This is the obligation that says a formal parameter has BECOME the subject
+// of a direction, and it is deliberately not the same question as "does this
+// declaration spell a direction word". A predicate subject that is a literal,
+// or a name belonging to no parameter of this declaration, binds no direction
+// at all, and that is what refusal 366 reason 1 reports: the subject exists,
+// the parameter it names does not, and the two failures are different ones.
+//
+// Only the two set wrappers are read, found by their kind (22 requires, 23
+// ensures), and only a predicate's ARGUMENTS are compared, found by their
+// shape. A `mov rax, p` in the body is an instruction statement (kind 32) and
+// can never be mistaken for a contract subject, which is the whole reason the
+// walk is scoped to the sets instead of the declaration.
+fn liaison(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+           parameter:ntasm_ast.Node)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let mut set_id:u64=declaration.first_child;
+    while set_id!=0 {
+        if set_id>tree.node_count { return 0; }
+        let set:ntasm_ast.Node=ntasm_ast.node_at(tree,set_id);
+        if set.kind==22 || set.kind==23 {
+            // The parser keeps a keyword wrapper whose single child is the
+            // predicate-set node of the SAME kind, and the arguments hang off
+            // the inner one. Scanning both is harmless -- the outer wrapper has
+            // no predicate children of its own -- and scanning neither would
+            // miss every contract in the language.
+            let mut body_id:u64=set_id;
+            if set.first_child!=0 && set.first_child<=tree.node_count {
+                let inner:ntasm_ast.Node=ntasm_ast.node_at(tree,set.first_child);
+                if inner.kind==set.kind { body_id=set.first_child; }
+            }
+            if names_a_subject(source,tree,body_id,parameter) { return 1; }
+        }
+        set_id=set.next_sibling;
+    }
+    return 0;
+}
+
+// A predicate subject that names no parameter of `id`. 1 when some predicate
+// argument under the declaration's requires or ensures is a BARE NAME whose
+// span matches no parameter name span, 0 when every bare-name subject resolves
+// or the declaration has no bare-name subject at all.
+//
+// This is the third refusal and it is the one a direction-only reading cannot
+// see: the subject is there, it is spelled like every other subject, and the
+// only thing wrong with it is that the parameter it names is not in this
+// signature. A subject that is a LITERAL is not counted here and not counted
+// as a liaison either: `stack_aligned(16)` is a fact about a number, not a
+// direction, and calling it an unbound direction would be a false positive on
+// a program the reference compiles.
+fn unbound_subject(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let mut set_id:u64=declaration.first_child;
+    while set_id!=0 {
+        if set_id>tree.node_count { return 0; }
+        let set:u64=set_id;
+        if ntasm_ast.node_kind(tree,set)==22 || ntasm_ast.node_kind(tree,set)==23 {
+            let mut body_id:u64=set_id;
+            if ntasm_ast.node_first_child(tree,set)!=0 && ntasm_ast.node_first_child(tree,set)<=tree.node_count {
+                let inner:u64=ntasm_ast.node_first_child(tree,set);
+                if ntasm_ast.node_kind(tree,inner)==ntasm_ast.node_kind(tree,set) { body_id=ntasm_ast.node_first_child(tree,set); }
+            }
+            let inner_set:u64=body_id;
+            let mut predicate:u64=ntasm_ast.node_first_child(tree,inner_set);
+            while predicate!=0 {
+                if predicate>tree.node_count { return 0; }
+                let p:u64=predicate;
+                if ntasm_ast.node_kind(tree,p)==33 {
+                    let mut argument:u64=ntasm_ast.node_first_child(tree,p);
+                    if argument!=0 && argument<=tree.node_count {
+                        argument=ntasm_ast.node_next_sibling(tree,argument);
+                    }
+                    while argument!=0 {
+                        if argument>tree.node_count { return 0; }
+                        let subject_id:u64=simple_name_id(tree,argument);
+                        if subject_id!=0 {
+                            if !names_a_parameter(source,tree,id,
+                                ntasm_ast.node_at(tree,subject_id)) { return 1; }
+                        }
+                        argument=ntasm_ast.node_next_sibling(tree,argument);
+                    }
+                }
+                predicate=ntasm_ast.node_next_sibling(tree,p);
+            }
+        }
+        set_id=ntasm_ast.node_next_sibling(tree,set);
+    }
+    return 0;
+}
+
+// Does any parameter of the declaration at `id` carry the name `subject`?
+fn names_a_parameter(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                     subject:ntasm_ast.Node)->bool {
+    if id==0 || id>tree.node_count { return false; }
+    let declaration:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    let mut c:u64=declaration.first_child;
+    while c!=0 {
+        if c>tree.node_count { return false; }
+        let item:u64=c;
+        if ntasm_ast.node_kind(tree,item)==19 {
+            let name_id:u64=parameter_name_id(tree,c);
+            if name_id!=0
+               && same_span(source,ntasm_ast.node_at(tree,name_id),subject) {
+                return true;
+            }
+        }
+        c=ntasm_ast.node_next_sibling(tree,item);
+    }
+    return false;
+}
+
+// ALIAS: two parameters of one declaration that name the SAME LOCATION.
+//
+// Two names for one location must be caught; two locations that happen to hold
+// equal values must NOT be. The test is same_span over the two REGISTER names,
+// and that is the whole discrimination: `@rcx` and `@rcx` are one location
+// spelled twice, `@rcx` and `@rdx` are two locations whatever they happen to
+// contain, and no comparison of VALUES appears anywhere in this function
+// because there are no values here to compare -- a parameter's value lives in
+// a register at run time and this tree has never run.
+//
+// Writes out[0]=the number of alias PAIRS found, out[1]=the zero-based
+// ordinal of the first offending pair, out[2]=its line, out[3]=its column.
+// Returns 0 on success and 317 on a pair, which is register_bindings' own
+// code for two parameters of one declaration bound to the same register:
+// this is the same fact seen from the direction side, and reusing the code
+// keeps one fact on one code. 800 on a malformed tree, with no write to out.
+export fn alias_parameters(source:buf<u8>,tree:ntasm_ast.Tree,
+                           out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut pairs:u64=0;
+    let mut code:u64=0;
+    let mut id:u64=1;
+    while id<=tree.node_count && code==0 {
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==18 || ntasm_ast.node_kind(tree,n)==9 {
+            let mut count:u64=0;
+            let mut c:u64=ntasm_ast.node_first_child(tree,n);
+            while c!=0 {
+                if c>tree.node_count { code=800; }
+                else {
+                    let item:u64=c;
+                    if ntasm_ast.node_kind(tree,item)==19 { count=count+1; }
+                    c=ntasm_ast.node_next_sibling(tree,item);
+                }
+            }
+            if code==0 {
+                let mut i:u64=0;
+                while i<count && code==0 {
+                    let a:u64=parameter_at(tree,id,i);
+                    let reg_a:u64=child(tree,a,2);
+                    if reg_a!=0 && reg_a<=tree.node_count {
+                        let ra:ntasm_ast.Node=ntasm_ast.node_at(tree,reg_a);
+                        if ra.start<ra.end && ra.end<=len(source) {
+                            let mut j:u64=i+1;
+                            while j<count && code==0 {
+                                let b:u64=parameter_at(tree,id,j);
+                                let reg_b:u64=child(tree,b,2);
+                                if reg_b!=0 && reg_b<=tree.node_count {
+                                    let rb:ntasm_ast.Node=ntasm_ast.node_at(tree,reg_b);
+                                    if same_span(source,ra,rb) {
+                                        pairs=pairs+1;
+                                        if code==0 {
+                                            out[0]=pairs;
+                                            out[1]=j;
+                                            out[2]=rb.line;
+                                            out[3]=rb.column;
+                                            code=317;
+                                        }
+                                    }
+                                }
+                                j=j+1;
+                            }
+                        }
+                    }
+                    i=i+1;
+                }
+            }
+        }
+        id=id+1;
+    }
+    if code==0 { out[0]=pairs;out[1]=0;out[2]=0;out[3]=0; }
+    rt_free(runtime(),scratch);
+    return code;
+}
+
+// THE THREE OBLIGATIONS, reported per declaration. One call, one row per
+// parameter, so a caller can see the direction AND what it owes in one place.
+//
+// out is a caller-sized array. out[0] is the ROW COUNT and row i begins at
+// out[7*(i+1)], so the count is never a row and a row is never the count.
+// That word is reserved rather than reused because the two are written at
+// different times -- rows while walking, the count at the end -- so a reader
+// that found the count clobbered by row 0 would read every direction as a
+// count. MEASURED, not guessed: with the count at out[0] and row 0 also at
+// out[0], every single-parameter case reported dir=1 whatever its direction,
+// because out[0] held the row count and `in` happened to be the count of a
+// one-row answer. Seven words of headroom for the count, seven per row.
+//
+// Each row is seven words, in signature order:
+//   [0] the direction: 1 in, 2 out, 3 inout
+//   [1] LIAISON: 1 when the parameter is a subject this declaration can bind
+//   [2] CONSOMMATION: 1 when an `in`/`inout` is read somewhere in the body
+//   [3] RESTITUTION:  1 when an `out`/`inout` is written back before return
+//   [4] the zero-based parameter ordinal, so a row can be located
+//   [5] the bound register family, 0 when the parameter names none
+//   [6] the node id of the parameter, so a caller can re-query the tree
+//
+// An `in` owes CONSOMMATION and never RESTITUTION. An `out` owes
+// RESTITUTION and never CONSOMMATION. An `inout` owes BOTH, and a gate that
+// read only one of the two words would pass an `inout` that does neither.
+// That is why the two are separate columns and not one "used" flag.
+//
+// Returns 0 on success, having written `count` rows and left the rest of out
+// untouched. Returns 366 with out[0..3] = line, column, REASON when a
+// parameter's direction cannot be bound, the three reasons of the section
+// header. Returns 314 when a declaration spells a parameter this function
+// cannot resolve to a name, and 800 on a malformed tree or a short buffer,
+// both with no write to out. The scratch is always freed; neither source nor
+// tree is released.
+export fn obligations(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<7 { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut written:u64=0;
+    let mut code:u64=0;
+    let mut bad_line:u64=0;
+    let mut bad_column:u64=0;
+    let mut bad_reason:u64=0;
+    let mut id:u64=1;
+    while id<=tree.node_count && code==0 {
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==18 || ntasm_ast.node_kind(tree,n)==9 {
+            let body:u64=body_block(tree,id);
+            // REFUSAL 366 reason 1, and it is checked FIRST because it is the
+            // only one of the three that is about the CONTRACT rather than
+            // about a parameter: a predicate subject that names no parameter
+            // of this declaration binds no direction, and no per-parameter
+            // rule below can see that, because there is no parameter to run it
+            // on. Checking it here keeps it from being reported as a
+            // successful liaison on some other parameter, which is what a
+            // per-parameter-only reading would do.
+            if unbound_subject(source,tree,id)==1 {
+                code=366;bad_reason=1;
+                bad_line=ntasm_ast.node_line(tree,n);bad_column=ntasm_ast.node_column(tree,n);
+            }
+            let mut index:u64=0;
+            let mut c:u64=ntasm_ast.node_first_child(tree,n);
+            while c!=0 && code==0 {
+                if c>tree.node_count { code=800; }
+                else {
+                    let item:ntasm_ast.Node=ntasm_ast.node_at(tree,c);
+                    if item.kind==19 {
+                        let name_id:u64=parameter_name_id(tree,c);
+                        if name_id==0 {
+                            code=314;bad_line=item.line;bad_column=item.column;
+                        }
+                        else {
+                        let name:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                        if name.start>=name.end || name.end>len(source) {
+                            code=314;bad_line=item.line;bad_column=item.column;
+                        }
+                        else {
+                            let dir:u64=direction(source,item);
+                            let reg_id:u64=child(tree,c,2);
+                            if dir==0 {
+                                code=366;bad_reason=2;
+                                bad_line=item.line;bad_column=item.column;
+                            }
+                            else if (dir==2 || dir==3) && reg_id==0 {
+                                code=366;bad_reason=3;
+                                bad_line=item.line;bad_column=item.column;
+                            }
+                            else if parameter_families(source,tree,id,index,scratch)!=0 {
+                                code=800;
+                            }
+                            else {
+                                // The row base is SEVEN words past the count,
+                                // not at it. Writing row 0 at out[0] would put a
+                                // direction where the count lives, and the count
+                                // is written last, so the direction would be the
+                                // thing that survived -- measured, not guessed:
+                                // every single-parameter case read dir=1 because
+                                // out[0] was the count, not `in`.
+                                let row:u64=written*7+7;
+                                if row+7>len(out) { code=800; }
+                                else {
+                                    let mut consumed:u64=0;
+                                    let mut restored:u64=0;
+                                    // The location a parameter occupies is its
+                                    // REGISTER. An `out`/`inout` with no
+                                    // explicit @GPR was already refused by
+                                    // reason 3, so on this path an unbound
+                                    // register can only be an `in`, which owes
+                                    // no restitution: the node below is then
+                                    // reached only by the VARIABLE name and
+                                    // matches no register operand, which is
+                                    // the right answer rather than a stand-in
+                                    // that would match everything.
+                                    let reg:ntasm_ast.Node=ntasm_ast.node_at(
+                                        tree,reg_id);
+                                    if body!=0 {
+                                        if dir==1 || dir==3 {
+                                            let hit:u64=reads_parameter(
+                                                source,tree,body,reg,name);
+                                            if hit!=0 { consumed=1; }
+                                        }
+                                        if dir==2 || dir==3 {
+                                            let hit:u64=writes_parameter(
+                                                source,tree,body,reg,name);
+                                            if hit!=0 { restored=1; }
+                                        }
+                                    }
+                                    out[row]=dir;
+                                    // LIAISON is not a constant 1. It is 1
+                                    // only when this declaration's requires or
+                                    // ensures set NAMES this parameter as a
+                                    // predicate subject, which is what makes it
+                                    // the subject of a direction at all. A
+                                    // parameter no contract mentions is bound
+                                    // to nothing and answers 0, and that 0 is
+                                    // what a caller refusing an unbound
+                                    // direction reads.
+                                    out[row+1]=liaison(source,tree,id,name);
+                                    out[row+2]=consumed;
+                                    out[row+3]=restored;
+                                    out[row+4]=index;
+                                    out[row+5]=scratch[0];
+                                    out[row+6]=c;
+                                    written=written+1;
+                                }
+                            }
+                            if code==0 { index=index+1; }
+                        }
+                        }
+                    }
+                    if code==0 { c=item.next_sibling; }
+                }
+            }
+        }
+        if code==0 { id=id+1; }
+    }
+    if code==0 { out[0]=written; }
+    else if code==366 {
+        out[0]=bad_line;out[1]=bad_column;out[2]=bad_reason;out[3]=0;
+    }
+    else if code==314 { out[0]=bad_line;out[1]=bad_column; }
+    rt_free(runtime(),scratch);
+    return code;
+}
+
+// ===========================================================================
+// INVALIDATION -- a fact that has become false is not carried forward.
+// Work-plan lot 24. Appended AFTER the DIRECTION BINDING block above, which
+// it does not modify: `direction`, `parameter_families`, `parameter_name_id`,
+// `simple_name_id`, `operand_token`, `same_span` and `child` are the helpers it
+// reuses, all read-only here, so a change to any of them moves this block and
+// the block above together rather than letting them drift.
+//
+// ---------------------------------------------------------------------------
+// THE CENSUS, AND THE GAP BETWEEN EACH NAME AND WHAT IT COVERS. Four
+// mechanisms in this tree touch the validity of a fact. Two of them are the
+// read/write analysis and are THIS block's subject; two are in
+// call_contracts.nova and one of those is what this block is wired into.
+//
+// 1. abi.reads_parameter / abi.writes_parameter, above.
+//    NAME SUGGESTS: "does this body read / write this parameter".
+//    COVERS: an EXISTENTIAL over the whole body subtree. `writes_parameter`
+//    returns the FIRST instruction at or below the body whose destination is
+//    the parameter's register span or its name span, for `mov` and `store`
+//    only. It has no position, no order and no point of observation: it
+//    answers for the body as a whole and cannot say "true until here".
+//    THE GAP: existence is not liveness. Both are correct for the question
+//    `obligations` asks -- "does this body ever mention the parameter" -- and
+//    neither can answer "does the mention happen before or after this call".
+//
+// 2. abi.obligations, above, at the two `reads_parameter` / `writes_parameter`
+//    call sites that fill CONSOMMATION and RESTITUTION.
+//    NAME SUGGESTS: nothing about time; the columns are named after the
+//    obligation, which is what they are.
+//    COVERS: the two words, from the two existentials, per parameter.
+//    THE GAP: same one. There is no point in a body at which the answer could
+//    have gone stale, so nothing downstream can be stale either.
+//
+// 3. call_contracts.caller_caps.
+//    NAME SUGGESTS: four capabilities the caller has.
+//    COVERS: bit 1 the stack cannot move, bit 2 the interrupt state cannot
+//    change, bit 4 no MSR access, bit 8 no memory write -- each ANDed from a
+//    declaration half and a body half. Bit 8 is computed by
+//    `body_writes_memory_depth`, which charges an instruction on its IMPLICIT
+//    STACK WRITE and on its MEMORY OPERANDS (node kind 34) and nothing else.
+//    THE GAP, and it is the whole of this lot: **bit 8 is about the machine's
+//    MEMORY, not about a parameter's LOCATION.** A `mov rcx, 7` in the caller
+//    body writes no memory operand and no stack, so bit 8 STAYS SET, while
+//    rcx is the very register a `@rcx` parameter arrives in. A sound-sounding
+//    bit is not a write set, and a write set over memory is not a write set
+//    over a callee's parameter slot. `body_writes_memory_depth` is also
+//    WHOLE-BODY and EXISTENTIAL, exactly like (1): it says "this body writes
+//    memory somewhere", never "it wrote memory before this call".
+//
+// 4. call_contracts.fact_matches.
+//    NAME SUGGESTS: does the caller carry a matching fact.
+//    COVERS: a byte match of a predicate in the caller's `requires` (or
+//    `ensures`, on the coverage side) against the callee's predicate, subject
+//    by subject.
+//    THE GAP: **the caller's `requires` is a statement about the state on
+//    ENTRY, and `fact_matches` reads it at a CALL SITE in the middle of the
+//    body.** Nothing between the entry and that call is consulted. A caller
+//    that overwrites the register its own `@rcx` parameter arrived in, and
+//    then calls a callee that requires `non_null` of the same parameter, is
+//    credited with a fact that was false when the credit was taken. That is
+//    the stale credit, and it is what the block below refuses.
+//
+// AND THE RECURSION HALF, which (3) has and (4) does not. `body_writes_
+// memory_depth` descends into a callee body with the depth bound set to the
+// number of declarations, and "at depth 0 the walk charges without
+// descending, which is the direction that refuses" -- its own words. That is
+// a CONSERVATIVE ASSUMPTION wearing a refusal's clothes: the walk pretends a
+// write it never looked for, and the reader cannot tell a real write from a
+// cut cycle. The block below separates the two: a write found is a DROP, and
+// a walk that could not finish is a REFUSAL with its own code, which is the
+// difference the lot asks for.
+// ---------------------------------------------------------------------------
+
+// THE DEPTH BOUND, and why it is the declaration count. A call chain of
+// distinct declarations cannot be longer than the tree holds declarations, so
+// at that depth the only chains still running are cycles. Same bound and the
+// same reason as `body_writes_memory` in call_contracts.nova, restated here
+// because the two are separate walks and a bound quoted by reference is a
+// bound nobody re-measured.
+fn declaration_count(tree:ntasm_ast.Tree)->u64 {
+    let mut seen:u64=0;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==18 || ntasm_ast.node_kind(tree,n)==9 { seen=seen+1; }
+        id=id+1;
+    }
+    return seen;
+}
+
+// Does instruction `id` WRITE the location named by the register `family` or
+// by the name span `name`? 0 for an instruction that is not a write of that
+// location.
+//
+// THE CLASSIFICATION IS THE ONE `writes_parameter` USES, ON PURPOSE, and the
+// two must agree: `mov` and `store` write their first operand and every other
+// mnemonic reads it. A walk that classified differently from the existence
+// rule would invalidate on a form the existence rule calls a read, and the
+// two halves of this file would answer different questions about one
+// instruction. See the KNOWN LIMIT paragraph above `fact_live_at`: a form that
+// writes its first operand without being `mov` or `store` is missed by BOTH,
+// and neither can see it because neither reads the encoder.
+fn instruction_writes_family(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                             family:u64,name:ntasm_ast.Node)->bool {
+    if id==0 || id>tree.node_count { return false; }
+    if name.start>=name.end { return false; }
+    let name_id:u64=child(tree,id,0);
+    if name_id==0 || name_id>tree.node_count { return false; }
+    let mnemonic:u64=name_id;
+    let dest_id:u64=child(tree,id,1);
+    if dest_id==0 || dest_id>tree.node_count { return false; }
+    let mov:buf<u8>="mov";let store:buf<u8>="store";
+    let is_mov:bool=same_bytes(source,ntasm_ast.node_start(tree,mnemonic),ntasm_ast.node_end(tree,mnemonic),mov);
+    let is_store:bool=same_bytes(source,ntasm_ast.node_start(tree,mnemonic),ntasm_ast.node_end(tree,mnemonic),store);
+    if is_mov==false && is_store==false { return false; }
+    let dest:ntasm_ast.Node=operand_token(tree,dest_id);
+    if dest.start>=dest.end { return false; }
+    if same_span(source,dest,name) { return true; }
+    if family!=0 {
+        if register_widths.family(source,dest.start,dest.end)==family {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The NAME node of the declaration at `id`, 0 when it is neither a function
+// nor an import or spells no name. Mirrors call_contracts.decl_name_id, which
+// is private to that file: an import's name is its SECOND child and a
+// function's is its first, and getting that backwards would resolve a call to
+// the wrong declaration -- a wrong callee here means a body that was not read.
+fn declaration_name_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let n:u64=id;
+    if ntasm_ast.node_kind(tree,n)==18 { return child(tree,id,0); }
+    if ntasm_ast.node_kind(tree,n)==9 { return child(tree,id,1); }
+    return 0;
+}
+
+// The NAME node of the call at `id`, 0 when the node spells no callable name.
+// Mirrors call_contracts.call_name_id: the first child is the qualified name
+// and its LAST child is the bare token.
+fn call_name_id(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let qid:u64=child(tree,id,0);
+    if qid==0 || qid>tree.node_count { return 0; }
+    let q:u64=qid;
+    if ntasm_ast.node_kind(tree,q)!=91 || ntasm_ast.node_last_child(tree,q)==0 || ntasm_ast.node_last_child(tree,q)>tree.node_count { return 0; }
+    return ntasm_ast.node_last_child(tree,q);
+}
+
+// The declaration the call at `id` names, 0 when it names none this tree can
+// resolve. **UNRESOLVABLE IS NOT EMPTY**, and the difference is the whole of
+// the refusal direction: a callee this file cannot find is a callee whose
+// body nobody has read, and a body nobody has read cannot be shown not to
+// write the location under test.
+fn callee_of(source:buf<u8>,tree:ntasm_ast.Tree,call_id:u64)->u64 {
+    let name_id:u64=call_name_id(tree,call_id);
+    if name_id==0 { return 0; }
+    let called:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+    let mut d:u64=1;
+    while d<=tree.node_count {
+        let decl:u64=d;
+        if ntasm_ast.node_kind(tree,decl)==18 || ntasm_ast.node_kind(tree,decl)==9 {
+            let dn_id:u64=declaration_name_id(tree,d);
+            if dn_id!=0 && dn_id<=tree.node_count {
+                let dn:ntasm_ast.Node=ntasm_ast.node_at(tree,dn_id);
+                if same_span(source,dn,called) { return d; }
+            }
+        }
+        d=d+1;
+    }
+    return 0;
+}
+
+// THE WALK. 0 no write of the location was found, 1 a write WAS found, 2 the
+// walk could not decide and must not be read as a 0.
+//
+// `before` is the byte offset the observation point sits at, and a statement
+// counts only when it ENDS at or before it, so the call under proof is never
+// charged against itself -- the same exclusion `body_writes_memory_depth`
+// makes, and for the same reason. `before` of 0 means "the whole body", which
+// is what the recursive step passes when it enters a callee: inside the
+// callee there is no observation point, only the whole of what it runs.
+//
+// THE ORDERING IS THE POINT and it is why this is a walk and not the
+// existential `writes_parameter` is. `writes_parameter` answers "somewhere in
+// this body"; this answers "before this call", and a fact that a write
+// AFTER the call destroyed is still live AT the call and must stay credited.
+// The parser emits nodes in source order (measured, and stated at
+// `directions-entry.nova`'s `first_parameter`), so a flat scan in node order
+// is a scan in source order and no sort is needed.
+//
+// WHY A CYCLE IS A REFUSAL AND NOT A CHARGE. `body_writes_memory_depth` at
+// depth 0 answers "a write happened" for a chain it simply stopped walking,
+// which is a lie with a conservative shape: the caller is right to refuse and
+// wrong to call it a write, and nothing in the output can tell the two apart.
+// Here the cycle answers 2, which the callers above turn into a refusal with
+// its own code, and the fact it refused to decide is counted and published so
+// the reader sees a DROP rather than a silent absence.
+fn write_verdict(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,family:u64,
+                 name:ntasm_ast.Node,before:u64,depth:u64)->u64 {
+    if tree.ok==false { return 2; }
+    if decl_id==0 || decl_id>tree.node_count { return 2; }
+    let owner:u64=decl_id;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:u64=id;
+        if ntasm_ast.node_start(tree,owner)<=ntasm_ast.node_start(tree,n) && ntasm_ast.node_end(tree,n)<=ntasm_ast.node_end(tree,owner) {
+            let past:bool=before==0 || ntasm_ast.node_end(tree,n)<=before;
+            if past {
+                if ntasm_ast.node_kind(tree,n)==32 && ntasm_ast.node_aux(tree,n)==0 {
+                    if instruction_writes_family(source,tree,id,family,name) {
+                        return 1;
+                    }
+                }
+                if ntasm_ast.node_kind(tree,n)==28 || (ntasm_ast.node_kind(tree,n)==35 && ntasm_ast.node_aux(tree,n)==1) {
+                    // Three refusals, not one. No depth left to follow a
+                    // callee with, a call naming a callee this tree cannot
+                    // resolve, and a callee that is an IMPORT -- which carries
+                    // no body here, so its body is not an empty one. All three
+                    // answer 2 and none of them answers 0.
+                    if depth==0 { return 2; }
+                    let callee:u64=callee_of(source,tree,id);
+                    if callee==0 { return 2; }
+                    if ntasm_ast.node_kind(tree,callee)!=18 { return 2; }
+                    let deeper:u64=write_verdict(source,tree,callee,family,
+                                                 name,0,depth-1);
+                    if deeper!=0 { return deeper; }
+                }
+            }
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// The raw ordinal of the parameter of `decl_id` whose NAME SPAN is `name`, or
+// 18446744073709551615 when the declaration has no such parameter. The
+// sentinel is the one `calls.nova`'s own parameter_index uses, for the same
+// reason: 0 is a legal ordinal and a function that answered 0 for "no such
+// parameter" would confuse "the first parameter" with "no parameter".
+fn parameter_ordinal_by_name(source:buf<u8>,tree:ntasm_ast.Tree,decl_id:u64,
+                             name:ntasm_ast.Node)->u64 {
+    if decl_id==0 || decl_id>tree.node_count { return 18446744073709551615; }
+    let decl:u64=decl_id;
+    let mut id:u64=ntasm_ast.node_first_child(tree,decl);
+    let mut seen:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 18446744073709551615; }
+        let p:u64=id;
+        if ntasm_ast.node_kind(tree,p)==19 {
+            let name_id:u64=parameter_name_id(tree,id);
+            if name_id!=0 && name_id<=tree.node_count {
+                let pn:ntasm_ast.Node=ntasm_ast.node_at(tree,name_id);
+                if same_span(source,pn,name) {
+                    return seen;
+                }
+            }
+            seen=seen+1;
+        }
+        id=ntasm_ast.node_next_sibling(tree,p);
+    }
+    return 18446744073709551615;
+}
+
+// The `requires` (kind 22) or `ensures` (kind 23) set of `decl_id`, 0 when it
+// spells none. The set is the kind-K node's only child, which carries kind K
+// again -- the shape `names_a_subject` and `liaison` above already read, and
+// the same shape call_contracts.contract_body_id reads from its side.
+fn fact_set_id(tree:ntasm_ast.Tree,decl_id:u64,kind:u64)->u64 {
+    if decl_id==0 || decl_id>tree.node_count { return 0; }
+    let decl:u64=decl_id;
+    let mut id:u64=ntasm_ast.node_first_child(tree,decl);
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        let n:u64=id;
+        if ntasm_ast.node_kind(tree,n)==kind {
+            if ntasm_ast.node_first_child(tree,n)==0 || ntasm_ast.node_first_child(tree,n)!=ntasm_ast.node_last_child(tree,n) { return 0; }
+            if ntasm_ast.node_first_child(tree,n)>tree.node_count { return 0; }
+            if ntasm_ast.node_at(tree,ntasm_ast.node_first_child(tree,n)).kind!=kind { return 0; }
+            return ntasm_ast.node_first_child(tree,n);
+        }
+        id=ntasm_ast.node_next_sibling(tree,n);
+    }
+    return 0;
+}
+
+// The ordinal-th ARGUMENT of the predicate at `pred_id`, 0 when it has none.
+// Arguments are the predicate's children AFTER the qualified predicate name,
+// so the walk starts at the second child -- the convention
+// `names_a_subject` states above and the one `fact_pred_arg_id` must share.
+fn fact_pred_arg_id(tree:ntasm_ast.Tree,pred_id:u64,ordinal:u64)->u64 {
+    if pred_id==0 || pred_id>tree.node_count { return 0; }
+    let p:ntasm_ast.Node=ntasm_ast.node_at(tree,pred_id);
+    if p.kind!=33 { return 0; }
+    let mut id:u64=p.first_child;
+    if id!=0 && id<=tree.node_count {
+        id=ntasm_ast.node_next_sibling(tree,id);
+    }
+    let mut seen:u64=0;
+    while id!=0 && seen<=ordinal {
+        if id>tree.node_count { return 0; }
+        if seen==ordinal { return id; }
+        id=ntasm_ast.node_next_sibling(tree,id);
+        seen=seen+1;
+    }
+    return 0;
+}
+
+// Is the fact `pred_id` still true at the call `call_id`, in the caller
+// `caller_id`? 1 yes, 0 NO -- and the 0 covers BOTH "a write destroyed it"
+// and "the walk could not decide", because a fact that cannot be shown to
+// hold is a fact this product must not credit. 800 is the domain error and is
+// a THIRD thing, deliberately not folded into the 0: 800 means the query was
+// malformed, 0 means the answer is no.
+//
+// ONE SUBJECT AT A TIME, and a predicate with no subject is live by
+// construction: `interrupts_enabled` carries no argument, so nothing the body
+// can do reaches it through this rule, and the guards that govern it are
+// caller_caps' business and not this one's. A subject that is a LITERAL names
+// no location and is skipped; a subject that is a bare name which is NOT a
+// parameter of the caller is a callee local or a constant and names no caller
+// location either.
+//
+// THE REGISTER IS THE EFFECTIVE ONE, resolved through `parameter_families`,
+// and that is not a detail. A signature that spells no `@GPR` -- `in p:u64`
+// -- still arrives in a register, the default family of its raw ordinal, and
+// that is the register a `mov` in the body would overwrite. A walk keyed on
+// the BOUND family would read 0 for the most common signature in the tree and
+// would therefore invalidate nothing at all, which is the failure mode that
+// looks most like a pass.
+//
+// KNOWN LIMIT, stated rather than assumed away: a form that writes its first
+// operand and is neither `mov` nor `store` is missed here and by
+// `writes_parameter` alike. Nothing in this tree can see it, because nothing
+// in this tree reads the encoder's per-mnemonic effect table. The direction
+// is therefore not "an unknown form invalidates", which would refuse every
+// `nop` and every `ret`, but "an unknown form invalidates nothing", which
+// agrees with the existence rule above and is wrong in the same place it is
+// wrong. Widening it needs the effect table this product does not project, and
+// that is a gap to close at its own cost, not one to paper over here.
+fn fact_live_at(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,call_id:u64,
+                pred_id:u64)->u64 {
+    if tree.ok==false || tree.node_count==0 { return 800; }
+    if caller_id==0 || caller_id>tree.node_count { return 800; }
+    if call_id==0 || call_id>tree.node_count { return 800; }
+    if pred_id==0 || pred_id>tree.node_count { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let depth:u64=declaration_count(tree);
+    let at:u64=ntasm_ast.node_start(tree,call_id);
+    let mut answer:u64=1;
+    let mut k:u64=0;
+    while k<2 && answer!=2 {
+        let arg:u64=fact_pred_arg_id(tree,pred_id,k);
+        if arg!=0 {
+            let nm:u64=simple_name_id(tree,arg);
+            if nm!=0 {
+                let arg_name:ntasm_ast.Node=ntasm_ast.node_at(tree,nm);
+                let ordinal:u64=parameter_ordinal_by_name(
+                    source,tree,caller_id,arg_name);
+                if ordinal!=18446744073709551615 {
+                    let code:u64=parameter_families(
+                        source,tree,caller_id,ordinal,scratch);
+                    if code!=0 { answer=2; }
+                    else {
+                        let verdict:u64=write_verdict(
+                            source,tree,caller_id,scratch[0],arg_name,at,depth);
+                        if verdict==1 { answer=0; }
+                        if verdict==2 { answer=2; }
+                    }
+                }
+            }
+        }
+        k=k+1;
+    }
+    rt_free(runtime(),scratch);
+    return answer;
+}
+
+// WHAT THE CALLER'S OWN REQUIRES STILL SAY AT ONE CALL. Work-plan lot 24.
+//
+// out[0] facts examined, out[1] facts DROPPED because a write destroyed them,
+// out[2] facts still live, out[3] 0 on a decided answer and 1 when the walk
+// could not finish and every fact was therefore dropped. out[3] IS THE VISIBLE
+// DROP and it exists because "a silent drop is as bad as a stale credit": a
+// reader who sees out[1]=0 and out[2]=0 must be able to tell "this caller
+// carried no fact" from "this caller carried facts and none of them could be
+// checked", and only out[3] separates those two.
+//
+// Returns 0 on a decided answer, having written the four words above and
+// touched nothing else. **Returns 367 and writes NOTHING when the walk could
+// not finish** -- not a count of the live facts it had reached, not a partial
+// answer, nothing: a walk that hit a cycle cannot say which facts it had
+// already cleared, and a reader given half of them would credit half of a
+// summary that is wrong for the recursive case and right for the acyclic one.
+// 367 is a code the specification registry lists as UNATTRIBUTED and forbids
+// from being emitted, and this row is that registry's outstanding debt, the
+// same shape as lot 27's 366 and for the same reason: both are QUERIES, not
+// pipeline stages, and neither has a caller from validate.nova today. It is
+// reported rather than smuggled.
+//
+// 800 on an invalid tree, a declaration or a call that is not one, or an out
+// buffer shorter than four words, with no write to out on any of them.
+export fn fact_validity(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,
+                        call_id:u64,out:buf<u64>)->u64 {
+    if tree.ok==false || tree.node_count==0 || len(out)<4 { return 800; }
+    if caller_id==0 || caller_id>tree.node_count { return 800; }
+    if call_id==0 || call_id>tree.node_count { return 800; }
+    let set:u64=fact_set_id(tree,caller_id,22);
+    if set==0 { out[0]=0;out[1]=0;out[2]=0;out[3]=0;return 0; }
+    let predicates:u64=set;
+    let mut examined:u64=0;
+    let mut stale:u64=0;
+    let mut live:u64=0;
+    let mut undecided:u64=0;
+    let mut id:u64=ntasm_ast.node_first_child(tree,predicates);
+    while id!=0 {
+        if id>tree.node_count { return 800; }
+        let p:u64=id;
+        if ntasm_ast.node_kind(tree,p)==33 {
+            let verdict:u64=fact_live_at(source,tree,caller_id,call_id,id);
+            if verdict==800 { return 800; }
+            if verdict==2 { undecided=undecided+1; }
+            else {
+                examined=examined+1;
+                if verdict==1 { live=live+1; }
+                else { stale=stale+1; }
+            }
+        }
+        id=ntasm_ast.node_next_sibling(tree,p);
+    }
+    if undecided!=0 {
+        // NOTHING IS CREDITED and the refusal is the whole answer.
+        return 367;
+    }
+    out[0]=examined;out[1]=stale;out[2]=live;out[3]=0;
+    return 0;
+}
+
+// The single-fact form of the question above, which is the one the call
+// proof asks: is THIS fact still true at THIS call. 1 live, 0 not creditable
+// (destroyed by a write, or the walk could not decide), 800 out of domain.
+//
+// THE 0 IS ONE MEANING AND NOT TWO. It means "this product will not credit
+// this fact here", and both reasons lead to the same decision, so there is no
+// ambiguity for a caller to resolve. A caller that needs to KNOW which of the
+// two happened asks `fact_validity` over the whole set, whose return code
+// separates them. Folding the limit into a 366 here would have put a
+// pipeline code on a query that never reaches the pipeline, and folding it
+// into an 800 would have made a malformed query indistinguishable from a
+// conservative refusal -- two meanings on one word, which is the defect this
+// project's own first harness died of.
+export fn fact_is_live(source:buf<u8>,tree:ntasm_ast.Tree,caller_id:u64,
+                       call_id:u64,pred_id:u64)->u64 {
+    let verdict:u64=fact_live_at(source,tree,caller_id,call_id,pred_id);
+    if verdict==800 { return 800; }
+    if verdict==1 { return 1; }
+    return 0;
+}
+
+// THE EFFECTIVE REGISTER FAMILY OF ONE PARAMETER, WHICH NOTHING PUBLISHED.
+//
+// The gap this closes is a name-versus-coverage gap of the kind this file
+// already carries one of. `argument` publishes the ARCHITECTURAL number of the
+// DEFAULT incoming register and zeroes it for a parameter that is explicitly
+// bound; `argument_family` publishes the DEFAULT family and zeroes it for the
+// same parameter; `bound_family` publishes the EXPLICIT one and zeroes it for a
+// parameter that is not explicitly bound. So every family this file publishes
+// is zero for one of the two cases, and the only function that ever held the
+// EFFECT — bound if there is one, otherwise the default of the raw ordinal —
+// was `parameter_families`, which is private.
+//
+// That is not a cosmetic gap. A fact about the CONTENT OF A REGISTER at a point
+// of a body is indexed by the effective family, and an export that answers 0
+// for an explicitly bound parameter is exactly the failure this file's own
+// comment above `fact_live_at` names: the most common signature in the tree
+// would get no slot and nothing would ever be invalidated, which is the shape a
+// pass most resembles when it is not one.
+//
+// Writes the family, 1..16, or 0 when the parameter has no register at all —
+// an `out` with no `@GPR`, or an ordinal past the fourth under nx64-abi-v0.
+// Returns 800 on an invalid tree, a declaration that is not one, a direction
+// word it cannot read, or an output buffer shorter than two words. Neither
+// source nor tree is released.
+export fn effective_family(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,
+                          param_index:u64)->u64 {
+  if len(source)==0 && tree.ok==true { return 800; }
+  let scratch:buf<u64>=alloc(runtime(),4);
+  let code:u64=parameter_families(source,tree,id,param_index,scratch);
+  if code!=0 { rt_free(runtime(),scratch); return code; }
+  let family:u64=scratch[0];
+  rt_free(runtime(),scratch);
+  return family;
+}

@@ -1,0 +1,250 @@
+module symbol_names;
+
+import ntasm_ast;
+
+// Node kinds: import 9, function declaration 18, data declaration 24.
+
+// Byte-wise name comparison over the real source text with bounds.
+fn same_name(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Direct child of parent at the given ordinal, or 0 when the chain is
+// invalid.
+//
+// THE "OR THE TREE IS INVALID" HALF WAS HERE AND WAS FALSE. MEASURED
+// 2026-10-02 on this exact body with parent=0 and with parent=node_count+1:
+// there was NO entry guard, so both reached ntasm_ast.node_at, which REFUSES
+// the run -- "ntasm_ast.node_at: id is not a node (id=0, node_count=27)" --
+// instead of answering 0. The comment is corrected BEFORE the guard is added,
+// because a comment promising a check that is not there is precisely what
+// makes the next reader believe this copy is already sound.
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);
+    let mut id:u64=p.first_child;
+    let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;
+        index=index+1;
+    }
+    if id>tree.node_count { return 0; }
+    return id;
+}
+
+// Name node id of a global symbol: first child for a function, data or
+// constant declaration, second child (the alias, after the qualified path)
+// for an import. Returns 0 when the tree does not carry a usable name.
+// The constant is named by its first child exactly like a data item, which
+// is what parser.nova:448-452 constant_decl attaches.
+fn name_id(tree:ntasm_ast.Tree,kind:u64,decl_id:u64)->u64 {
+    if kind==18 || kind==24 || kind==10 { return child(tree,decl_id,0); }
+    if kind==9 { return child(tree,decl_id,1); }
+    return 0;
+}
+
+// --------------------------------------------------- the two namespaces
+// The C oracle keeps TWO disjoint name tables. This pass kept one, and each
+// of the two halves of that was wrong in opposite directions: it REFUSED a
+// function and a data item that share a name, which the oracle compiles,
+// and it ACCEPTED a constant beside a data item of one name, which the
+// oracle refuses.
+//
+//   table 1, the callable names. duplicate_function (frontend.c:2950)
+//     walks p->functions and matches on module and name. parse_function
+//     (frontend.c:3043) calls it for a function name and parse_import
+//     (frontend.c:2968) calls it for an alias, so a function and an import
+//     alias of one name are the SAME name. fn->section is assigned at
+//     :3055 and :2981 and never read again, so the table is MODULE wide.
+//   table 2, the link names. The loop in parse_data (frontend.c:3163) and
+//     the one in parse_constant (frontend.c:3240) walk p->variables for
+//     entries with v->function==0 in the same module, so a data item and a
+//     constant of one name collide, and a data item collides with a local
+//     only when that local is a module global. v->section is assigned at
+//     :3197 and never read, so this table is MODULE wide too.
+//
+// Neither loop ever looks at the other table. Measured with
+// nt_object_compile, on the sources the gate carries: fn/data, data/fn,
+// import/data, data/import, fn/const, const/fn, import/const and
+// const/import are all ACCEPTED with two symbols, in both declaration
+// orders and in every section pairing; while fn/fn, import/import,
+// fn/import are REFUSED duplicate function, and data/data, const/const,
+// data/const and const/data are REFUSED duplicate data or duplicate
+// constant.
+//
+// The kind term is therefore the namespace term. It is not a section term:
+// both tables ignore sections entirely, and giving the scan one would
+// refuse `data same` in .rdata against `data same` in .data, which the
+// oracle refuses too.
+//
+// kind 10 is a constant and belongs to table 2. spec/ntasm/ntasm.md:1617 says so
+// of this code, and the oracle agrees: `const same` twice is 300-series
+// "duplicate constant", `const same` beside `data same` in .rdata is
+// "duplicate data", in both declaration orders. Before this, all three were
+// ACCEPTED here, so the refusal set was a strict SUBSET of the oracle's and
+// two module globals shared a name in silence. Note the direction: closing
+// it only ADDS refusals, and every one it adds is a refusal the oracle also
+// raises, so the two sets are now equal. There is no pairing this pass
+// accepts that the oracle refuses, and none it newly refuses that the
+// oracle accepts.
+fn namespace_of(kind:u64)->u64 {
+    if kind==9 || kind==18 { return 1; }
+    if kind==24 || kind==10 { return 2; }
+    return 0;
+}
+
+// spec/ntasm/ntasm.md 13 develops a macro before the final verification of types
+// and contracts, so a comptime(11), a macro(13) and a quote(43) subtree is a
+// template and not code: what it spells is replaced by an expansion or refused
+// by the expander, and either way a declaration written there is not a
+// declaration of the module. Measured with nt_object_compile: a macro
+// declaring `fn same` and never invoked, beside a real `fn same` in .text, is
+// accepted with ONE symbol. A flat node id sweep would have seen both and
+// refused, which is the same false refusal the single table produced.
+//
+// The mask is a whole pass of its own, done before the sweep below, marking a
+// template root together with everything under it, so it assumes nothing about
+// where a subtree sits in the id order. Marking is idempotent, so a nested root
+// costs one compare and a cyclic child chain terminates. The recursion is
+// bounded by the depth of a template subtree, a handful of levels, the same
+// shape control_flow.nova already walks recursively. refs.nova:11-57 and
+// callable_names.nova:11-53 carry the same mask for the same reason; this is
+// the third copy, not a second rule.
+fn mask_below(tree:ntasm_ast.Tree,mask:buf<u64>,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 800; }
+    if mask[id]==1 { return 0; }
+    let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    mask[id]=1;
+    let mut at:u64=n.first_child;
+    while at!=0 {
+        if at>tree.node_count { return 800; }
+        mask_below(tree,mask,at);
+        at=ntasm_ast.node_at(tree,at).next_sibling;
+    }
+    return 0;
+}
+fn template_mask(tree:ntasm_ast.Tree,mask:buf<u64>)->u64 {
+    let k_comptime:u64=11;
+    let k_macro:u64=13;
+    let k_quote:u64=43;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==k_comptime || n.kind==k_macro || n.kind==k_quote {
+            let refused:u64=mask_below(tree,mask,id);
+            if refused!=0 { return refused; }
+        }
+        id=id+1;
+    }
+    return 0;
+}
+
+// Check the two global name tables of an NTASM tree, module wide and
+// independently: a function name (kind 18) or an import alias (kind 9,
+// second child) must differ from every other name in the callable table,
+// and a data name (kind 24) or a constant name (kind 10), both first child,
+// from every other name in the link table. A name may appear once in EACH
+// table without a collision. A declaration a comptime(11), a macro(13) or a
+// quote(43) subtree owns is not a declaration of the module and is in
+// neither table; the mask keys on the kind of the ROOT, so it does not
+// matter what kind of declaration sits underneath.
+// Returns 0 on success, writing out[0]=functions, out[1]=link names, that is
+// data plus constant, out[2]=imports, out[3]=declared names, which is
+// functions plus link names plus imports. out[1] counted data only until a
+// constant joined the link namespace, and naming that word after the category
+// it missed is how the const gap survived: the count has to move with the
+// table or the signature describes a namespace that is not the one checked.
+// Returns 319 on a second occurrence of the same name in the SAME table,
+// writing the line and column of the second name to out[0..1]. Returns 800
+// with no write to out on an invalid tree, an invalid span or child chain,
+// or an output buffer shorter than four words. The scratch and mask buffers
+// are always freed; neither source nor tree is released.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    let n_import:u64=9;
+    let n_function:u64=18;
+    let n_data:u64=24;
+    let n_constant:u64=10;
+    let entry_words:u64=3;
+    if tree.ok==false { return 800; }
+    if tree.node_count==0 { return 800; }
+    if len(out)<4 { return 800; }
+
+    let slots:u64=tree.node_count+1;
+    let scratch:buf<u64>=alloc(runtime(),tree.node_count*entry_words);
+    let mask:buf<u64>=alloc(runtime(),slots);
+    let mut i:u64=0;
+    while i<slots { mask[i]=0;i=i+1; }
+    let mut used:u64=0;
+    let mut imports:u64=0;
+    let mut functions:u64=0;
+    let mut link:u64=0;
+    let mut code:u64=template_mask(tree,mask);
+    let mut dup_line:u64=0;
+    let mut dup_column:u64=0;
+
+    let mut id:u64=1;
+    while id<=tree.node_count && code==0 {
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if (node.kind==n_import || node.kind==n_function ||
+            node.kind==n_data || node.kind==n_constant) && mask[id]!=1 {
+            let nid:u64=name_id(tree,node.kind,id);
+            if nid==0 { code=800; }
+            else {
+                let name:ntasm_ast.Node=ntasm_ast.node_at(tree,nid);
+                if name.start>name.end || name.end>len(source) { code=800; }
+                else {
+                    // Duplicate scan: same table, identical bytes, whole module.
+                    let table:u64=namespace_of(node.kind);
+                    let mut j:u64=0;
+                    while j<used {
+                        let at:u64=j*entry_words;
+                        if scratch[at]==table &&
+                           same_name(source,scratch[at+1],scratch[at+2],
+                                     name.start,name.end) {
+                            code=319;
+                            dup_line=name.line;
+                            dup_column=name.column;
+                        }
+                        j=j+1;
+                    }
+                    if code==0 {
+                        let at:u64=used*entry_words;
+                        scratch[at]=table;
+                        scratch[at+1]=name.start;
+                        scratch[at+2]=name.end;
+                        used=used+1;
+                        if node.kind==n_function { functions=functions+1; }
+                        else if node.kind==n_data { link=link+1; }
+                        else if node.kind==n_constant { link=link+1; }
+                        else { imports=imports+1; }
+                    }
+                }
+            }
+        }
+        id=id+1;
+    }
+
+    if code==0 {
+        out[0]=functions;
+        out[1]=link;
+        out[2]=imports;
+        out[3]=functions+link+imports;
+    } else if code==319 && len(out)>=2 {
+        out[0]=dup_line;
+        out[1]=dup_column;
+    }
+    rt_free(runtime(),scratch);
+    rt_free(runtime(),mask);
+    return code;
+}

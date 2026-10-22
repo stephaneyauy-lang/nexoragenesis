@@ -1,0 +1,5 @@
+# Keep checked-out source bytes stable; do not silently rewrite pinned inputs.
+* -text
+*.png binary
+*.jpg binary
+*.efi binary

@@ -1,0 +1,353 @@
+module ast_entry;
+import ntasm_ast;
+import ntasm_parser;
+
+// THE PROBE FOR ast.nova, and its job is to make every one of that module's
+// nine `export fn` reachable from a C caller.
+//
+// ast.nova publishes NINE `export fn`. Each one is called by some mode below,
+// and the mode is what says which export the mode exists for. There is no
+// other reason to split them: one mode calling all nine would answer "the
+// module loaded", and a module that loaded is not a module whose exports ran.
+//
+//   mode 0  THE KIND VOCABULARY. KIND_BASE, KIND_COUNT, NTIR_STATED_COUNT,
+//           kind_at over the whole table and at the two indices outside it,
+//           kind_present asked about the kinds the table names and about the
+//           ones it does not, kind_name_of over every kind, and kind_text
+//           compared against kind_name_of(kind_at(i)) row by row.
+//   mode 1  node_at over a REAL tree at an id inside the tree, publishing all
+//           twelve words.
+//   mode 2  node_at with id=0 -- the sentinel, which names no node.
+//   mode 3  node_at with id=node_count+1 -- one PAST the last node.
+//   mode 4  node_at with id=node_count+2 -- the id after that.
+//   mode 5  release ONCE, publishing what rt_free answered.
+//   mode 6  release TWICE, publishing the second answer, which is the
+//           lifetime refusal and not a second success.
+//
+// MODES 2, 3, 4 AND 6 ARE SEPARATE RUNS AND NOT ONE RUN EACH, because a
+// refusal sets the runtime's error word and the runtime's rule is
+// first-error-wins: once it is set, every later host call in that context
+// answers 0 without touching anything. One run asked for id 0 and then for
+// node_count+1 would MEASURE THE FIRST REFUSAL TWICE and never ask the second
+// question at all. Mode 6 is the same shape: the second release is only
+// reachable if the first left the context clean, which it does, and the
+// refusal it raises is then the only thing in the report.
+//   mode 2  node_at with id=0 -- the sentinel, which names no node. `past` is
+//           ZERO here and the id comes from `index`, which the gate sends as
+//           zero. That is the one mode where the id is NOT derived from
+//           node_count: 0 is the sentinel precisely because it is not a node,
+//           and it sits BELOW the tree's range rather than past its end.
+//
+// THE TWO OUT-OF-RANGE IDS ARE DERIVED FROM THE TREE, NEVER TYPED. Modes 3
+// and 4 ask for node_count+1 and node_count+2, and node_count is what
+// ntasm_parser.parse measured on the source this run was handed. A harness
+// that typed 28 would be pinning a node count of a fixture it had not
+// measured, and the id would stop being the id the tree makes it.
+export fn main(source:buf<u8>,mode:u64,index:u64,out:buf<u64>,
+        out_count:u64,report:buf<u64>)->u64 {
+    if len(report)<160 { return 800; }
+    if mode==0 { return vocabulary(out,out_count,report); }
+    if mode==1 { return node_mode(source,index,report,0); }
+    if mode==2 { return node_mode(source,0,report,0); }
+    if mode==3 { return node_mode(source,index,report,1); }
+    if mode==4 { return node_mode(source,index,report,2); }
+    if mode>=7 && mode<=9 { return scalar_mode(source,mode,index,report); }
+    if mode==5 { return release_mode(source,report,1); }
+    return release_mode(source,report,2);
+}
+
+// ONE MODE, THREE SHAPES, and the shape is an ARGUMENT rather than a copy of
+// the body. `past` is 0 for an id the caller chose, 1 for node_count+1 and 2
+// for node_count+2; the id is DERIVED HERE from the tree this run built.
+//
+// `wanted` false means the caller is asking for an id that is NOT a node, and
+// the run comes back with the runtime's error set. The twelve words are
+// published either way, because WHAT THE ACCESSOR LEFT BEHIND IS PART OF THE
+// ANSWER: a refusal that also wrote twelve plausible zeros would be the
+// words.py shape this accessor was written to refuse, and only a harness that
+// reads them can tell the two apart.
+fn node_mode(source:buf<u8>,index:u64,report:buf<u64>,past:u64)->u64 {
+    let mut tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { report[0]=0;report[1]=0;ntasm_ast.release(tree);return 800; }
+    let mut count:u64=tree.node_count;
+    let mut id:u64=index;
+    if past==1 { id=count+1; }
+    if past==2 { id=count+2; }
+    report[0]=id;
+    report[1]=count;
+    report[2]=count;
+    // node_at, the export itself. Everything below reads what it returned.
+    let mut n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+    report[3]=n.kind;report[4]=n.token_begin;report[5]=n.token_end;
+    report[6]=n.source;report[7]=n.line;report[8]=n.column;
+    report[9]=n.start;report[10]=n.end;report[11]=n.first_child;
+    report[12]=n.last_child;report[13]=n.next_sibling;report[14]=n.aux;
+    // The words the PARSER wrote, at the offset node_at says it reads. The
+    // gate confronts the two, and this is the only place in this file where
+    // the raw buffer is touched: a reader that compared node_at against
+    // itself would prove nothing.
+    if id>=1 && id<=count {
+        let mut raw:buf<u64>=tree.node_words;
+        let at:u64=(id-1)*12;
+        report[15]=raw[at];report[16]=raw[at+1];report[17]=raw[at+2];
+        report[18]=raw[at+3];report[19]=raw[at+4];report[20]=raw[at+5];
+        report[21]=raw[at+6];report[22]=raw[at+7];report[23]=raw[at+8];
+        report[24]=raw[at+9];report[25]=raw[at+10];report[26]=raw[at+11];
+    }
+    // node_at again, at the id that is certainly inside the tree, so the gate
+    // has one call that MUST answer and one that must refuse, from the same
+    // tree, in the same shape.
+    if count>=1 {
+        let mut again:ntasm_ast.Node=ntasm_ast.node_at(tree,1);
+        report[27]=again.kind;report[28]=again.line;report[29]=again.column;
+        report[30]=again.start;report[31]=again.end;
+    }
+    ntasm_ast.release(tree);
+    return 0;
+}
+
+// release, ONCE OR TWICE.
+//
+// `twice` is 1 or 2. The FIRST release frees token_words and then node_words,
+// and returns rt_free's answer on the second of them. The SECOND release asks
+// for two buffers that are no longer live, and the runtime's lifetime rule is
+// what answers -- that is the only negative arm this module has, and it is
+// asked in its own run because the error word is first-error-wins.
+//
+// report[0] is the return of ast.nova's release, report[1] is how many times
+// it was asked for. Nothing here is a constant typed in the gate: the gate
+// reads these words and decides.
+fn release_mode(source:buf<u8>,report:buf<u64>,twice:u64)->u64 {
+    let mut tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { report[0]=0;report[1]=0;ntasm_ast.release(tree);return 800; }
+    report[2]=tree.node_count;
+    report[3]=tree.token_count;
+    let mut words:buf<u64>=tree.node_words;
+    report[4]=len(words);
+    let mut tokens:buf<u64>=tree.token_words;
+    report[5]=len(tokens);
+    let mut first:u64=ntasm_ast.release(tree);
+    report[0]=first;
+    report[1]=twice;
+    if twice==2 {
+        // The second release names the same two buffers. ast.nova holds them
+        // in locals and hands them to rt_free again, and the runtime refuses
+        // a handle whose generation no longer matches.
+        let mut second:u64=ntasm_ast.release(tree);
+        report[6]=second;
+    }
+    return 0;
+}
+
+// The kind vocabulary, read back in full.
+//
+// THE NAMES ARRIVE IN A CALLER BUFFER. ast.nova's kind_name_of and kind_text
+// both return a buf<u8>, which does not survive this bootstrap compiler's
+// cross-module export boundary -- the same reason parser.nova's keyword_read_back
+// exists -- so the string is copied out one byte per word, NUL-terminated per
+// entry, and the return value is the byte length.
+fn vocabulary(out:buf<u64>,out_count:u64,report:buf<u64>)->u64 {
+    let mut count:u64=ntasm_ast.KIND_COUNT();
+    let mut base:u64=ntasm_ast.KIND_BASE();
+    let mut stated:u64=ntasm_ast.NTIR_STATED_COUNT();
+    // THE LAYOUT, WRITTEN DOWN BECAUSE IT WAS WRONG TWICE AND A READER WILL
+    // WANT TO KNOW WHICH SLOT IS WHICH.
+    //
+    //   report[0..2]   count, base, ntir_stated
+    //   report[3]      kind_at(0)            -- the one-based probe
+    //   report[4]      kind_at(count+1)      -- the out-of-range probe
+    //   report[5]      kind_present: how many trues
+    //   report[6]      kind_present: how many falses
+    //   report[7]      how many kinds carry a name
+    //   report[8]      the first named kind
+    //   report[9]      the second named kind
+    //   report[10]     kind_text agrees with kind_name_of(kind_at(i))
+    //   report[16+i]   kind_at(i), for i = 1..count
+    //
+    // THE TABLE IS AT 16 AND NOT AT 3, 4 OR 8, AND EACH OF THOSE WAS TRIED.
+    // At 3+i the table collided with the kind_at(0) probe written at 3+count
+    // -- which IS 3+i when i=count -- so the probe overwrote the LAST ROW:
+    // index 51 read 0 instead of 96 and the monotonic check went red at the
+    // END of the table. At 8+i the table collided with report[9], the second
+    // named kind, so index 1 read 18 instead of 1 and the same check went red
+    // at the START. Two reds that look identical and are not: one was a gap
+    // in the middle of the run, the other a value out of order, and only the
+    // row that moved says which.
+    //
+    // THE RULE THAT SETTLES IT IS NOT A BIGGER CONSTANT. Every scalar sits at
+    // a FIXED index and the table starts ABOVE all of them, so no scalar can
+    // land inside the table for ANY count. An index of the form k+count has no
+    // such property -- it is inside the table for one count and outside it for
+    // another -- and that is why two of these slots were wrong before the
+    // third was right. ast.nova was correct throughout: it answers 96 at index
+    // 51 and it has always answered 96 at index 51.
+    if len(report)<count+32 { return 800; }
+    report[0]=count;report[1]=base;report[2]=stated;
+    // kind_at over the WHOLE table, one-based. The table has a hole at 26 and
+    // a gap from 46 to 90, so the two out-of-range probes are what tell a
+    // table LOOKUP from a range TEST: a range test over [1,51] would answer
+    // something for both of them.
+    let mut i:u64=1;
+    while i<=count { report[16+i]=ntasm_ast.kind_at(i);i=i+1; }
+    report[3]=ntasm_ast.kind_at(0);
+    report[4]=ntasm_ast.kind_at(count+1);
+    // kind_present, asked about every kind the table names, which must all be
+    // present, and about four that it does not: 0 (the sentinel), the hole at
+    // 26, 96 (which IS in the table, at index 45) and 97 (which is above it).
+    let mut yes:u64=0;
+    let mut i2:u64=1;
+    while i2<=count {
+        let kind:u64=ntasm_ast.kind_at(i2);
+        if ntasm_ast.kind_present(kind)==true { yes=yes+1; }
+        i2=i2+1;
+    }
+    // Only 96 is in the table, at index 45, so exactly ONE of these four is
+    // true.  The first version counted 96 here AND counted it again in the
+    // loop above, so the total came to 52 against a table of 51 and the gate
+    // read a red that named nothing.  A count that double-counts one element
+    // is a count of something other than the thing being counted, and the
+    // gate cannot tell which element without re-deriving the loop.
+    if ntasm_ast.kind_present(96)==true { yes=yes+1; }
+    let mut no:u64=0;
+    if ntasm_ast.kind_present(0)==false { no=no+1; }
+    if ntasm_ast.kind_present(26)==false { no=no+1; }
+    if ntasm_ast.kind_present(97)==false { no=no+1; }
+    if ntasm_ast.kind_present(1)==false { no=no+1; }
+    // report[5] and report[6] are FIXED SLOTS, not 5+count and 6+count.  The
+    // table occupies report[8..8+count), so an index of the form k+count can
+    // land inside it for one value of k and outside it for another -- which is
+    // the same collision the table move above fixed, and it would have come
+    // back one line later.  A slot chosen as an offset from a length is a slot
+    // whose meaning depends on that length.
+    report[5]=yes;
+    report[6]=no;
+    // kind_name_of over every kind in the table, counted by NAME and not by
+    // length: ast.nova publishes exactly two names and the other 49 answer
+    // "UNNAMED". A gate that counted non-empty answers would report 51 names
+    // and be wrong 49 times, so what is counted here is how many answers are
+    // NOT the string UNNAMED.
+    let mut unnamed:buf<u8>="UNNAMED";
+    // BOTH named kinds are recorded, not the first.  The first version kept
+    // only `which`, set on the first non-UNNAMED answer, and the gate asserted
+    // it was 18 -- the function declaration.  It answered 9, because the loop
+    // walks the table in index order and kind 9 ("import") comes first.  Both
+    // kinds are named by the module and the assertion named one of them;
+    // recording only the first made the other unobservable, so a check
+    // asserting 18 was red on a module that names both.
+    let mut named:u64=0;
+    let mut first_named:u64=0;
+    let mut second_named:u64=0;
+    let mut i3:u64=1;
+    while i3<=count {
+        let kind:u64=ntasm_ast.kind_at(i3);
+        let mut nm:buf<u8>=ntasm_ast.kind_name_of(kind);
+        if same(nm,unnamed)==false {
+            named=named+1;
+            if named==1 { first_named=kind; }
+            if named==2 { second_named=kind; }
+        }
+        rt_free(runtime(),nm);
+        i3=i3+1;
+    }
+    // Fixed slots again, and the same reason as report[5] and report[6]: an
+    // index of the form k+count lands inside the table for some k and outside
+    // it for others, so its meaning depends on the length it was offset from.
+    report[7]=named;
+    report[8]=first_named;
+    report[9]=second_named;
+    // kind_text, the INDEX-keyed form, against kind_name_of(kind_at(i)) for
+    // every i. They are two separate exports, so the gate confronts them
+    // rather than assuming they agree.
+    let mut agree:u64=0;
+    let mut i4:u64=1;
+    while i4<=count {
+        let a:buf<u8>=ntasm_ast.kind_text(i4);
+        let kind:u64=ntasm_ast.kind_at(i4);
+        let b:buf<u8>=ntasm_ast.kind_name_of(kind);
+        if same(a,b) { agree=agree+1; }
+        rt_free(runtime(),a);
+        rt_free(runtime(),b);
+        i4=i4+1;
+    }
+    report[10]=agree;
+    // The strings themselves, into out[0..), one byte per word.
+    if len(out)<8192 { return 800; }
+    let mut total:u64=0;
+    let mut i5:u64=1;
+    while i5<=count {
+        let mut nm:buf<u8>=ntasm_ast.kind_text(i5);
+        let mut size:u64=len(nm);
+        let mut j:u64=0;
+        while j<size {
+            if total+j>=len(out) { rt_free(runtime(),nm);return 800; }
+            out[total+j]=nm[j];
+            j=j+1;
+        }
+        if total+size>=len(out) { rt_free(runtime(),nm);return 800; }
+        out[total+size]=0;
+        total=total+size+1;
+        rt_free(runtime(),nm);
+        i5=i5+1;
+    }
+    return total;
+}
+
+// Byte equality over two buffers, and the LENGTH IS PART OF IT. A comparison
+// that stopped at the first difference would call "import" and "import "
+// equal, and a gate built on that would pass a name with a trailing byte.
+fn same(a:buf<u8>,b:buf<u8>)->bool {
+    if len(a)!=len(b) { return false; }
+    let mut i:u64=0;
+    while i<len(a) {
+        if a[i]!=b[i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+// Each invalid getter gets its own runtime: first-error-wins cannot mask a later probe.
+fn scalar_read(tree:ntasm_ast.Tree,id:u64,field:u64)->u64 {
+    if field==0 { return ntasm_ast.node_kind(tree,id); }
+    if field==1 { return ntasm_ast.node_token_begin(tree,id); }
+    if field==2 { return ntasm_ast.node_token_end(tree,id); }
+    if field==3 { return ntasm_ast.node_source(tree,id); }
+    if field==4 { return ntasm_ast.node_line(tree,id); }
+    if field==5 { return ntasm_ast.node_column(tree,id); }
+    if field==6 { return ntasm_ast.node_start(tree,id); }
+    if field==7 { return ntasm_ast.node_end(tree,id); }
+    if field==8 { return ntasm_ast.node_first_child(tree,id); }
+    if field==9 { return ntasm_ast.node_last_child(tree,id); }
+    if field==10 { return ntasm_ast.node_next_sibling(tree,id); }
+    return ntasm_ast.node_aux(tree,id);
+}
+fn scalar_mode(source:buf<u8>,mode:u64,field:u64,report:buf<u64>)->u64 {
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree);return 800; }
+    let raw:buf<u64>=tree.node_words;
+    report[0]=tree.node_count;report[1]=len(raw);
+    if mode==8 { report[2]=scalar_read(tree,0,field);return 0; }
+    if mode==9 { report[2]=scalar_read(tree,tree.node_count+1,field);return 0; }
+    let snapshot:ntasm_ast.Node=ntasm_ast.node_at(tree,1);
+    let mut i:u64=0;
+    while i<12 {
+        report[16+i]=raw[i];
+        report[32+i]=scalar_read(tree,1,i);
+        raw[i]=raw[i]+1;
+        i=i+1;
+    }
+    report[48]=snapshot.kind;
+    report[49]=snapshot.token_begin;
+    report[50]=snapshot.token_end;
+    report[51]=snapshot.source;
+    report[52]=snapshot.line;
+    report[53]=snapshot.column;
+    report[54]=snapshot.start;
+    report[55]=snapshot.end;
+    report[56]=snapshot.first_child;
+    report[57]=snapshot.last_child;
+    report[58]=snapshot.next_sibling;
+    report[59]=snapshot.aux;
+    let mut j:u64=0;
+    while j<12 { report[64+j]=scalar_read(tree,1,j);j=j+1; }
+    ntasm_ast.release(tree);
+    return 0;
+}

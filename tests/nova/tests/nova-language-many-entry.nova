@@ -1,0 +1,14 @@
+module entry;
+import nova_language_parse;
+
+export fn main(
+    blob: buf<u8>, spans: buf<u64>, count: u64, root_idx: u64,
+    nodes: buf<u64>, scopes: buf<u64>, binds: buf<u64>, fields: buf<u64>,
+    modules: buf<u64>, out: buf<u64>
+) -> u64 {
+    return nova_language_parse.parse_many(
+        blob, spans, count, root_idx,
+        nodes, scopes, binds, fields,
+        modules, out
+    );
+}

@@ -1,0 +1,234 @@
+module x64_lower_nxo_pe;
+import ntasm_ast;
+import ntasm_nxo;
+import ntasm_nxo_pe;
+import ntasm_nxo_link_pe;
+import ntasm_pe;
+import x64_lower_nxo;
+
+fn failed(code:u64)->ntasm_nxo_pe.ConvertResult {
+    let empty:buf<u8>=alloc(runtime(),0);
+    return ntasm_nxo_pe.ConvertResult{code:code,bytes:empty};
+}
+
+// Compose the bounded AST producer with the existing NXO linker and PE writer.
+// Neither source nor definition bytes are mutated or owned by this function.
+export fn build(source:buf<u8>,tree:ntasm_ast.Tree,features:u64,cpl:u64,
+                definition:buf<u8>)->ntasm_nxo_pe.ConvertResult {
+    let object:ntasm_nxo.WriteResult=
+        x64_lower_nxo.build_import_call_with_scalar_data(source,tree,features,cpl);
+    let left:buf<u8>=object.bytes;
+    if object.code!=0 {rt_free(runtime(),left);return failed(object.code);}
+    let result:ntasm_nxo_pe.ConvertResult=ntasm_nxo_link_pe.link_pe(left,definition);
+    rt_free(runtime(),left);
+    return result;
+}
+
+// Convert the bounded two-function local-call NXO directly to PE. The NXO
+// producer owns its result; the borrowed source remains untouched.
+export fn build_local_helper_call(source:buf<u8>,tree:ntasm_ast.Tree,
+                                  features:u64,cpl:u64)->ntasm_nxo_pe.ConvertResult {
+    let object:ntasm_nxo.WriteResult=
+        x64_lower_nxo.build_local_helper_call(source,tree,features,cpl);
+    let bytes:buf<u8>=object.bytes;
+    if object.code!=0 {rt_free(runtime(),bytes);return failed(object.code);}
+    let parsed:ntasm_nxo.ReadResult=ntasm_nxo.read(bytes);
+    if parsed.code!=0 {let fault:ntasm_nxo.Object=parsed.object;ntasm_nxo.release(fault);rt_free(runtime(),bytes);return failed(828);}
+    let result:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(parsed.object);
+    ntasm_nxo.release(parsed.object);
+    rt_free(runtime(),bytes);
+    return result;
+}
+
+export fn build_local_helper_call_with_scalar_data(source:buf<u8>,tree:ntasm_ast.Tree,
+                                                    features:u64,cpl:u64)->ntasm_nxo_pe.ConvertResult {
+    let object:ntasm_nxo.WriteResult=
+        x64_lower_nxo.build_local_helper_call_with_scalar_data(source,tree,features,cpl);
+    let bytes:buf<u8>=object.bytes;
+    if object.code!=0 {rt_free(runtime(),bytes);return failed(object.code);}
+    let parsed:ntasm_nxo.ReadResult=ntasm_nxo.read(bytes);
+    if parsed.code!=0 {let fault:ntasm_nxo.Object=parsed.object;ntasm_nxo.release(fault);rt_free(runtime(),bytes);return failed(828);}
+    let result:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(parsed.object);
+    ntasm_nxo.release(parsed.object);
+    rt_free(runtime(),bytes);
+    return result;
+}
+
+export fn build_local_helper_calls(source:buf<u8>,tree:ntasm_ast.Tree,
+                                   features:u64,cpl:u64)->ntasm_nxo_pe.ConvertResult {
+    let object:ntasm_nxo.WriteResult=x64_lower_nxo.build_local_helper_calls(source,tree,features,cpl);
+    let bytes:buf<u8>=object.bytes;
+    if object.code!=0 {rt_free(runtime(),bytes);return failed(object.code);}
+    let parsed:ntasm_nxo.ReadResult=ntasm_nxo.read(bytes);
+    if parsed.code!=0 {let fault:ntasm_nxo.Object=parsed.object;ntasm_nxo.release(fault);rt_free(runtime(),bytes);return failed(828);}
+    let result:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(parsed.object);
+    ntasm_nxo.release(parsed.object);
+    rt_free(runtime(),bytes);
+    return result;
+}
+
+// Additive local-call stream plus literal scalar data. The NXO buffer stays
+// owned and alive until the read and the PE conversion have both finished.
+export fn build_local_helper_calls_with_scalar_data(source:buf<u8>,tree:ntasm_ast.Tree,
+                                                     features:u64,cpl:u64)->ntasm_nxo_pe.ConvertResult {
+    let object:ntasm_nxo.WriteResult=
+        x64_lower_nxo.build_local_helper_calls_with_scalar_data(source,tree,features,cpl);
+    let bytes:buf<u8>=object.bytes;
+    if object.code!=0 {rt_free(runtime(),bytes);return failed(object.code);}
+    let parsed:ntasm_nxo.ReadResult=ntasm_nxo.read(bytes);
+    if parsed.code!=0 {let fault:ntasm_nxo.Object=parsed.object;ntasm_nxo.release(fault);rt_free(runtime(),bytes);return failed(828);}
+    let result:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(parsed.object);
+    ntasm_nxo.release(parsed.object);
+    rt_free(runtime(),bytes);
+    return result;
+}
+
+// Self contained multi-function object straight to PE. build_function_bodies emits a closed NXO of real lowered bodies, so it
+// needs no definition object and no link step: ntasm_nxo_pe.convert is the whole pipeline. link_pe compares contract text byte
+// for byte, and this producer writes the CANONICAL text, not a "v0" placeholder: measured on a
+// two function source, the contract string in the Nova object is character for character the one
+// the C reference writes for the same declaration, function contracts and data contracts alike.
+// The printer is declaration_contract in x64_lower_nxo.nova, and its consumer is the build entry
+// that hands the table to emit_canonical. An earlier version of this comment said the opposite
+// and named "v0" as the reason a cross producer link was refused with 825; that was false, it
+// survived a repair that had already been made, and it is recorded here because it is what
+// briefed a whole lot onto a defect that does not exist.
+// Transactional like every adapter here: a non zero code returns no bytes, the NXO buffer owned until both steps have ended.
+// B2, named because it was nowhere. The body producer behind this adapter, and behind every file writer in this file, is the
+// ONE entry x64_lower_nxo.build_function_bodies, and that entry now covers both shapes of source. A source whose functions
+// declare no parameter is lowered frameless, as before: each body goes at the offset computed for it, then only mov rax,imm64
+// with ret, or a bare ret, with no prologue and no epilogue. A source that declares a parameter is handed whole to the framed
+// producer of x64_lower_nxo, which emits the codegen.c frame, the parameter spill and the epilogue, so the image of a
+// parametric source now has the shape the C reference gives it. The dispatch lives in x64_lower_nxo, not here, because this
+// module cannot import abi: the gates that compile it do not list abi.nova among their inputs, so an import here would fail
+// every one of them with E302, and the framed producer therefore answers the register questions from the copy of the
+// nx64-abi-v0 table it carries when no table is injected. case_framed_route runs both shapes and compares each against the C
+// reference, so neither branch of the dispatch is asserted here.
+export fn build_function_bodies(source:buf<u8>,tree:ntasm_ast.Tree,features:u64,cpl:u64)->ntasm_nxo_pe.ConvertResult {
+    let object:ntasm_nxo.WriteResult=x64_lower_nxo.build_function_bodies(source,tree,features,cpl);
+    let bytes:buf<u8>=object.bytes;
+    if object.code!=0 {rt_free(runtime(),bytes);return failed(object.code);}
+    let parsed:ntasm_nxo.ReadResult=ntasm_nxo.read(bytes);
+    if parsed.code!=0 {let fault:ntasm_nxo.Object=parsed.object;ntasm_nxo.release(fault);rt_free(runtime(),bytes);return failed(828);}
+    let result:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(parsed.object);
+    ntasm_nxo.release(parsed.object);
+    rt_free(runtime(),bytes);
+    return result;
+}
+
+// The same source text reaches a file, so a source becomes a bootable image with no C driver in the middle. rt_open_new, rt_write
+// and rt_close are the frozen runtime intrinsics, so this adds no new host capability: the runtime opens the path exclusively and
+// refuses to overwrite. Every refusal of the conversion happens before the file is opened, so a rejected source never creates
+// anything. 830 open refused, 831 short write, 832 close refused. Measured on this host: 830 is not observable from C, because a
+// raised runtime error forces the entry's return value to 0 at the boundary, whatever integer the Nova source returns. The
+// observable refusal is NV2_IO on the context, and the gate asserts that plus the untouched file instead of the 830.
+// This is the entry that produced the one PE the chain had really run, out/c-bootstrap/nova/ntasm-nova-uefi-20260926, marker
+// NG_NTASM_C_RESULT_OK and result 42, and that image is still reproduced octet for octet, because its source declares no
+// parameter and the frameless branch is untouched. The same entry now also produced the first image with a parameter in it,
+// out/c-bootstrap/nova/ntasm-nova-uefi-w6-8, marker NG_NTASM_C_RESULT_OK, which returns 7 for an argument of 1 and 9 for an
+// argument of 0 from the same bytes. The two writers below take the same two steps, so they write the same shape as this one.
+export fn build_function_bodies_and_write(source:buf<u8>,tree:ntasm_ast.Tree,features:u64,
+                                           cpl:u64,path:buf<u8>)->u64 {
+    let converted:ntasm_nxo_pe.ConvertResult=build_function_bodies(source,tree,features,cpl);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 {rt_free(runtime(),bytes);return converted.code;}
+    let size:u64=len(bytes);
+    let handle:u64=rt_open_new(runtime(),path);
+    if handle==0 {rt_free(runtime(),bytes);return 830;}
+    let written:u64=rt_write(runtime(),handle,bytes);
+    let closed:u64=rt_close(runtime(),handle);
+    rt_free(runtime(),bytes);
+    if written!=size {return 831;}
+    if closed!=0 {return 832;}
+    return 0;
+}
+
+// The cross producer route for the same self contained object: the producer
+// bytes, linked against an external definition object, then converted.
+// Transactional: no bytes on refusal, the NXO buffer owned until the merge
+// has finished.
+//
+// THE "v0" ATTRIBUTION THAT WAS HERE IS FALSE, and it cost a lot. This comment
+// used to say the route "cannot work today", that "every call ends in 825 with
+// no bytes", and that the cause was the producer writing the two byte contract
+// string "v0" where the C frontend writes the full canonical text. None of
+// that is true. The producer writes the canonical text: measured, the contract
+// string in the Nova object is character for character the one the C reference
+// writes for the same declaration, for a function contract and for a data
+// contract alike. The repair that made it true had already been made when this
+// comment was written, and a repaired thing whose documentation outlived it is
+// a worse failure than an unrepaired one, because the next reader inherits a
+// blocker that is not there.
+//
+// WHAT IS STILL TRUE ON THIS ROUTE, and is the reason the entry keeps its
+// shape. link_pe compares contract text byte for byte, so a definition whose
+// contract differs by one byte is still refused with 825 before one instruction
+// is examined; that refusal is real and is a property of the merge, not of the
+// producer. And the framed producer of x64_lower_nxo, the one matching
+// codegen.c octet for octet, has no PE route and no file route in this module,
+// so no framed image reaches a disk through any entry here. Spec 17.5 states
+// that; 17.8, which inventories what the pipeline emits, does not.
+//
+// WHAT IS NOT MEASURED, and was not measured when the false claim stood here
+// either: whether a given cross producer link now resolves end to end. The
+// gate that was written to show it, tests_ntasm_x64_lower_nxo_pe, cannot
+// currently reach it. Its producer_contract asks the Nova object for a symbol
+// named "entry", and the producer writes the module qualified "m.entry", so it
+// returns NULL and the whole block that would have asserted the link is
+// skipped with no check of its own. That is a hole in a file this module does
+// not own; it is named, not fixed, here.
+export fn build_function_bodies_linked(source:buf<u8>,tree:ntasm_ast.Tree,features:u64,
+                                       cpl:u64,definition:buf<u8>)->ntasm_nxo_pe.ConvertResult {
+    let object:ntasm_nxo.WriteResult=x64_lower_nxo.build_function_bodies(source,tree,features,cpl);
+    let left:buf<u8>=object.bytes;
+    if object.code!=0 {rt_free(runtime(),left);return failed(object.code);}
+    let result:ntasm_nxo_pe.ConvertResult=ntasm_nxo_link_pe.link_pe(left,definition);
+    rt_free(runtime(),left);
+    return result;
+}
+
+// The same cross producer link, straight to a file. The merge runs to completion first and a
+// refusal returns from it before any path could be opened, so a 825 leaves nothing on disk.
+// 830 open refused, 831 short write, 832 close refused, exactly as on the self
+// contained route, and 830 is unobservable from C for the same measured reason.
+export fn build_function_bodies_and_write_linked(source:buf<u8>,tree:ntasm_ast.Tree,features:u64,
+                                                 cpl:u64,definition:buf<u8>,path:buf<u8>)->u64 {
+    let converted:ntasm_nxo_pe.ConvertResult=build_function_bodies_linked(source,tree,features,cpl,definition);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 {rt_free(runtime(),bytes);return converted.code;}
+    let size:u64=len(bytes);
+    let handle:u64=rt_open_new(runtime(),path);
+    if handle==0 {rt_free(runtime(),bytes);return 830;}
+    let written:u64=rt_write(runtime(),handle,bytes);
+    let closed:u64=rt_close(runtime(),handle);
+    rt_free(runtime(),bytes);
+    if written!=size {return 831;}
+    if closed!=0 {return 832;}
+    return 0;
+}
+
+// The self contained route to a file, plus the byte count Nova itself computed,
+// copied into out[0..8]. That count is the producer claim the caller compares
+// with the length of the file on disk and with the in memory PE of the same
+// source, so a producer that reported a size it did not write could not pass.
+// A report buffer shorter than the eight count bytes is refused with 827 before
+// the producer runs, and a producer refusal returns the producer code with out
+// untouched; 830, 831 and 832 are reported after the write attempt, as on the
+// unsized route.
+export fn build_function_bodies_and_write_sized(source:buf<u8>,tree:ntasm_ast.Tree,features:u64,
+                                                cpl:u64,path:buf<u8>,out:buf<u8>)->u64 {
+    if len(out)<8 {return 827;}
+    let converted:ntasm_nxo_pe.ConvertResult=build_function_bodies(source,tree,features,cpl);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 {rt_free(runtime(),bytes);return converted.code;}
+    let size:u64=len(bytes);
+    let handle:u64=rt_open_new(runtime(),path);
+    if handle==0 {rt_free(runtime(),bytes);return 830;}
+    let written:u64=rt_write(runtime(),handle,bytes);
+    let closed:u64=rt_close(runtime(),handle);
+    if written==size {ntasm_pe.put64(out,0,size);}
+    rt_free(runtime(),bytes);
+    if written!=size {return 831;}
+    if closed!=0 {return 832;}
+    return 0;
+}

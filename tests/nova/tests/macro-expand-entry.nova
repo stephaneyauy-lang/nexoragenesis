@@ -1,0 +1,26 @@
+module macro_expand_entry;
+
+import ntasm_parser;
+import ntasm_ast;
+import ntasm_macro_expand;
+
+// Gate entry for the bounded hygienic macro expander. out[0] on input selects
+// the request: 0 asks for the expansion, 1 asks for the six consumptions under
+// the frozen maxima. On return out[0] is the diagnostic code, zero on success,
+// out[1] the produced node count or the line, out[2] the name table byte length
+// or the column, out[3] the reason.
+//
+// The tree is borrowed, never owned: this module releases it on every path,
+// including the refusals, so the gate sees no leak under detect_leaks=1.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    let request:u64=out[0];
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    let mut code:u64=800;
+    if tree.ok {
+        if request==1 { code=ntasm_macro_expand.measure(source,tree,out); }
+        else { code=ntasm_macro_expand.expand(source,tree,out); }
+    }
+    ntasm_ast.release(tree);
+    return code;
+}

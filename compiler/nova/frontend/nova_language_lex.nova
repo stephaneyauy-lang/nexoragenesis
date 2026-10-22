@@ -1,0 +1,151 @@
+module nova_language_lex;
+
+// LOT 139 -- THE FIRST TOKEN OF THE NOVA LANGUAGE FRONT END.
+//
+// WHAT THIS MODULE IS, and what it is not. It is a LEXER over a Nova source
+// buffer: it walks the buffer, cuts it into identifier tokens, and reports
+// WHICH OF THE EIGHT NOVA LANGUAGE KEYWORDS occur in it, one bit each, in the
+// order the C front end honours them. It is NOT a parser, NOT a grammar and
+// NOT a type checker; it builds no tree and it decides nothing.
+//
+// WHY IT IS A SEPARATE MODULE AND NOT A TABLE ADDED TO parser.nova. Measured
+// on this tree, 2026-10-03, by EXECUTION:
+//   parser.nova's flat keyword table reads back 77 words, and of the eight
+//   Nova language keywords it holds module/fn/let/export/return and NOT
+//   struct/mut/while -- KEYWORD_GAP 3 of 8 (tests_ntasm_nova_language).
+//   That table is the NTASM DIALECT's keyword set: it is indexed by numeric
+//   id from every call site (keyword(p,38), take_word(p,2,2)), so appending a
+//   Nova word to it would be an edit to the dialect, not to the language.
+//   nova.c, by execution, honours all eight and refuses every one-character
+//   alteration of them (a fixture using all eight compiles E0; 8/8 altered
+//   and 8/8 same-length-replaced are refused). So the eight ARE a language
+//   and the C front end already speaks them; what is absent is a module that
+//   does, in Nova. THIS is that module, and it is the smallest one that is
+//   not a token.
+//
+// THE MATCH IS WHOLE-IDENTIFIER, NEVER A SUBSTRING, and that is the property
+// the gate exercises in both directions: a source in which `mut` appears as
+// `mutable` must NOT report `mut`, and one in which `struct` is written
+// `strukt` must NOT report `struct`. A substring matcher passes the positive
+// half of every test in this file and fails both negative halves, which is
+// why the gate names the prefix case and the one-character case separately.
+//
+// THE EIGHT, AND WHERE THE ORDER COMES FROM. export fn let module mut return
+// struct while -- the order of the C front end's own sites, not an order
+// invented here. The bit index is the index in THIS module's keyword_words()
+// table and is published by keyword_read_back(), so the C harness reads the
+// names back out of the executed image rather than from a literal of its own.
+
+// The eight Nova language keywords, one flat NUL-separated table, in the
+// order of the C front end. Read back through keyword_read_back() by the gate.
+export fn keyword_words()->buf<u8> {
+    let words:buf<u8>="export\0fn\0let\0module\0mut\0return\0struct\0while\0";
+    return words;
+}
+
+// Copies keyword_words() into out at base, one byte per u64 word, and returns
+// its byte length. The gate's read-back: it counts the table by reading the
+// EXECUTED module, so the count cannot drift from the literal above.
+export fn keyword_read_back(out:buf<u64>,base:u64)->u64 {
+    let words:buf<u8>=keyword_words();
+    let size:u64=len(words);
+    let mut i:u64=0;
+    while i<size { out[base+i]=words[i];i=i+1; }
+    rt_free(runtime(),words);
+    return size;
+}
+
+// Byte length of the word STARTING at `at`, i.e. the run of non-NUL bytes from
+// `at` to the next NUL. A slot at or past the end yields 0, which is how every
+// walk below terminates and how a slot past the table is refused rather than
+// read.
+fn word_length(table:buf<u8>,at:u64)->u64 {
+    if at>=len(table) { return 0; }
+    let mut length:u64=0;
+    let mut cursor:u64=at;
+    while cursor<len(table) && table[cursor]!=0 { length=length+1;cursor=cursor+1; }
+    return length;
+}
+
+// Byte offset of the word AFTER the one starting at `at`, i.e. past its NUL.
+// THE FIRST VERSION OF THIS MODULE advanced by ONE BYTE per slot instead
+// (`slot=slot+1`), which walks INTO the middle of words and compares the
+// source against the tail `xport` as if it were a keyword. It compiled, ran,
+// and reported a `found` count that no case expected. The fix is a named
+// function rather than a `+1`, because `+1` here was a claim about the table's
+// shape written as an arithmetic operator.
+fn word_next(table:buf<u8>,at:u64)->u64 {
+    let length:u64=word_length(table,at);
+    if length==0 { return len(table); }
+    return at+length+1;
+}
+
+// True when source[start,end) is EXACTLY the word starting at `at`: same
+// length, same bytes, every byte compared. The length is compared FIRST, so a
+// longer identifier that merely starts with the keyword is refused before a
+// single byte of it is compared as if it were the keyword.
+fn matches(table:buf<u8>,source:buf<u8>,start:u64,end:u64,at:u64)->bool {
+    let length:u64=word_length(table,at);
+    if length==0 { return false; }
+    if end<start { return false; }
+    if end-start!=length { return false; }
+    if end>len(source) { return false; }
+    let mut i:u64=0;
+    while i<length {
+        if source[start+i]!=table[at+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+fn is_letter(ch:u64)->bool {
+    return (ch>=97 && ch<=122) || (ch>=65 && ch<=90) || ch==95;
+}
+fn is_digit(ch:u64)->bool { return ch>=48 && ch<=57; }
+fn is_name_byte(ch:u64)->bool { return is_letter(ch) || is_digit(ch); }
+
+// THE SCAN. Walks the whole buffer, and for every identifier-shaped run sets
+// out[k]=1 when the run IS the k'th of the eight, whole. Identifiers are
+// MAXIMAL runs of name bytes, so `mutable` is one identifier and cannot match
+// `mut`; a keyword altered by one character is a different identifier and
+// cannot match its table word either.
+//
+// out[0] is `found`; out[1..8] are the eight bits, in keyword_words() order.
+// `found` counts the eight BITS, not the occurrences: `let` written twice sets
+// one bit and `found` stays 1. That is a property of the published interface,
+// not a convenience, and the gate states it as a case of its own.
+//
+// Returns 0 on success, 800 when `out` is too short to carry the eight bits --
+// and the refusal is TRANSACTIONAL: the size is checked before a single word
+// is written, so a short buffer leaves out[] untouched rather than half written.
+export fn scan(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<9 { return 800; }
+    let mut k:u64=1;
+    while k<=8 { out[k]=0;k=k+1; }
+    let table:buf<u8>=keyword_words();
+    let mut found:u64=0;
+    let mut i:u64=0;
+    let size:u64=len(source);
+    while i<size {
+        if is_letter(source[i]) {
+            let start:u64=i;
+            while i<size && is_name_byte(source[i]) { i=i+1; }
+            let end:u64=i;
+            // The slot of each keyword in the table, walked in the table's own
+            // order so the bit index and the table index cannot disagree, and
+            // advanced by word_next() so a slot is always a word START.
+            let mut slot:u64=0;
+            let mut bit:u64=1;
+            while bit<=8 {
+                if matches(table,source,start,end,slot)==true {
+                    // once per BIT: a keyword written twice is still one bit
+                    if out[bit]==0 { out[bit]=1;found=found+1; }
+                    bit=9;
+                } else { slot=word_next(table,slot);bit=bit+1; }
+            }
+        } else { i=i+1; }
+    }
+    out[0]=found;
+    rt_free(runtime(),table);
+    return 0;
+}

@@ -1,0 +1,40 @@
+module macro_io_write_entry;
+
+// The WRITE half of the A5 absence-of-I/O positive control. Wave 12.
+//
+// A read that returns a byte could in principle be a buffer the host image
+// already carried. A CREATE is not ambiguous: after main runs, a file exists
+// that did not exist before. The gate therefore observes both, and this module
+// exists to make the create observable, so that "no file appeared during the
+// expansion corpus" is a statement about the filesystem and not about a
+// detector that would not have noticed a file.
+//
+// It writes the thirteen bytes "HILL-OK-NOVA\n" to path, so the file that
+// appears is recognisable and is not an empty create. It was measured to do
+// so: the gate observes a thirteen byte file whose first bytes are "HILL".
+//
+// main(path,out): out[0] = bytes written, out[1] = 1 on success.
+// A return of 8 is the runtime NV2_IO error. rt_open_new opens with "wbx"
+// (runtime_v2.c:243), so a path that already exists is refused, and the gate
+// leans on that refusal to tell a fresh create from a stale file -- the
+// negative proof of the filesystem observer, since a snapshot that could not
+// see a create could not conclude that no create happened.
+
+export fn main(path:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<2 { return 800; }
+    out[0]=0; out[1]=0;
+    let bytes:buf<u8>=alloc(runtime(),13);
+    if len(bytes)!=13 { rt_free(runtime(),bytes); return 900; }
+    bytes[0]=72; bytes[1]=73; bytes[2]=76; bytes[3]=76;
+    bytes[4]=45; bytes[5]=79; bytes[6]=75; bytes[7]=45;
+    bytes[8]=78; bytes[9]=79; bytes[10]=86; bytes[11]=65;
+    bytes[12]=10;
+    let writer:u64=rt_open_new(runtime(),path);
+    if writer==0 { rt_free(runtime(),bytes); return 8; }
+    let wrote:u64=rt_write(runtime(),writer,bytes);
+    rt_close(runtime(),writer);
+    out[0]=wrote; out[1]=1;
+    rt_free(runtime(),bytes);
+    if wrote!=13 { return 8; }
+    return 0;
+}

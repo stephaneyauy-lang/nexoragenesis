@@ -1,0 +1,21 @@
+// Lot 122 counter-example, 3 of 4: all eight Nova keywords in one file.
+//
+// The eight are the ones the C front end itself honours: `module`,
+// `export`, `struct`, `fn`, `let`, `mut`, `return`, `while`. Each one is
+// used below in the position nova.c gives it, and nothing else is used at
+// all: no `target`, no `section`, no `abi`, no `effects`, no `clobbers`, no
+// `@reg`, no `comptime`, no `expand`. A front end for Nova must accept this
+// file whole; one that refuses it is speaking a different language.
+module nova_language_eight_keywords;
+
+export struct Counter {
+    value:u64
+}
+
+export fn tick(bound:u64) -> u64 {
+    let mut total:u64=0;
+    while total < bound {
+        total=total+1;
+    }
+    return total;
+}

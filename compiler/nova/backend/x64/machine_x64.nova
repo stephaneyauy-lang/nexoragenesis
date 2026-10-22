@@ -1,0 +1,702 @@
+module machine_x64;
+
+import machine_ir;
+import x64_fixed;
+import ntasm_nxo;
+
+// ===========================================================================
+// THE CONSUMER. machine_ir.nova builds and verifies a Machine IR and nothing
+// reads one to produce a byte; this module is the reader. It takes the flat
+// `buf<u64>` image, checks every executable record against what the encoder can
+// actually express, encodes the records it can, and hands the result to the
+// EXISTING NXO writer (ntasm_nxo.emit) rather than writing a container of its
+// own.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS ESTABLISHED HERE AND WHAT IS NOT, because the difference is the
+// whole content of this file.
+//
+// The Machine IR is TARGET-INDEPENDENT BY CONSTRUCTION and says so in its own
+// header (machine_ir.nova:37-49). Three consequences were MEASURED on the seven
+// CORPUS members and on the gate's own `.nova` corpus before this module was
+// written, and all three bound what a consumer can do:
+//
+//   1. NO REGISTER IS NAMED. `mir_bind` and `mir_clobber` keep a WIDTH and drop
+//      the register (machine_ir.nova:747-751 and :2245-2247). An operand of an
+//      `mir_asm` is a VIRTUAL VALUE, so every two-operand instruction needs a
+//      register assignment this level does not own and this module does not
+//      invent. Those records are REFUSED, with E_REGISTER, before emission.
+//
+//   2. THE DECLARED RETURN TYPE IS ABSENT. `mir_function` carries the entry
+//      block and nothing else: on `return42.ntasm` record 4 is
+//      `kind=2051 a=9 n=0 w=0`, and the source's `-> u64` appears nowhere. The
+//      `mir_return` that follows carries `w=8`, the WIDTH OF THE CONSTANT it
+//      returns, not the width of the declared result. The C reference emits
+//      `48 b8 2a ...` — a 64-bit move into RAX. Encoding what this image says
+//      would give `b0 2a`, `mov al, 42`, and machine_ir.nova:3081-3092 is the
+//      project's own sentence about that trade: a wrong machine instruction is
+//      worse than a refusal. So it is refused.
+//
+//   3. A DEFINED FUNCTION HAS NO NAME. `mir_symbol` (kind 2057) carries a byte
+//      span and exists for the module name, for call targets and for labels.
+//      `mir_function` (kind 2051) does not carry one. An NXO symbol table needs
+//      a name for every symbol, so the symbols THIS MODULE CARRIES are the ones
+//      the IR actually names, and a defined function is not one of them.
+//
+// The bound this module delivers, stated so the next lot knows what remains:
+//
+//   ENCODED:  `mir_asm` with OP_NOP, `mir_unreachable`, `mir_return` with no
+//             operand, and `mir_call` with arity 0 (which is also the one form
+//             that yields a RELOCATION, because the call's immediate offset is
+//             known only once this module has laid the block out).
+//   REFUSED:  every other executable record, each with its own code and its own
+//             reason, decided BEFORE a byte is emitted.
+//
+// The next step, and it is not a small one: register assignment. Without it the
+// encoder's reg/reg and reg/imm forms are unreachable and no comparison against
+// the C reference's `.text` is possible, because every C reference prologue
+// (`9c 51 52 53 56 57 41 50 ...`) is a register-allocation and frame-layout
+// decision the Machine IR has no record for.
+// ===========================================================================
+
+// ---- refusal codes --------------------------------------------------------
+//
+// A band of its own. machine_ir.nova owns 930..948, ntir.nova owns 800 and
+// 808..819, and the C oracle's NTF_E_OOM is 900 (frontend.h:53), so nothing
+// published can reach 960..968. Every code below is fired by exactly one
+// condition, for the reason machine_ir.nova:317-329 gives for its own E_FRAME:
+// a gate that saw a code could not otherwise tell two different refusals apart.
+export fn E_IMAGE()->u64 { return 960; }
+export fn E_OPCODE()->u64 { return 961; }
+export fn E_FORM()->u64 { return 962; }
+export fn E_REGISTER()->u64 { return 963; }
+export fn E_CALL()->u64 { return 964; }
+export fn E_MEMORY()->u64 { return 965; }
+export fn E_CONTROL()->u64 { return 966; }
+
+// ---- the opcode vocabulary THIS MODULE can encode -------------------------
+//
+// A property of this module and not of the target: `x64_fixed` has no encoder
+// for an opcode below, and an opcode without an encoder is refused rather than
+// approximated. OP_MUL, OP_DIV, OP_REM, OP_SHL, OP_SHR and OP_SAR are absent
+// for that reason and NOT because they are unimportant; x64_fixed.nova:297
+// carries the shift-immediate encoder and nothing for multiply or divide.
+export fn COVERED_COUNT()->u64 { return 4; }
+fn covered_op(op:u64)->bool {
+    if op==machine_ir.OP_NOP() { return true; }
+    if op==machine_ir.OP_UNREACHABLE() { return true; }
+    if op==machine_ir.OP_RET() { return true; }
+    if op==machine_ir.OP_CALL() { return true; }
+// The fifth entry. `add` IS covered: this predicate answers true for OP_ADD,
+// and the refusal a two-operand `add` gets is 963 E_REGISTER and not 961
+// E_OPCODE, which is how the covering is observed from outside.
+//
+// WHICH ENCODER IS THE OTHER HALF, AND IT IS NOT THE ONE THIS FILE NAMED
+// BEFORE. An earlier version of this comment said `x64_fixed.encode_rr` was
+// the encoder that was only waiting for a dispatch, because `encode_rr` names
+// « add » explicitly (x64_fixed.nova:97, :102, :113). That is true of the
+// NAME and false of the SHAPE. MEASURED, calling both encoders with
+// destination=RAX and width=64:
+//
+//   encode_rr("add",2,rax,rax,64)  -> 48 01 c0     3 bytes  `add rax, rax`
+//   encode_ri("add",2,rax,64,1)    -> 48 83 c0 01  4 bytes  `add rax, 1`
+//
+// and the C reference's own `.text` for `add rax, 1` carries `48 83 c0 01`
+// at offset 496 of its NXO and does NOT carry `48 01 c0` anywhere. So the
+// encoder that emits this instruction is `encode_ri`, the REGISTER/IMMEDIATE
+// form, and wiring `encode_rr` here would emit a different, wrong machine
+// instruction while looking like an encoder that works. `encode_ri` also
+// names « add » (x64_fixed.nova:178), so the encoder was never missing for
+// either shape; the DISPATCH and the SHAPE were both unnamed.
+    if op==machine_ir.OP_ADD() { return true; }
+    return false;
+}
+// The mnemonic an opcode encodes to. A switch rather than a table because a
+// Nova buffer argument must NAME a buffer, so a literal cannot be indexed out
+// of one; x64_fixed.nova:17 and its siblings all take `name:buf<u8>`.
+fn encode_zero(op:u64,out:buf<u8>)->u64 {
+    let mut features:u64=1;
+    let mut cpl:u64=3;
+    let mut nop:buf<u8>="nop";
+    if op==machine_ir.OP_NOP() { return x64_fixed.encode(nop,0,features,cpl,out); }
+    let mut ud2:buf<u8>="ud2";
+    if op==machine_ir.OP_UNREACHABLE() { return x64_fixed.encode(ud2,0,features,cpl,out); }
+    let mut ret:buf<u8>="ret";
+    if op==machine_ir.OP_RET() { return x64_fixed.encode(ret,0,features,cpl,out); }
+    return E_OPCODE();
+}
+// The TWO-operand form, the sibling of `encode_zero` and the arm the fifth
+// `covered_op` entry needs. The encoder was never the missing piece, but WHICH
+// ENCODER is a fact this comment previously got wrong, and getting it wrong is
+// worse than missing it, because the wrong one runs.
+//
+// `add rax, 1` IS A REGISTER/IMMEDIATE INSTRUCTION, not a register/register
+// one. MEASURED, calling both candidate encoders with destination=RAX and
+// width=64 against the C reference's own bytes:
+//
+//   x64_fixed.encode_rr("add",2,rax,rax,64)  -> 48 01 c0     3 bytes
+//   x64_fixed.encode_ri("add",2,rax,64,1)    -> 48 83 c0 01  4 bytes
+//   the C reference's NXO for `add rax, 1`  -> 48 83 c0 01  at offset 496,
+//                                                and 48 01 c0 nowhere
+//
+// So this arm's encoder is `encode_ri` (x64_fixed.nova:173, and it names
+// « add » at :178), NOT `encode_rr`. `encode_rr` names « add » too (x64_fixed.nova:102,
+// :113), which is exactly why an earlier version of this comment named it: the
+// mnemonic matched and the OPERAND SHAPE did not. Wiring `encode_rr` here
+// would emit `add rax, rax` for every two-operand `add` in the tree and look
+// like an encoder that works.
+//
+// WHAT IS STILL MISSING IS THE REGISTER, AND IT IS MISSING TWICE OVER. An
+// `encode_ri` call needs an architectural GPR number 0..15 for the destination
+// and refuses 406 above that (x64_fixed.nova:203); the record carries VIRTUAL
+// VALUE ids in fields 5 and 6 and their count in field 8 (machine_ir.nova's
+// `mir_asm`). An id of 1..15 would silently encode a register the program
+// never named, and an id above 15 would refuse for the wrong reason. The
+// second operand is worse: it is not a register at all, it is the literal
+// `1`, and the IR carries no immediate VALUE — only the WIDTH that a binding
+// and a clobber keep while dropping the register (this file's header, and
+// machine_ir.nova's `mir_bind`/`mir_clobber`).
+//
+// WHAT IS MISSING IS ITS TWO REGISTERS. `encode_rr` takes architectural GPR
+// numbers 0..15 and refuses 406 above that (x64_fixed.nova:126), so it cannot
+// be handed a VIRTUAL VALUE id: an id of 1..15 would silently encode a
+// register the program never named, and an id above 15 would refuse for the
+// wrong reason. The record does not carry the numbers. A `mir_asm` puts
+// VIRTUAL VALUE ids in fields 5 and 6 and their count in field 8
+// (machine_ir.nova:1927-1931), and the one place in the tree that knows a
+// destination is a register SPELLING turns it into `bind_write` and keeps a
+// value (machine_ir.nova:1949-1955); a binding and a clobber each keep a
+// WIDTH and drop the register (machine_ir.nova:897-905, :2450-2461).
+//
+// So this arm refuses E_REGISTER rather than invent a register number, and
+// that refusal is the same fact the `mir_asm` arm of `constraints` already
+// reports for a covered opcode that carries operands. Writing the call here
+// with a guessed zero would emit `add rax, rax` for every two-operand `add` in
+// the tree and look like an encoder that works.
+// The parameters are the encoder's own: `encode_rr(name,operand_count,
+// destination,source,width,features,cpl,out)` (x64_fixed.nova:97). Naming them
+// here is what makes the missing input addressable — the call site passes what
+// the record HAS, and this is the list of what it does not.
+fn encode_two(op:u64,destination:u64,source:u64,width:u64,out:buf<u8>)->u64 {
+    if op!=machine_ir.OP_ADD() { return E_OPCODE(); }
+    return E_REGISTER();
+}
+// ---- reading the image ----------------------------------------------------
+//
+// The stride is read from the OWNER (machine_ir.HEADER_WORDS and NODE_WORDS)
+// rather than written down here, so a change to the image layout is a refusal
+// in this module and not a silently mis-indexed read of somebody else's array.
+// The same rule is the one the C gate follows at tests_ntasm_machine_ir.c.
+fn field(words:buf<u64>,record:u64,at:u64)->u64 {
+    return words[machine_ir.HEADER_WORDS()+(record-1)*machine_ir.NODE_WORDS()+at];
+}
+fn same(name:buf<u8>,text:buf<u8>)->bool {
+    if len(name)!=len(text) { return false; }
+    let mut i:u64=0;
+    while i<len(text) {
+        if name[i]!=text[i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+// The kind table INDEX of a record's kind, or 0. Derived exactly as
+// machine_ir.nova:nindex derives it and checked against machine_ir.kind_at, so
+// a kind outside the published range cannot be turned into a plausible index.
+fn kind_index(words:buf<u64>,record:u64)->u64 {
+    let mut kind:u64=field(words,record,0);
+    if kind<machine_ir.KIND_BASE() { return 0; }
+    let mut index:u64=kind-machine_ir.KIND_BASE()+1;
+    if index>machine_ir.KIND_COUNT() { return 0; }
+    if machine_ir.kind_at(index)!=kind { return 0; }
+    return index;
+}
+// A KIND, ASKED FOR BY ITS NAME. machine_ir publishes kind_text(index) and
+// kind_name_of(kind), so a consumer can name a record without writing its
+// number down; and if the owner's table is ever renumbered or renamed, this
+// answers false and the record below is REFUSED instead of decoded as something
+// else. That is the property worth having: the coupling is to the vocabulary,
+// not to a literal.
+fn kind_is(words:buf<u64>,record:u64,name:buf<u8>)->bool {
+    let mut index:u64=kind_index(words,record);
+    if index==0 { return false; }
+    // A Nova buffer argument must NAME a buffer, so a call result is bound to
+    // a local first rather than passed inline. The compiler says so at the
+    // call site and the error lands four lines from the cause otherwise.
+    let mut got:buf<u8>=machine_ir.kind_text(index);
+    return same(got,name);
+}
+fn image_words(words:buf<u64>,count:u64)->u64 {
+    if count==0 { return 0; }
+    return machine_ir.HEADER_WORDS()+count*machine_ir.NODE_WORDS();
+}
+// ---- the pre-emission constraint check ------------------------------------
+//
+// report[0] record, [1] code, [2] opcode, [3] arg_count. Transactional: a
+// refusal reports the record it refused and nothing is emitted.
+fn place(report:buf<u64>,record:u64,code:u64,op:u64,taken:u64)->u64 {
+    report[0]=record;report[1]=code;report[2]=op;report[3]=taken;
+    return code;
+}
+// Is this record EXECUTABLE, i.e. does it have to become bytes? The answer is
+// asked of the owner's vocabulary rather than of a list held here: a record
+// that is a declaration contributes to the object and a record that is an
+// operation contributes to .text, and which is which is the IR's own
+// distinction (machine_ir.nova:2696-2740 gates arity per kind the same way).
+export fn constraints(words:buf<u64>,count:u64,report:buf<u64>)->u64 {
+    if len(report)<4 { return 800; }
+    if len(words)<image_words(words,count) { return 800; }
+    report[0]=0;report[1]=0;report[2]=0;report[3]=0;
+    if count==0 { return E_IMAGE(); }
+    // MIR/1.0 runtime cells, flag state and call effects belong to machine_emit.
+    // This legacy consumer cannot ignore them even on declaration/vreg records.
+    // Reject before selecting an opcode or writing any bytes.
+    let mut meta:u64=1;
+    while meta<=count {
+        if field(words,meta,20)!=0 || field(words,meta,21)!=0
+            || field(words,meta,22)!=0 || field(words,meta,23)!=0 {
+            return place(report,meta,E_FORM(),field(words,meta,14),field(words,meta,8));
+        }
+        meta=meta+1;
+    }
+    let mut executable:u64=0;
+    let mut record:u64=1;
+    while record<=count {
+        let mut index:u64=kind_index(words,record);
+        if index==0 { return place(report,record,E_IMAGE(),0,0); }
+        let mut name:buf<u8>=machine_ir.kind_text(index);
+        let mut op:u64=field(words,record,14);
+        // A Nova buffer argument must NAME a buffer, so every kind name this
+        // module compares against is bound to a local ONCE here rather than
+        // written as a literal at a dozen call sites. The literals are also
+        // the only spelling of the vocabulary in this file, which is
+        // deliberate: the NUMBERS are read out of machine_ir and only the
+        // NAMES are typed, so a renumbered owner cannot silently change what
+        // this module decodes.
+        let mut k_asm:buf<u8>="asm";
+        let mut k_return:buf<u8>="return";
+        let mut k_unreachable:buf<u8>="unreachable";
+        let mut k_call:buf<u8>="call";
+        let mut k_load:buf<u8>="load";
+        let mut k_store:buf<u8>="store";
+        let mut k_address:buf<u8>="address";
+        let mut k_binary:buf<u8>="binary";
+        let mut k_unary:buf<u8>="unary";
+        let mut k_convert:buf<u8>="convert";
+        let mut k_extend:buf<u8>="extend";
+        let mut k_truncate:buf<u8>="truncate";
+        let mut k_copy:buf<u8>="copy";
+        let mut k_select:buf<u8>="select";
+        let mut k_jump:buf<u8>="jump";
+        let mut k_branch:buf<u8>="branch";
+        let mut k_phi:buf<u8>="phi";
+        let mut taken:u64=field(words,record,8);
+        if same(name,k_asm)==true {
+            executable=executable+1;
+            if op>machine_ir.OP_LIMIT() { return place(report,record,E_OPCODE(),op,taken); }
+            if covered_op(op)==false { return place(report,record,E_OPCODE(),op,taken); }
+            // OP_NOP, OP_UNREACHABLE and OP_RET encode a ZERO-operand form,
+            // OP_CALL is emitted as its own `E8 rel32` sequence, and the fifth
+            // entry, OP_ADD, is the one covered opcode whose encoder takes
+            // operands at all: `x64_fixed.encode_ri` takes a destination
+            // register and an immediate (x64_fixed.nova:173) — NOT
+            // `encode_rr`, which takes two registers and encodes a DIFFERENT
+            // instruction; the measurement is in `encode_two`'s header.
+            // So this branch is no longer saying that every covered form is
+            // zero-operand. What it still says, and what is now the
+            // load-bearing sentence, is the next one: a record that carries
+            // operands is well formed and still unencodable, because this
+            // level names virtual values and holds no register assignment;
+            // that is E_REGISTER and not E_FORM.
+            //
+            // THIS IS THE SITE THAT REFUSES `add rax, 1`, and it is measured
+            // rather than inferred: for that body the report is
+            // [record=11, 963, opcode=2, operands=2], and replacing ONLY the
+            // `taken!=0` line below with a different code changes that 963 to
+            // that code. `encode_two` is not reached at all — replacing both
+            // of its returns with distinct codes leaves this 963 unchanged.
+            if taken!=0 { return place(report,record,E_REGISTER(),op,taken); }
+        }
+        if same(name,k_return)==true {
+            executable=executable+1;
+            if op!=machine_ir.OP_RET() { return place(report,record,E_OPCODE(),op,taken); }
+            if taken!=0 { return place(report,record,E_REGISTER(),op,taken); }
+        }
+        if same(name,k_unreachable)==true { executable=executable+1; }
+        if same(name,k_call)==true {
+            executable=executable+1;
+            // `aux` on a call record is the RESOLVED ARITY (machine_ir.nova:2015),
+            // not an opcode; the opcode is aux2. An arity above zero needs an
+            // argument register per argument, which is the same missing
+            // assignment E_REGISTER names, and a callee that is not a
+            // `mir_symbol` record is not a symbol at all.
+            if field(words,record,15)!=machine_ir.OP_CALL() {
+                return place(report,record,E_OPCODE(),field(words,record,15),taken);
+            }
+            if taken!=0 { return place(report,record,E_REGISTER(),machine_ir.OP_CALL(),taken); }
+            if field(words,record,5)==0 { return place(report,record,E_CALL(),machine_ir.OP_CALL(),taken); }
+        }
+        if same(name,k_load)==true || same(name,k_store)==true || same(name,k_address)==true {
+            executable=executable+1;
+            return place(report,record,E_MEMORY(),op,taken);
+        }
+        if same(name,k_binary)==true || same(name,k_unary)==true ||
+           same(name,k_convert)==true || same(name,k_extend)==true ||
+           same(name,k_truncate)==true || same(name,k_copy)==true ||
+           same(name,k_select)==true {
+            executable=executable+1;
+            return place(report,record,E_OPCODE(),op,taken);
+        }
+        if same(name,k_jump)==true || same(name,k_branch)==true || same(name,k_phi)==true {
+            executable=executable+1;
+            return place(report,record,E_CONTROL(),op,taken);
+        }
+        record=record+1;
+    }
+    report[0]=count;report[1]=0;report[2]=executable;report[3]=0;
+    return 0;
+}
+
+// ---- layout and emission --------------------------------------------------
+// Every covered record is emitted in ASCENDING RECORD ORDER, which is the
+// lowering order and therefore the block order: machine_ir.nova emits a
+// block's children under it (machine_ir.nova:1887 onward), so a record id
+// orders the program without this module owning a block layout.
+struct Emit {
+    text:buf<u8>, at:u64,
+    sites:buf<u64>, site_count:u64
+}
+// A record is emitted here if and only if `constraints` accepted the whole
+// image, so emission cannot meet a node the checker did not already clear.
+fn emit_record(e:Emit,words:buf<u64>,record:u64)->u64 {
+    let mut scratch:buf<u8>=alloc(runtime(),16);
+    let mut index:u64=kind_index(words,record);
+    if index==0 { rt_free(runtime(),scratch); return E_IMAGE(); }
+    let mut name:buf<u8>=machine_ir.kind_text(index);
+    // The same rule as in `constraints`: a buffer argument must name a
+    // buffer, so these four names are bound once. They are the same four
+    // literals, which is the point -- the two functions must decode a record
+    // the same way, and two independently typed vocabularies would be a way
+    // for the checker and the emitter to disagree about what a record is.
+    let mut k_asm:buf<u8>="asm";
+    let mut k_unreachable:buf<u8>="unreachable";
+    let mut k_return:buf<u8>="return";
+    let mut k_call:buf<u8>="call";
+    let mut op:u64=0;
+    if same(name,k_asm)==true { op=field(words,record,14); }
+    else if same(name,k_unreachable)==true { op=machine_ir.OP_UNREACHABLE(); }
+    else if same(name,k_return)==true { op=machine_ir.OP_RET(); }
+    else if same(name,k_call)==true {
+        // `E8 rel32`. The immediate is four zero bytes and the RELOCATION is
+        // what fills them in; emitting a placeholder and then resolving it here
+        // is what makes the call a relocatable call rather than a call to zero.
+        if len(e.text)<e.at+5 { rt_free(runtime(),scratch); return 800; }
+        e.text[e.at]=232;e.text[e.at+1]=0;e.text[e.at+2]=0;
+        e.text[e.at+3]=0;e.text[e.at+4]=0;
+        let mut site:u64=e.site_count*3;
+        e.sites[site]=record;e.sites[site+1]=e.at+1;e.sites[site+2]=0;
+        e.site_count=e.site_count+1;
+        e.at=e.at+5;
+        rt_free(runtime(),scratch);
+        return 0;
+    }
+    else { rt_free(runtime(),scratch); return 0; }
+    if covered_op(op)==false { rt_free(runtime(),scratch); return E_OPCODE(); }
+    // The operand COUNT decides the encoder, and it is the record's own field 8
+    // (machine_ir.nova:1931). A record with operands goes to the two-operand
+    // arm; one without goes to the zero-operand arm it always went to, so the
+    // four pre-existing entries take exactly the path they took before.
+    //
+    // OP_ADD IS THE EXCEPTION AND NOT A SPECIAL CASE, because it is the only
+    // covered opcode whose encoder takes operands at all: routing a
+    // zero-operand `add` to `encode_zero` would answer E_OPCODE there, AFTER
+    // `covered_op` had already said yes, and a checker and an emitter that
+    // disagree about one record is the defect this module's own header names.
+    let mut taken:u64=field(words,record,8);
+    let mut two:bool=(taken!=0)||(op==machine_ir.OP_ADD());
+    let mut code:u64=0;
+    if two==true {
+        // Fields 5 and 6 are the two operands and field 9 is the width of the
+        // first. They are VIRTUAL VALUE ids, and that is the whole of what is
+        // wrong with the three arguments below.
+        code=encode_two(op,field(words,record,5),field(words,record,6),
+                        field(words,record,9),scratch);
+    }
+    else { code=encode_zero(op,scratch); }
+    if code!=0 { rt_free(runtime(),scratch); return code; }
+    let mut length:u64=scratch[0];
+    if length==0 || len(e.text)<e.at+length { rt_free(runtime(),scratch); return 800; }
+    let mut i:u64=0;
+    while i<length { e.text[e.at+i]=scratch[i+1];i=i+1; }
+    e.at=e.at+length;
+    rt_free(runtime(),scratch);
+    return 0;
+}
+// Emit the whole image into `text`. Transactional in the sense that a refusal
+// reports through `report` and the caller must not use the buffer; the byte
+// count is returned through `length` ONLY on success, because a caller that
+// read a length after a refusal would be reading a prefix of a program that
+// does not exist.
+export fn emit_text(words:buf<u64>,count:u64,text:buf<u8>,length:buf<u64>,
+                    report:buf<u64>)->u64 {
+    if len(length)<1 || len(report)<4 { return 800; }
+    let mut verdict:u64=constraints(words,count,report);
+    if verdict!=0 { return verdict; }
+    let mut sites:buf<u64>=alloc(runtime(),count*3);
+    let mut e:Emit=Emit{text:text,at:0,sites:sites,site_count:0};
+    let mut record:u64=1;
+    let mut code:u64=0;
+    while record<=count && code==0 {
+        code=emit_record(e,words,record);
+        record=record+1;
+    }
+    if code!=0 { rt_free(runtime(),sites); return code; }
+    length[0]=e.at;
+    rt_free(runtime(),sites);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// THE OBJECT. The bytes go into the EXISTING NXO writer, ntasm_nxo.emit, and
+// this module writes no container of its own: the 240-byte header, the 64-byte
+// symbol record and the 40-byte relocation record are nxo.nova:227-278 and
+// object.c:110, and a second writer would be a second format.
+//
+// WHAT IS CARRIED, AND WHAT CANNOT BE:
+//
+//   SYMBOLS. Every `mir_symbol` record (kind 2057) carries a byte span into the
+//   SOURCE and becomes one NXO symbol. That is the whole of what the Machine IR
+//   names, and it is measured rather than assumed: `mir_function` (kind 2051)
+//   carries no span at all -- on `return42.ntasm` record 4 is
+//   `kind=2051 a=9 n=0 w=0`, and the function's name is nowhere in the image.
+//   A DEFINED FUNCTION IS THEREFORE NOT A SYMBOL THIS MODULE CAN EMIT, and the
+//   object it writes is a library object (entry 0) rather than an executable.
+//
+//   THE MODULE PREFIX IS NOT APPLIED. The C reference qualifies every name with
+//   its module (object_build.c:305) and sorts the table by the QUALIFIED name
+//   (x64_lower_nxo.nova:1352-1366 records what getting that sort key wrong cost:
+//   104 fixtures red). This module cannot, and the reason is IN THE IMAGE: the
+//   module's own `mir_symbol` span is the whole `module NAME` DECLARATION and
+//   not the name -- on `zero.nova` record 2 is `a=0 b=9` over `module n`. The
+//   name is inside that span and no word says where it starts. So the names
+//   here are the raw spans and the table is sorted by those. THAT IS WHY THE
+//   OBJECT DOES NOT CONVERGE WITH THE REFERENCE, and naming the reason is worth
+//   more than a prefix guessed from the seventh byte of a declaration.
+//
+//   RELOCATIONS. A `mir_call` record carries its callee as a `mir_symbol` record
+//   id (machine_ir.nova:1993). The call's immediate OFFSET is not in the image
+//   and cannot be: it is a block-layout fact, and this module is what performs
+//   the layout. So the site is recorded HERE, at emission, and the REL32 a
+//   `mir_call` produces is as IR-driven as the opcode beside it -- corrupt the
+//   call's callee link and the relocation stops resolving.
+// ---------------------------------------------------------------------------
+fn span_before(source:buf<u8>,a:u64,alen:u64,b:u64,blen:u64)->bool {
+    let mut i:u64=0;
+    while i<alen && i<blen {
+        if source[a+i]!=source[b+i] { return source[a+i]<source[b+i]; }
+        i=i+1;
+    }
+    return alen<blen;
+}
+fn named(words:buf<u64>,record:u64,want:buf<u8>)->bool {
+    let mut index:u64=kind_index(words,record);
+    if index==0 { return false; }
+    let mut got:buf<u8>=machine_ir.kind_text(index);
+    return same(got,want);
+}
+fn is_symbol(words:buf<u64>,record:u64)->bool {
+    let mut want:buf<u8>="symbol";
+    return named(words,record,want);
+}
+fn is_call(words:buf<u64>,record:u64)->bool {
+    let mut want:buf<u8>="call";
+    return named(words,record,want);
+}
+export fn build_object(words:buf<u64>,count:u64,source:buf<u8>,out:buf<u8>,
+                       length:buf<u64>,report:buf<u64>)->u64 {
+    if len(length)<1 || len(report)<4 { return 800; }
+    let mut verdict:u64=constraints(words,count,report);
+    if verdict!=0 { return verdict; }
+    // Two passes over the image rather than one pass with a growable table:
+    // the record count is an upper bound on both, and a growable table would
+    // cost an allocator this module would then have to get wrong.
+    let mut symbols_n:u64=0;
+    let mut calls_n:u64=0;
+    let mut scan:u64=1;
+    while scan<=count {
+        if is_symbol(words,scan)==true { symbols_n=symbols_n+1; }
+        if is_call(words,scan)==true { calls_n=calls_n+1; }
+        scan=scan+1;
+    }
+    // The text, with the call sites recorded as it goes.
+    let mut text:buf<u8>=alloc(runtime(),count*16+16);
+    let mut sites:buf<u64>=alloc(runtime(),count*3+3);
+    let mut e:Emit=Emit{text:text,at:0,sites:sites,site_count:0};
+    let mut code:u64=0;
+    let mut record:u64=1;
+    while record<=count && code==0 {
+        code=emit_record(e,words,record);
+        record=record+1;
+    }
+    if code!=0 { rt_free(runtime(),text); rt_free(runtime(),sites); return code; }
+    // The symbol table, in canonical NAME order. `order` holds record ids and
+    // `table` the eight object words per symbol.
+    let mut order:buf<u64>=alloc(runtime(),symbols_n*8+8);
+    let mut table:buf<u64>=alloc(runtime(),symbols_n*8+8);
+    let mut strings:buf<u8>=alloc(runtime(),symbols_n*1024+1024);
+    let mut cursor:u64=0;
+    let mut placed:u64=0;
+    // WHICH SYMBOLS BECOME OBJECT SYMBOLS, and the answer is not "every
+    // `mir_symbol`". nxo.nova:129 requires a symbol that is not an import to
+    // name a section, an offset and a non-zero size, and a `mir_symbol` that
+    // no `mir_call` names has none of those three: it is the MODULE's own name
+    // or a LABEL's name, and the Machine IR gives it no home. A symbol no call
+    // names is therefore NOT emitted, and a symbol a call names is an
+    // UNDEFINED reference -- flags IMPORT|FUNCTION, section 0 -- which is
+    // exactly what nxo.nova:135-139 describes and what object.h:9 calls it.
+    // The alternative, emitting the module name as a section-1 function, would
+    // be a symbol the reference never writes.
+    record=1;
+    while record<=count {
+        if is_call(words,record)==true {
+            let mut callee:u64=field(words,record,5);
+            let mut j:u64=0;
+            let mut known:bool=false;
+            while j<placed {
+                if order[j]==callee { known=true; }
+                j=j+1;
+            }
+            if known==false {
+                // The callee is named by a symbol record. Add it now.
+                let mut start:u64=field(words,callee,5);
+                let mut stop:u64=field(words,callee,6);
+                let mut nlen:u64=0;
+                if start>stop || stop>len(source) { code=E_IMAGE(); }
+                else { nlen=stop-start; }
+                if code==0 && (nlen==0 || nlen>512) { code=E_IMAGE(); }
+                if code==0 {
+                    let mut cbase:u64=cursor+nlen;
+                    let mut tail:buf<u8>=";mir=0.1;";
+                    let mut tlen:u64=len(tail);
+                    let mut j2:u64=0;
+                    while j2<nlen { strings[cursor+j2]=source[start+j2];j2=j2+1; }
+                    let mut k2:u64=0;
+                    while k2<tlen { strings[cbase+k2]=tail[k2];k2=k2+1; }
+                    let mut at_o:u64=placed;
+                    while at_o>0 {
+                        let mut prev:u64=order[at_o-1];
+                        let mut ps:u64=field(words,prev,5);
+                        let mut pe:u64=field(words,prev,6);
+                        if span_before(source,ps,pe-start,start,stop)==true { break; }
+                        order[at_o]=prev;
+                        let mut w:u64=0;
+                        while w<8 { table[at_o*8+w]=table[(at_o-1)*8+w];w=w+1; }
+                        at_o=at_o-1;
+                    }
+                    order[at_o]=callee;
+                    let mut t:u64=at_o*8;
+                    table[t]=cursor;table[t+1]=nlen;
+                    table[t+2]=0;table[t+3]=10;table[t+4]=0;table[t+5]=0;
+                    table[t+6]=cbase;table[t+7]=tlen;
+                    cursor=cbase+tlen;
+                    placed=placed+1;
+                }
+            }
+        }
+        record=record+1;
+    }
+    if code!=0 {
+        rt_free(runtime(),text);rt_free(runtime(),sites);rt_free(runtime(),order);
+        rt_free(runtime(),table);rt_free(runtime(),strings);
+        return code;
+    }
+    // The relocation table, ascending by site as object.c:97 demands. Each
+    // TARGET is the one-based index of the symbol the call record NAMED, so the
+    // table is a projection of the image and not a reconstruction of it.
+    let mut relocs:buf<u64>=alloc(runtime(),calls_n*5+5);
+    let mut rcount:u64=0;
+    let mut j:u64=0;
+    while j<e.site_count && code==0 {
+        let mut callee:u64=field(words,e.sites[j*3],5);
+        let mut target:u64=0;
+        let mut s:u64=0;
+        while s<placed {
+            if order[s]==callee { target=s+1; }
+            s=s+1;
+        }
+        if target==0 { code=E_CALL(); }
+        else {
+            let mut r:u64=rcount*5;
+            relocs[r]=1;relocs[r+1]=1;relocs[r+2]=e.sites[j*3+1];
+            relocs[r+3]=target;relocs[r+4]=0;
+            rcount=rcount+1;
+            j=j+1;
+        }
+    }
+    if code!=0 {
+        rt_free(runtime(),text);rt_free(runtime(),sites);rt_free(runtime(),order);
+        rt_free(runtime(),table);rt_free(runtime(),strings);rt_free(runtime(),relocs);
+        return code;
+    }
+    // The string table and the relocation table are handed to the writer at
+    // their EXACT sizes. nxo.nova:129 ends the symbol loop with
+    // `cursor != len(strings) -> 800` and takes the relocation count as
+    // `len(r)/5`, so an over-allocated scratch buffer is not slack -- it is a
+    // malformed object, because the writer has no way to know how much of it
+    // is live. The copies are the price of an allocation whose size is only
+    // known after the scan.
+    let mut exact:buf<u8>=alloc(runtime(),cursor);
+    let mut z:u64=0;
+    while z<cursor { exact[z]=strings[z];z=z+1; }
+    let mut usedr:buf<u64>=alloc(runtime(),rcount*5);
+    // The .text section is handed over at its EXACT size for the same reason:
+    // ntasm_nxo.emit takes the section length from len(object.text), so the
+    // over-allocated scratch buffer would emit its own slack as code.
+    let mut exact_text:buf<u8>=alloc(runtime(),e.at);
+    let mut z3:u64=0;
+    while z3<e.at { exact_text[z3]=text[z3];z3=z3+1; }
+
+    let mut z2:u64=0;
+    while z2<rcount*5 { usedr[z2]=relocs[z2];z2=z2+1; }
+    // `entry` is 0 and that is a FACT, not a default: nxo.nova reads entry 0 as
+    // a library, and the PE conversion refuses an entryless object at
+    // nxo_pe.nova:33. There is no `main` symbol to point at, because the
+    // Machine IR does not name the function it defines.
+    // rdata and data are SEPARATE buffers even though both are empty. Sharing
+    // one handle makes the object name a single allocation twice, and
+    // ntasm_nxo.release frees text, rdata and data BY HANDLE -- two names for
+    // one allocation is a double free, which the host reports as
+    // NV2_LIFETIME. The first version of this passed one buffer for both and
+    // measured exactly that.
+    let mut rdata:buf<u8>=alloc(runtime(),0);
+    let mut data:buf<u8>=alloc(runtime(),0);
+    let mut used:buf<u64>=alloc(runtime(),placed*8);
+    let mut k:u64=0;
+    while k<placed*8 { used[k]=table[k];k=k+1; }
+    let object:ntasm_nxo.Object=ntasm_nxo.Object{
+        target:1,entry:0,text:exact_text,rdata:rdata,data:data,
+        symbols:used,relocations:usedr,strings:exact};
+    let result:ntasm_nxo.WriteResult=ntasm_nxo.emit(object);
+    let mut copied:u64=0;
+    if result.code==0 {
+        if len(out)<len(result.bytes) { copied=0; }
+        else {
+            let mut b:u64=0;
+            while b<len(result.bytes) { out[b]=result.bytes[b];b=b+1; }
+            copied=len(result.bytes);
+        }
+    }
+    length[0]=copied;
+    // The six buffers are freed HERE, once each, and ntasm_nxo.release is NOT
+    // called. nxo.nova:157-163 frees text, rdata, data, symbols, relocations
+    // and strings AND THEN frees `object` again -- which is the rdata handle a
+    // second time, so `release` double-frees on any object whose rdata is a
+    // real allocation. That is a defect in a module this lot does not own, so
+    // it is NAMED here rather than worked around in silence: a reader who
+    // wants the fix wants it in nxo.nova, not in a caller's cleverness.
+    rt_free(runtime(),text);rt_free(runtime(),sites);rt_free(runtime(),order);
+    rt_free(runtime(),table);rt_free(runtime(),strings);rt_free(runtime(),relocs);
+    rt_free(runtime(),used);rt_free(runtime(),rdata);rt_free(runtime(),data);
+    rt_free(runtime(),exact);rt_free(runtime(),usedr);
+    rt_free(runtime(),exact_text);
+    return result.code;
+}

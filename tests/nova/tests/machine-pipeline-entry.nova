@@ -1,0 +1,266 @@
+module machine_pipeline_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import ntasm_lexer;
+import ntir;
+import machine_ir;
+import ntasm_macro_splice;
+import ntasm_nxo;
+import ntasm_nxo_pe;
+import machine_pipeline;
+import machine_emit;
+
+// The C-callable entry for machine_pipeline. One entry, several modes, and the
+// split between them is the point: mode 3 puts the Machine IR into the CALLER's
+// buffer and modes 4, 5 and 6 take an image that is already there, so a caller
+// can damage the image between the two and drive the emission with damaged
+// input. Nothing below parses the source on those modes, which is what makes
+// them evidence about the image rather than about the text.
+//
+//   mode 0  the VOCABULARY. Writes this module's own constants into `words`, not
+//           into `report`: there are two refusal codes, TEN stages, the report
+//           width and two owner pins, and fourteen report words do not hold
+//           them. A gate with its own literals can only say they agree today;
+//           this can say they are the same words.
+//   mode 1  machine_pipeline.build_object:    source -> NXO container
+//   mode 2  machine_pipeline.build_pe:        source -> PE container
+//   mode 3  machine_pipeline.lower:           source -> Machine IR in `words`
+//   mode 4  machine_pipeline.build_object_from_image: image in `words` -> NXO
+//   mode 5  machine_pipeline.build_pe_from_image:     image in `words` -> PE
+//   mode 6  mode 4, after damaging `words` by `index`. The damage is applied
+//           HERE, in the caller-visible buffer, so what the pipeline reads is
+//           what the gate damaged.
+//   mode 7  mode 5, after the same damage: the executable image follows the
+//           Machine IR too, not only the object.
+//   mode 8  machine_pipeline.effective_text: the text the expansion PRODUCED,
+//           copied into `out`. The buffer belongs to the splice and dies inside
+//           the call, so a caller has the bytes and not the pointer. This is the
+//           mode that says the expansion happened, as opposed to the modes that
+//           say a program was produced.
+//   mode 9  machine_pipeline.lower_tree, called on its own: parse, expand ONCE,
+//           and hand the DEVELOPED tree to the exported seam, which validates
+//           nothing and owns nothing.
+//
+// The perturbations, and the predicate of the image each one attacks. Three
+// words of the image that three different readers own, chosen so that none of
+// them can pass by accident and so that no one of them needs to know anything
+// about the particular program:
+//
+//   0  none. THE CANARY: it must reproduce the undamaged run exactly, or the
+//      machinery below is perturbing something other than what it names.
+//   1  the record count. Every walk in the backend is bounded by it, so
+//      dropping the last record must either change the emitted bytes or refuse.
+//   2  the KIND of the DEFINED FUNCTION record, set to the base kind. The
+//      backend looks that record up BY NAME, so a record that stops being what
+//      it was loses the entry symbol and the object becomes a library -- which
+//      the PE conversion refuses at 803. The first version of this
+//      perturbation set the kind of RECORD 2 and measured nothing at all: 336
+//      bytes before and 336 after, because record 2 is a `mir_target` here and
+//      no reader on the object path asks what kind it is. A control that cannot
+//      be read is a green row, and the difference is invisible in the report.
+//   3  the DEFINED FUNCTION's name span, pushed past the end of the source.
+//      The object writer checks a span it reads out of the image against
+//      len(source) before it copies a single byte of a name.
+//
+// A MAGIC-WORD perturbation is deliberately absent. machine_emit reads the image
+// through its own field accessor and never compares the tag, so corrupting word
+// 0 on this path would be a perturbation that provably cannot be read, and a
+// control that cannot be read measures nothing. The tag IS read, by
+// machine_ir.verify, which is on the source path rather than this one.
+
+// THE FUNCTION KIND, TAKEN FROM THE OWNER'S VOCABULARY and not written down.
+// machine_ir publishes KIND_COUNT, kind_at(index) and kind_text(index), so the
+// number is found by asking the table which index is named `function` -- the
+// same three steps machine_x64's own `named()` takes (machine_emit, the
+// emitter on this path since 6 October 2026, asks by kind number), and one
+// fewer literal.
+fn function_kind()->u64 {
+    let mut i:u64=1;
+    let mut want:buf<u8>="function";
+    while i<=machine_ir.KIND_COUNT() {
+        let mut got:buf<u8>=machine_ir.kind_text(i);
+        let mut j:u64=0;
+        let mut same:bool=len(got)==len(want);
+        while same==true && j<len(want) {
+            if got[j]!=want[j] { same=false; }
+            j=j+1;
+        }
+        if same==true { return machine_ir.kind_at(i); }
+        i=i+1;
+    }
+    return 0;
+}
+
+fn field(words:buf<u64>,record:u64,at:u64)->u64 {
+    return words[machine_ir.HEADER_WORDS()+(record-1)*machine_ir.NODE_WORDS()+at];
+}
+
+
+// The record the object writer looks up by name, or 0. Found through
+// machine_ir's own kind vocabulary rather than by a literal, so a renumbered
+// kind table moves this with it instead of making the perturbation write into
+// whatever record happens to sit at the number.
+fn find_function(words:buf<u64>,count:u64)->u64 {
+    let want:u64=function_kind();
+    if want==0 { return 0; }
+    let mut record:u64=1;
+    let mut found:u64=0;
+    while record<=count {
+        if field(words,record,0)==want { found=record; }
+        record=record+1;
+    }
+    return found;
+}
+// Damages `words` in place. Returns 0, or 800 when the perturbation does not
+// apply to this image -- which is a fact about the IMAGE and not a failure, and
+// the gate is told through the return value rather than through a quiet no-op.
+fn damage(words:buf<u64>,count:u64,source:buf<u8>,index:u64)->u64 {
+    if index==0 { return 0; }
+    if count==0 { return 800; }
+    if index==1 {
+        if count<2 { return 800; }
+        words[3]=count-1;
+        return 0;
+    }
+    if index==2 {
+        let found:u64=find_function(words,count);
+        if found==0 { return 800; }
+        // The KIND of the record the object writer looks up BY NAME. The first
+        // version of this perturbation set the kind of RECORD 2 instead, and it
+        // measured nothing: 336 bytes before and 336 bytes after, same code,
+        // same report. Record 2 is a `mir_target` on this corpus, and no reader
+        // on the object path asks what kind it is, so the perturbation was a
+        // perturbation of a word nobody reads. A control that cannot be read is
+        // not a control -- it is a green row, and the difference between those
+        // two is invisible in the report.
+        field_set(words,found,0,machine_ir.KIND_BASE());
+        return 0;
+    }
+    if index==3 {
+        let found:u64=find_function(words,count);
+        if found==0 { return 800; }
+        // arg_b, which the object writer reads as the name's first byte. Past
+        // the end of the source on purpose: `stop>len(source)` and `start>stop`
+        // are both checked before a byte is copied, so this must refuse rather
+        // than read.
+        field_set(words,found,6,len(source)+8);
+        return 0;
+    }
+    return 800;
+}
+
+fn field_set(words:buf<u64>,record:u64,at:u64,value:u64)->u64 {
+    words[machine_ir.HEADER_WORDS()+(record-1)*machine_ir.NODE_WORDS()+at]=value;
+    return 0;
+}
+
+// A signature written on one line stops parsing when the line gets long and the
+// error lands far from the cause, so this one is split in two.
+export fn main(source:buf<u8>,mode:u64,index:u64,words:buf<u64>,
+        words_count:u64,out:buf<u8>,out_count:u64,length:buf<u64>,
+        report:buf<u64>)->u64 {
+    if len(report)<machine_pipeline.REPORT_WORDS() { return 800; }
+    if len(length)<1 { return 800; }
+    length[0]=0;
+    let mut i:u64=0;
+    while i<machine_pipeline.REPORT_WORDS() { report[i]=0; i=i+1; }
+    if mode==0 {
+        // The vocabulary goes into `words`, not into `report`: there are two
+        // refusal codes, TEN stages, the report width and two owner pins, and
+        // thirteen report words were not going to hold them without one of them
+        // being dropped. `words` is a scratch buffer the caller already lends
+        // for the image, it is far larger, and putting the vocabulary somewhere
+        // the module does not also write removes a collision rather than
+        // tolerating one.
+        let mut k:u64=0;
+        while k<16 { words[k]=0; k=k+1; }
+        words[0]=machine_pipeline.E_OUTPUT();
+        words[1]=machine_pipeline.E_BOUND();
+        words[2]=machine_pipeline.STAGE_PARSE();
+        words[3]=machine_pipeline.STAGE_EXPAND();
+        words[4]=machine_pipeline.STAGE_VALIDATE();
+        words[5]=machine_pipeline.STAGE_NTIR();
+        words[6]=machine_pipeline.STAGE_LOWER();
+        words[7]=machine_pipeline.STAGE_VERIFY();
+        words[8]=machine_pipeline.STAGE_OBJECT();
+        words[9]=machine_pipeline.STAGE_READ();
+        words[10]=machine_pipeline.STAGE_LINK();
+        words[11]=machine_pipeline.STAGE_DELIVER();
+        words[12]=machine_pipeline.REPORT_WORDS();
+        // The two owners' own pins, published beside this module's own, so a
+        // gate can see that the image it damages and the container it reads back
+        // were produced under the versions this tree carries.
+        words[13]=machine_ir.version_pin();
+        words[14]=ntasm_nxo.FORMAT_VERSION();
+        return 0;
+    }
+    if mode==8 {
+        // THE EFFECTIVE TEXT, published so a macro test can compare what the
+        // expansion produced rather than inferring it. The buffer belongs to the
+        // splice and is released inside the call, so the caller has the BYTES and
+        // not the pointer -- which is why this mode hands them out through `out`.
+        return machine_pipeline.effective_text(source,out,length,report);
+    }
+    if mode==9 {
+        // THE lower_tree SEAM, called directly: parse, expand ONCE, and hand the
+        // DEVELOPED tree to `machine_pipeline.lower_tree`, which validates
+        // nothing and owns nothing. A gate that only ever reached the image
+        // through `lower` would be testing one private chain and calling it a
+        // public API; this mode is the API on its own.
+        let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+        if tree.ok==false { ntasm_ast.release(tree); return 800; }
+        let mut scratch:buf<u64>=alloc(runtime(),6);
+        let mut q:u64=0;
+        while q<6 { scratch[q]=0; q=q+1; }
+        let s:ntasm_macro_splice.Splice=ntasm_macro_splice.blank_splice(source,tree);
+        let mut code:u64=ntasm_macro_splice.expand_stage(s,scratch);
+        if code==0 {
+            let unit:ntasm_ast.Tree=ntasm_macro_splice.unit_of(s);
+            code=machine_pipeline.lower_tree(s.text,unit,words,words_count,report);
+        }
+        ntasm_macro_splice.splice_release(s);
+        ntasm_ast.release(tree);
+        rt_free(runtime(),scratch);
+        return code;
+    }
+    if mode==3 {
+        return machine_pipeline.lower(source,words,words_count,report);
+    }
+    if mode==11 {
+        // THE IMAGE AS TEXT, through `machine_ir`'s own serializer. A refusal
+        // that names a code and no record leaves the reader to re-derive where
+        // the record was, and this mode is what turns "the image is valid" into
+        // "and here is the record that says so".
+        if len(words)<machine_ir.HEADER_WORDS() { return 800; }
+        return machine_ir.serialize(words,words[3],out,length);
+    }
+    if len(words)<machine_ir.HEADER_WORDS() { return 800; }
+    if mode==6 {
+        let mut hurt:u64=damage(words,words[3],source,index);
+        if hurt!=0 { return hurt; }
+        return machine_pipeline.build_object_from_image(words,words[3],source,out,length,report);
+    }
+    if mode==7 {
+        // The same damage, then the PE path. Mode 6 shows that a damaged image
+        // stops or changes the OBJECT; mode 7 shows the same for the executable
+        // image, which is the claim worth making -- that the PE is a function of
+        // the Machine IR and not of the text beside it.
+        let mut hurt:u64=damage(words,words[3],source,index);
+        if hurt!=0 { return hurt; }
+        return machine_pipeline.build_pe_from_image(words,words[3],source,out,length,report);
+    }
+    if mode==4 {
+        return machine_pipeline.build_object_from_image(words,words[3],source,out,length,report);
+    }
+    if mode==5 {
+        return machine_pipeline.build_pe_from_image(words,words[3],source,out,length,report);
+    }
+    if mode==1 {
+        return machine_pipeline.build_object(source,out,length,report);
+    }
+    if mode==2 {
+        return machine_pipeline.build_pe(source,out,length,report);
+    }
+    return 800;
+}

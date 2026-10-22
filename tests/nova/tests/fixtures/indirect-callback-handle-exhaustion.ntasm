@@ -1,0 +1,53 @@
+module callback.native
+target x86_64-nexora-uefi
+default_abi efi-x64-v0
+section .text {
+export fn main(in ctx:u64,in a:u64,in b:u64,in c:u64)->u64
+effects {reads_mem(user),writes_mem(user),changes_flags}
+clobbers {rax,rcx,rdx,r8,r9,r10,r11,rflags} {
+mov r10,rsp
+and r10,15
+cmp r10,8
+jne bad
+mov r11,0x123456789abcdef0
+mov r10,rsp
+add r10,8
+store [r10]:ptr<user,u64>,r11
+add r10,8
+store [r10]:ptr<user,u64>,r11
+add r10,8
+store [r10]:ptr<user,u64>,r11
+add r10,8
+store [r10]:ptr<user,u64>,r11
+mov r10,rcx
+add r10,16
+mov r11,1
+store [r10]:ptr<user,u64>,r11
+mov r10,rcx
+add r10,8
+load r11,[r10]:ptr<user,u64>
+add r11,1
+store [r10]:ptr<user,u64>,r11
+load rax,[rcx]:ptr<user,u64>
+add rax,rdx
+add rax,r8
+add rax,r8
+add rax,r8
+add rax,r9
+add rax,r9
+add rax,r9
+add rax,r9
+add rax,r9
+add rax,r9
+add rax,r9
+mov rcx,0
+mov rdx,0
+mov r8,0
+mov r9,0
+mov r10,0xaaaaaaaaaaaaaaaa
+mov r11,0xbbbbbbbbbbbbbbbb
+return rax;
+bad:
+return 2989;
+}
+}

@@ -1,0 +1,10 @@
+module native_runtime_stale;
+// Expected return0/error7; a live child cannot keep a freed parent alive.
+fn main()->u64 {
+    let owner:buf<u8>=alloc(runtime(),4);
+    let child:buf<u8>=slice(owner,1,2);
+    owner[1]=42;
+    rt_free(runtime(),owner);
+    return u64(child[0]);
+}
+

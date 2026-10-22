@@ -1,0 +1,348 @@
+module register_widths;
+
+import ntasm_ast;
+
+// Node kinds: import 9, function declaration 18, parameter 19.
+
+// Byte-wise comparison over the real source text with bounds.
+fn same_bytes(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Direct child of parent at the given ordinal, or 0 when the chain or
+// the tree is invalid.
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let p:ntasm_ast.Node=ntasm_ast.node_at(tree,parent);
+    let mut id:u64=p.first_child;
+    let mut index:u64=0;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        id=n.next_sibling;
+        index=index+1;
+    }
+    if id>tree.node_count { return 0; }
+    return id;
+}
+
+// Width in bits of a machine scalar type spelled exactly as
+// u8/u16/u32/u64 or i8/i16/i32/i64, the closed integer catalog of
+// the v0 scalar types. Returns 0 when the span spells none of them,
+// so bool, never and the composite forms stay out of the width rule.
+fn type_width(source:buf<u8>,start:u64,end:u64)->u64 {
+    let n:u64=end-start;
+    if n==2 {
+        if (source[start]==117 || source[start]==105)
+           && source[start+1]==56 { return 8; }
+        return 0;
+    }
+    if n==3 && (source[start]==117 || source[start]==105) {
+        if source[start+1]==49 && source[start+2]==54 { return 16; }
+        if source[start+1]==51 && source[start+2]==50 { return 32; }
+        if source[start+1]==54 && source[start+2]==52 { return 64; }
+    }
+    return 0;
+}
+
+// Width in bits of a register spelled exactly as the frontend does:
+// 64-bit rax..r15/rip, 32-bit eax..r15d, 16-bit ax..r15w,
+// 8-bit al/cl/dl/bl/spl/bpl/sil/dil/r8b..r15b/ah/ch/dh/bh.
+// Returns 0 for any other spelling.
+fn register_width(source:buf<u8>,start:u64,end:u64)->u64 {
+    let n:u64=end-start;
+    if n==2 {
+        let b0:u64=source[start];
+        let b1:u64=source[start+1];
+        // r8, r9 are the only two-letter r-registers.
+        if b0==114 {
+            if b1==56 || b1==57 { return 64; }
+            return 0;
+        }
+        // x: ax,bx,cx,dx,si? no; second letter decides.
+        if b1==108 { return 8; }  // al,cl,dl,bl
+        if b1==104 { return 8; }  // ah,ch,dh,bh
+        if b1==120 { return 16; } // ax,bx,cx,dx
+        if b1==105 { return 16; } // si,di
+        if b1==112 { return 16; } // bp,sp
+        return 0;
+    }
+    if n==3 {
+        let b0:u64=source[start];
+        let b1:u64=source[start+1];
+        let b2:u64=source[start+2];
+        if b0==114 {
+            // r10..r15 (64-bit), r8d/r8w/r8b style, rax..rdx, rsi/rdi,
+            // rbp/rsp, rip.
+            if b1==49 {
+                if b2>=48 && b2<=53 { return 64; }
+                return 0;
+            }
+            if b1==56 || b1==57 {
+                if b2==100 { return 32; }
+                if b2==119 { return 16; }
+                if b2==98 { return 8; }
+                return 0;
+            }
+            if b2==120 { return 64; } // rax,rbx,rcx,rdx
+            if b2==105 { return 64; } // rip,rsi,rdi
+            if b2==112 { return 64; } // rbp,rsp
+            return 0;
+        }
+        // eax..edx, esi,edi,ebp,esp, spl,bpl,sil,dil, ah,ch,dh,bh.
+        if b2==120 { return 32; } // eax,ebx,ecx,edx
+        if b2==105 { return 32; } // esi,edi,sil,dil
+        if b2==112 { return 32; } // ebp,esp
+        if b2==108 { return 8; }  // spl,bpl
+        if b2==104 { return 8; }  // ah,ch,dh,bh
+        return 0;
+    }
+    if n==4 {
+        // r10b..r15b, r10w..r15w, r10d..r15d.
+        if source[start]==114 && source[start+1]==49
+           && source[start+2]>=48 && source[start+2]<=53 {
+            if source[start+3]==98 { return 8; }
+            if source[start+3]==119 { return 16; }
+            if source[start+3]==100 { return 32; }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+export fn width(source:buf<u8>,start:u64,end:u64)->u64 {
+    if start>end || end>len(source) { return 0; }
+    return register_width(source,start,end);
+}
+
+// Stable physical REGISTER family for the explicit x86_64 aliases used by
+// parameter bindings and operand decoding. Zero means that this pass does not know
+// the spelling; callers then retain their byte-wise comparison behaviour.
+//
+// This is deliberately closed over the sixteen GPRs and it must stay closed. It
+// answers a register question, so every value it returns has an operand width in
+// register_width and a slot in the encoder. rflags is the name that would break
+// it: the oracle gives rflags a family and a width of 64, but no instruction in
+// this language names rflags as an operand, and what honours an rflags clobber is
+// codegen.c:1277 dropping the pushfq/popfq pair, not a register slot. Adding it
+// here would silently hand a seventeenth to the six decoders that read this
+// function for an operand: abi.nova:218 and :357, body_clobbers.nova:42 and :54,
+// register_bindings.nova:100 and :102, x64_lower_fixed.nova:41, :117, :128, :391,
+// :413 and :419. None of them has an answer for a register that is never an
+// operand. The clobber question has its own table, clobber_bit below, and this
+// one stays sixteen wide.
+export fn family(source:buf<u8>,start:u64,end:u64)->u64 {
+    if start>end || end>len(source) { return 0; }
+    let n:u64=end-start;
+    if n==2 {
+        let b0:u64=source[start];
+        let b1:u64=source[start+1];
+        if b0==97 && (b1==120 || b1==108 || b1==104) { return 1; } // ax, al
+        if b0==99 && (b1==120 || b1==108 || b1==104) { return 2; } // cx, cl
+        if b0==100 && (b1==120 || b1==108 || b1==104) { return 3; } // dx, dl
+        if b0==98 && (b1==120 || b1==108 || b1==104) { return 4; } // bx, bl
+        if b0==115 && b1==112 { return 5; } // sp
+        if b0==98 && b1==112 { return 6; } // bp
+        if b0==115 && b1==105 { return 7; } // si
+        if b0==100 && b1==105 { return 8; } // di
+        if b0==114 && b1==56 { return 9; }  // r8
+        if b0==114 && b1==57 { return 10; } // r9
+        return 0;
+    }
+    if n==3 {
+        let b0:u64=source[start];
+        let b1:u64=source[start+1];
+        let b2:u64=source[start+2];
+        if b2==120 {
+            if (b0==114 || b0==101) && b1==97 { return 1; } // rax,eax
+            if (b0==114 || b0==101) && b1==99 { return 2; } // rcx,ecx
+            if (b0==114 || b0==101) && b1==100 { return 3; } // rdx,edx
+            if (b0==114 || b0==101) && b1==98 { return 4; } // rbx,ebx
+        }
+        if b2==112 {
+            if (b0==114 || b0==101) && b1==115 { return 5; } // rsp,esp
+            if (b0==114 || b0==101) && b1==98 { return 6; }  // rbp,ebp
+        }
+        if b2==105 {
+            if (b0==114 || b0==101) && b1==115 { return 7; } // rsi,esi
+            if (b0==114 || b0==101) && b1==100 { return 8; } // rdi,edi
+        }
+        if b2==108 {
+            if b0==115 && b1==112 { return 5; } // spl
+            if b0==98 && b1==112 { return 6; }  // bpl
+            if b0==115 && b1==105 { return 7; } // sil
+            if b0==100 && b1==105 { return 8; } // dil
+        }
+        if b0==114 && (b1==56 || b1==57)
+           && (b2==100 || b2==119 || b2==98) {
+            if b1==56 { return 9; }
+            return 10;
+        }
+        if b0==114 && b1==49 && b2>=48 && b2<=53 {
+            return 11+(b2-48); // r10..r15
+        }
+        return 0;
+    }
+    if n==4 && source[start]==114 && source[start+1]==49
+       && source[start+2]>=48 && source[start+2]<=53
+       && (source[start+3]==100 || source[start+3]==119
+           || source[start+3]==98) {
+        return 11+(source[start+2]-48); // r10d/w/b .. r15d/w/b
+    }
+    return 0;
+}
+
+// The bit of a caller's clobber mask that one clobbers-set entry charges, or
+// 0 when the spelling names no clobber family at all.
+//
+// THE RULE THIS STATES. A family is a clobber when, and only when, naming it
+// sets a bit in the mask the caller has to honour. The oracle says it three
+// times and never in terms of a family number: frontend.c:1866 refuses a name
+// nt_frontend_register does not know, frontend.c:1874 refuses a name whose bit
+// is already set, frontend.c:1880 sets it. codegen.c:1277 then reads one bit
+// out of the mask to pick the frame. So every rule over a clobbers set has to
+// be stated over bits. Stated over family numbers instead, the rules are right
+// exactly as long as the family numbering is dense from zero, which is why they
+// all look correct over the sixteen GPRs and all break together on the
+// seventeenth. clobbers.nova states its two rules over this function for that
+// reason: unknown is "no bit", duplicate is "this bit already set".
+//
+// WHY rflags IS NOT family() PLUS ONE. The oracle's family space is sparse:
+// 0..15 the GPRs, 16 rip, 17 rflags, 18 gsbase, 19 fsbase (frontend.c:755-775).
+// clobber_bit returns the BIT, not the family, so the gap cannot be papered
+// over. Six GPRs answer 1<<(family-1), which is right because their families
+// are 0..15. rflags answers 1<<17 because that is the bit the oracle reads.
+// 131072 is therefore a COUPLING to frontend.c:769
+//     if (!strcmp(s, "rflags")) return (NtFRegister){17, 64, 0};
+// consumed at codegen.c:1277
+//     g->preserve_flags = !(f->clobbers & (UINT64_C(1) << 17));
+// and not a constant of this module: if the oracle ever moves rflags, this
+// literal is wrong and this function is wrong with it. Architectural clobber
+// bits are sparse: rip16, rflags17, gsbase18, fsbase19. These declarations are
+// carried by MIR/NXO and call checks; they do not create GPR operand encodings.
+// Unknown or qualified spellings still return zero. Current tests compare
+// accepted masks and emitted contracts to the C reference.
+export fn clobber_bit(source:buf<u8>,start:u64,end:u64)->u64 {
+    if start>end || end>len(source) { return 0; }
+    // rflags, matched byte-wise so this
+    // module keeps its no-string-literal spelling rule.
+    if end-start==6
+       && source[start]==114 && source[start+1]==102
+       && source[start+2]==108 && source[start+3]==97
+       && source[start+4]==103 && source[start+5]==115 { return 131072; }
+    // Sparse architectural clobber identities, not GPR operand families.
+    if end-start==3 && source[start]==114 && source[start+1]==105 && source[start+2]==112 { return 65536; }
+    if end-start==6 && source[start+1]==115 && source[start+2]==98
+        && source[start+3]==97 && source[start+4]==115 && source[start+5]==101 {
+        if source[start]==103 { return 262144; }
+        if source[start]==102 { return 524288; }
+    }
+    let n:u64=family(source,start,end);
+    if n==0 { return 0; }
+    return 1<<(n-1);
+}
+
+// Register widths against scalar parameter types. For every function
+// (kind 18) and import (kind 9), the direct parameter children (kind 19)
+// carry the type as second child and optionally the register name after
+// @ as third child. When both the type is one of u8/u16/u32/u64 and the
+// register is one of the recognized frontend spellings, the widths must
+// agree. Unbound parameters and types or names outside this scalar rule
+// are skipped, not accepted as semantically valid.
+// Returns 0 on success, writing out[0]=functions, out[1]=imports,
+// out[2]=checked bindings, out[3]=0. Returns 318 on a width mismatch,
+// writing the register line, column, expected width (type) and actual
+// width (register) to out[0..3]. Returns 800 with no write to out on an
+// invalid tree, an invalid span or child chain, or an output buffer
+// shorter than four words. The scratch buffer is always freed; neither
+// source nor tree is released.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    let n_import:u64=9;
+    let n_function:u64=18;
+    let n_parameter:u64=19;
+    if tree.ok==false { return 800; }
+    if tree.node_count==0 { return 800; }
+    if len(out)<4 { return 800; }
+
+    let scratch:buf<u64>=alloc(runtime(),1);
+    let mut imports:u64=0;
+    let mut functions:u64=0;
+    let mut checked:u64=0;
+    let mut code:u64=0;
+    let mut bad_line:u64=0;
+    let mut bad_column:u64=0;
+    let mut expected:u64=0;
+    let mut actual:u64=0;
+
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if node.kind==n_import || node.kind==n_function {
+            if node.kind==n_function { functions=functions+1; }
+            else { imports=imports+1; }
+            // Walk direct children, keep only parameters (kind 19).
+            let mut child_id:u64=node.first_child;
+            while child_id!=0 && code==0 {
+                if child_id>tree.node_count { code=800; }
+                else {
+                    let cn:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+                    if cn.kind==n_parameter {
+                        // name, type, then optional register after @.
+                        let name_id:u64=child(tree,child_id,0);
+                        let type_id:u64=child(tree,child_id,1);
+                        let reg_id:u64=child(tree,child_id,2);
+                        if name_id==0 || type_id==0 { code=800; }
+                        else if reg_id!=0 {
+                            let tn:ntasm_ast.Node=ntasm_ast.node_at(tree,type_id);
+                            let rn:ntasm_ast.Node=ntasm_ast.node_at(tree,reg_id);
+                            if tn.start>tn.end || tn.end>len(source) {
+                                code=800;
+                            } else if rn.start>rn.end || rn.end>len(source) {
+                                code=800;
+                            } else {
+                                let tw:u64=type_width(source,tn.start,tn.end);
+                                let rw:u64=register_width(source,rn.start,rn.end);
+                                if tw!=0 && rw!=0 {
+                                    checked=checked+1;
+                                    if tw!=rw {
+                                        code=318;
+                                        bad_line=rn.line;
+                                        bad_column=rn.column;
+                                        expected=tw;
+                                        actual=rw;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if code==0 { child_id=cn.next_sibling; }
+                }
+            }
+            if code!=0 { id=tree.node_count+1; }
+        }
+        if code==0 { id=id+1; }
+    }
+
+    if code==0 {
+        out[0]=functions;
+        out[1]=imports;
+        out[2]=checked;
+        out[3]=0;
+    } else if code==318 && len(out)>=4 {
+        out[0]=bad_line;
+        out[1]=bad_column;
+        out[2]=expected;
+        out[3]=actual;
+    }
+    rt_free(runtime(),scratch);
+    return code;
+}

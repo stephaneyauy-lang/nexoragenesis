@@ -1,0 +1,13 @@
+module bootstrap.branching_runtime
+target x86_64-nexora-uefi
+section .text {
+    export fn main(in x:u64 @rcx) -> u64
+    effects {}
+    clobbers {rax} {
+        if x == 0 {
+            return 42;
+        } else {
+            return 43;
+        }
+    }
+}

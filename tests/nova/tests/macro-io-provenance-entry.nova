@@ -1,0 +1,158 @@
+module macro_io_provenance_entry;
+
+import ntasm_parser;
+import ntasm_ast;
+import ntasm_macro_expand;
+import constant_eval;
+
+// The EXECUTION half of the A5 provenance campaign. Wave 13.
+//
+// The absence-of-I/O campaign needed two canary modules because a claim that a
+// file does not call fopen is a statement about the file and not about the
+// machine. The provenance campaign has the same shape of weakness and it needs
+// the same answer: reading the produced name table says what the expander
+// WROTE, and says nothing about whether what it wrote can be run. This module
+// is the run.
+//
+// It takes a module source, expands it, and then EXECUTES the produced text
+// with the compiler's own compile-time evaluator. No second evaluator is
+// written for it: the produced region is already a valid node_words buffer
+// (macro_expand.nova:436-443 is the module saying so), so the evaluator that
+// folds a comptime condition is the evaluator that folds an expansion result.
+// It also reads the hygiene mark back out of the SAME region it executed, so
+// "the mark is fresh" and "the produced text runs" are two facts about one
+// artefact instead of two runs that happen to agree. That is the whole point
+// of confronting a fresh mark against an execution of the text it names.
+//
+// A produced literal carries a token index into the CALLER's token array
+// (folded_token, macro_expand.nova:277-283), so the tree handed to the
+// evaluator borrows the caller's tokens and owns only the node words.
+//
+// out[0] on input is ignored; the harness shape is kept so the call reads the
+// same as the other two entries. On return out[0] is the diagnostic code,
+// zero on success, and then
+//   out[1] the produced node count
+//   out[2] the evaluate status, 0 only when the produced text folded
+//   out[3] 1 when the folded value is negative
+//   out[4] the folded magnitude
+//   out[5] the ordinal read back out of the first hygiene mark
+//   out[6] the serial read back out of that same mark
+// out[2] is not optional and a gate that read out[4] without it would be
+// reading the zero this module writes before it knows anything: a run whose
+// evaluate status is not 0 executed nothing, and a comparison of two such runs
+// would compare two zeros and prove nothing at all.
+
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<7 { return 800; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree);return 800; }
+    // Room for the published region: four words, the name table, and twelve
+    // words per produced node. Four million words is far above what any
+    // source the gate runs produces, and the refusal for a larger one is 203
+    // with the requirement in the diagnostic, so a caller sees the ceiling
+    // rather than a truncation.
+    let room:buf<u64>=alloc(runtime(),4194304);
+    if len(room)!=4194304 {
+        rt_free(runtime(),room);ntasm_ast.release(tree);return 900;
+    }
+    let code:u64=ntasm_macro_expand.expand(source,tree,room);
+    if code!=0 {
+        rt_free(runtime(),room);ntasm_ast.release(tree);return code;
+    }
+    let nodes:u64=room[1];
+    let names:u64=(room[2]+7)/8;
+    let words:u64=nodes*12;
+    let made:buf<u64>=alloc(runtime(),words);
+    if len(made)!=words {
+        rt_free(runtime(),made);rt_free(runtime(),room);
+        ntasm_ast.release(tree);return 900;
+    }
+    let mut i:u64=0;
+    while i<words { made[i]=room[4+names+i];i=i+1; }
+
+    // The mark, read back out of the region that is about to be executed.
+    // The name table bytes live at room[4 + byte/8]; the eight bit shifts
+    // are the packing put_byte writes (macro_expand.nova:520-529).
+    let mut ordinal:u64=0;
+    let mut serial:u64=0;
+    let mut id:u64=1;
+    while id<=nodes && serial==0 {
+        if made[(id-1)*12]==90 {
+            let start:u64=made[(id-1)*12+6];
+            let stop:u64=made[(id-1)*12+7];
+            if stop>start && stop<=room[2] {
+                // "__nt" then one of m, d, p then '$': six bytes, so every
+                // mark starts with the same five and differs at the fifth.
+                if byte_at(room,start)==95 && byte_at(room,start+1)==95 &&
+                   byte_at(room,start+2)==110 && byte_at(room,start+3)==116 &&
+                   byte_at(room,start+4)!=110 && byte_at(room,start+5)==36 {
+                    ordinal=read_number(room,start+6);
+                    // "$e" then the serial, then '$'.
+                    if byte_at(room,start+6+digits_of(ordinal))==36 &&
+                       byte_at(room,start+7+digits_of(ordinal))==101 {
+                        serial=read_number(room,start+8+digits_of(ordinal));
+                    }
+                }
+            }
+        }
+        id=id+1;
+    }
+
+    // The produced text, executed. Node one of an expansion is the expand
+    // wrapper and the wrapper's first child is that macro's result
+    // (expand_node, macro_expand.nova:1926-2033), so the result of the first
+    // wrapper whose result is an EXPRESSION is the thing to fold. Picking it
+    // by shape rather than by a node number is what lets one region hold a
+    // declaration -- and therefore a hygiene mark -- beside the expression
+    // that gets executed, which is the whole point of confronting one with
+    // the other.
+    let mut target:u64=0;
+    let mut scan:u64=1;
+    while scan<=nodes && target==0 {
+        if made[(scan-1)*12]==31 {
+            let child:u64=made[(scan-1)*12+8];
+            if child!=0 && child<=nodes && made[(child-1)*12]==35 { target=child; }
+        }
+        scan=scan+1;
+    }
+    let produced:ntasm_ast.Tree=ntasm_ast.Tree{ok:true,
+        token_words:tree.token_words,token_count:tree.token_count,
+        node_words:made,node_count:nodes,code:0,reason:0,source:0,line:0,
+        column:0,start:0,end:0};
+    let value:constant_eval.Value=constant_eval.evaluate(produced,target);
+    out[0]=0;out[1]=nodes;out[2]=value.status;out[3]=0;out[4]=value.magnitude;
+    if value.negative { out[3]=1; }
+    out[5]=ordinal;out[6]=serial;
+    rt_free(runtime(),made);rt_free(runtime(),room);ntasm_ast.release(tree);
+    return 0;
+}
+
+// One byte of the produced name table, unpacked the way put_byte packed it.
+fn byte_at(words:buf<u64>,at:u64)->u64 {
+    return (words[4+at/8]>>(8*(at%8)))&255;
+}
+
+// The decimal number starting at `at`, stopping at the first byte that is not
+// a digit. Zero when there is no digit there, which is what makes a mark
+// whose serial is missing read as "no serial" rather than as "serial zero".
+fn read_number(words:buf<u64>,at:u64)->u64 {
+    let mut value:u64=0;
+    let mut seen:u64=0;
+    let mut i:u64=at;
+    while i<at+20 {
+        let ch:u64=byte_at(words,i);
+        if ch<48 || ch>57 { break; }
+        value=value*10+(ch-48);seen=seen+1;i=i+1;
+    }
+    if seen==0 { return 0; }
+    return value;
+}
+
+// How many decimal digits a number is written in, so the reader can step over
+// the ordinal and find the "$e" that follows it.
+fn digits_of(value:u64)->u64 {
+    let mut n:u64=1;
+    let mut rest:u64=value;
+    while rest>=10 { rest=rest/10;n=n+1; }
+    return n;
+}

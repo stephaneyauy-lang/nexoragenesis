@@ -1,0 +1,10 @@
+{
+  "source": "compiler/c/ntasm/frontend/ntasm.c",
+  "sha256": "c81b9398ce98648501f3390b9903c738a2f90d74e3b5ce104940fd518a11a307",
+  "suffix_offset": 6132,
+  "suffix_anchor": "static void put16",
+  "suffix_extra_function": "int nova_oracle_relocation(",
+  "layout_source": "compiler/c/ntasm/formats/pe_layout.h",
+  "layout_copy": "compiler/c/nova/pe/pe_layout_oracle.h",
+  "layout_sha256": "f26b3dee39882b444dff238810457e2b0ea52507c5a801be43f0dfafb16b43b5"
+}

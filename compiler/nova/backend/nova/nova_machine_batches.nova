@@ -1,0 +1,239 @@
+module nova_machine_batches;
+import nova_machine_many;
+import machine_pipeline;
+import ntasm_pe;
+
+// THE BATCH ORCHESTRATOR.
+//
+// A program of many sources does not fit in one Machine IR image, so it is
+// lowered in BATCHES: the reachable functions are cut into slices of
+// `batch_limit` functions, every slice becomes its own NXO object, and the
+// objects are gathered in ONE arena for the linker.
+//
+// WHAT THIS MODULE IS NOT. It lowers nothing by itself: a batch is lowered by
+// `nova_machine_many.lower_many_batch` -- the same backend the closed mode
+// runs -- and an object is built by `machine_pipeline.build_object_from_image`
+// -- the same emitter. There is no second backend here, and no contract is
+// relaxed to make a batch fit.
+//
+// THE ARENA. `out` holds `count` descriptors of sixteen bytes (offset,length)
+// followed by the NXO payloads: the arena `ntasm_nxo_link_pe.link_pe_list`
+// reads, byte for byte. The descriptor table is reserved at its full width of
+// sixty four slots and only the filled ones are read, so the padding between
+// the table and the first payload is part of the format and not a hole.
+//
+// WHY THE AST AND THE MIR DO NOT SURVIVE THE LINK. The caller may free the
+// frontend's tables and the MIR image as soon as this function returns, and
+// the arena is then the only thing the linker reads. The MIR of one batch is
+// reused by the next: the same words, the same text.
+
+export fn MAX_OBJECTS()->u64 { return 64; }
+export fn HEADER_BYTES()->u64 { return 1024; }
+export fn MAX_OBJECT_BYTES()->u64 { return 16777216; }
+
+// THE REPORT LAYOUT THIS MODULE PUBLISHES. The four first words and the
+// stage are the LAST STAGE THAT RAN, whether it refused or not: the lower's
+// (node,line,code,column), the emitter's (record,code,kind,0) or the stage
+// number itself.
+//   [4]  the number of batches the plan holds, zero when the plan was refused
+//   [5]  the reachable count the first lower reported
+//   [6]  the number of objects written into the arena, zero when nothing is
+//         published
+//   [7]  the declared count the first lower reported
+//   [8]  the stage, with machine_pipeline's stage numbers
+//   [9]  the index of the batch that refused, zero when none did
+//   [10] the batch limit the caller asked for
+//   [11] the emitted count the first lower reported
+//   [12] the bytes the arena holds, zero when nothing is published
+//   [13] one when the arena is complete and ready to be linked
+//
+// THE COUNTS OF THE LOWER ARE READ BEFORE THE OBJECT STAGE RUNS, because the
+// object stage clears the report and a count read after it would be a count
+// of something else. The object stage clears the WHOLE report, so the batch
+// limit and the batch counts are written again after every object.
+fn refuse(report:buf<u64>,stage:u64,code:u64)->u64 {
+    report[0]=0;report[1]=0;report[2]=code;report[3]=0;report[8]=stage;
+    return code;
+}
+// THE ARENA'S CAPACITY, which is the smaller of the capacity the caller
+// claims and the buffer it really lent.
+fn arena_capacity(out:buf<u8>,out_count:u64)->u64 {
+    let real:u64=len(out);
+    if out_count<real { return out_count; }
+    return real;
+}
+// Opt-in stage markers contain only a zero-based batch index. Every label,
+// digit buffer and slice is released before the next compiler stage begins.
+fn progress_mark(enabled:bool,index:u64,phase:u64)->u64 {
+    if enabled==false { return 0; }
+    if phase==0 { let s:buf<u8>="NG_NOVA_BATCH_LOWER_BEGIN ";rt_diag(runtime(),s);rt_free(runtime(),s); }
+    if phase==1 { let s:buf<u8>="NG_NOVA_BATCH_LOWER_END ";rt_diag(runtime(),s);rt_free(runtime(),s); }
+    if phase==2 { let s:buf<u8>="NG_NOVA_BATCH_OBJECT_BEGIN ";rt_diag(runtime(),s);rt_free(runtime(),s); }
+    if phase==3 { let s:buf<u8>="NG_NOVA_BATCH_OBJECT_END ";rt_diag(runtime(),s);rt_free(runtime(),s); }
+    let digits:buf<u8>=alloc(runtime(),22);
+    digits[20]=u8(13);digits[21]=u8(10);
+    let mut cursor:u64=20;let mut value:u64=index;let mut done:bool=false;
+    while done==false {
+        cursor=cursor-1;digits[cursor]=u8(48+value%10);value=value/10;
+        if value==0 { done=true; }
+    }
+    let exact:buf<u8>=slice(digits,cursor,22-cursor);
+    rt_diag(runtime(),exact);rt_free(runtime(),exact);rt_free(runtime(),digits);
+    return 0;
+}
+export fn build_objects(blob:buf<u8>,spans:buf<u64>,count:u64,root:u64,
+                         nodes:buf<u64>,node_count:u64,program:u64,
+                         scopes:buf<u64>,binds:buf<u64>,fields:buf<u64>,modules:buf<u64>,
+                         words:buf<u64>,capacity:u64,
+                         text_out:buf<u8>,text_length:buf<u64>,
+                         out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>,
+                         batch_limit:u64)->u64 {
+    return build_objects_progress(blob,spans,count,root,nodes,node_count,program,
+        scopes,binds,fields,modules,words,capacity,text_out,text_length,
+        out,out_count,length,report,batch_limit,false);
+}
+export fn build_objects_progress(blob:buf<u8>,spans:buf<u64>,count:u64,root:u64,
+                         nodes:buf<u64>,node_count:u64,program:u64,
+                         scopes:buf<u64>,binds:buf<u64>,fields:buf<u64>,modules:buf<u64>,
+                         words:buf<u64>,capacity:u64,
+                         text_out:buf<u8>,text_length:buf<u64>,
+                         out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>,
+                         batch_limit:u64,progress:bool)->u64 {
+    // THE OUTPUTS ARE INVALIDATED FIRST, and they are invalidated even when
+    // the interface itself is refused: a caller that reads a length after any
+    // refusal must read zero and not the length of a previous call.
+    if len(length)>=2 { length[0]=0;length[1]=0; }
+    if len(report)<14 || len(length)<2 || len(text_length)<1 { return 800; }
+    report[4]=0;report[5]=0;report[6]=0;report[7]=0;report[9]=0;
+    report[10]=batch_limit;report[11]=0;report[12]=0;report[13]=0;
+    // A LIMIT OF ZERO IS AN ARGUMENT, NOT A PLAN: no slice can be cut.
+    if batch_limit==0 { return refuse(report,machine_pipeline.STAGE_LOWER(),800); }
+    let cap:u64=arena_capacity(out,out_count);
+    if cap<HEADER_BYTES() { return refuse(report,machine_pipeline.STAGE_DELIVER(),machine_pipeline.E_OUTPUT()); }
+    // THE DESCRIPTOR TABLE IS ZEROED WHOLE, so the slots that are not filled
+    // carry zero and not whatever the buffer held.
+    let mut h:u64=0;
+    while h<(HEADER_BYTES()) { out[h]=u8(0); h=h+1; }
+    // THE FIRST BATCH IS LOWERED FIRST, because the lower is the only one
+    // that knows how many functions the program can reach, and the number of
+    // batches is a function of that count.
+    report[8]=machine_pipeline.STAGE_LOWER();
+    progress_mark(progress,0,0);
+    let code:u64=nova_machine_many.lower_many_batch(blob,spans,count,root,nodes,node_count,program,
+                                                    scopes,binds,fields,modules,words,capacity,
+                                                    text_out,text_length,out,out_count,length,report,
+                                                    0,batch_limit);
+    progress_mark(progress,0,1);
+    if code!=0 {
+        length[0]=0;length[1]=0;
+        // THE PLAN IS NOT A PLAN AND NO OBJECT WAS WRITTEN, so the two slots
+        // that carry them are zeroed. The lower's own words and its own
+        // reachable count stay where they are: they are the lower's, and a
+        // slot labelled "batches" must not carry the lower's "declared".
+        report[4]=0;report[6]=0;
+        return code;
+    }
+    // THE THREE COUNTS, READ HERE, BEFORE THE OBJECT STAGE CLEARS THE REPORT.
+    let declared:u64=report[4];
+    let reachable:u64=report[5];
+    let emitted:u64=report[6];
+    report[7]=declared;report[11]=emitted;report[5]=reachable;
+    // THE NUMBER OF BATCHES, WITHOUT AN ADDITION THAT CAN OVERFLOW: the
+    // quotient and the remainder, so a limit of eighteen quintillion is one
+    // batch and not a refusal.
+    let mut batches:u64=0;
+    if reachable>0 {
+        batches=reachable/batch_limit;
+        if reachable%batch_limit!=0 { batches=batches+1; }
+    }
+    report[4]=batches;
+    // MORE BATCHES THAN THE DESCRIPTOR TABLE HOLDS IS AN OUTPUT REFUSAL, and
+    // it is refused BEFORE anything is emitted.
+    if batches>MAX_OBJECTS() {
+        length[0]=0;length[1]=0;
+        return refuse(report,machine_pipeline.STAGE_DELIVER(),machine_pipeline.E_OUTPUT());
+    }
+    if batches==0 {
+        length[0]=0;length[1]=0;
+        return refuse(report,machine_pipeline.STAGE_LOWER(),machine_pipeline.E_BOUND());
+    }
+    // THE TEMPORARY OBJECT, bounded and reused by every batch: one allocation
+    // for the whole call, and the object stage refuses an object that does
+    // not fit it.
+    let temp:buf<u8>=alloc(runtime(),MAX_OBJECT_BYTES());
+    let temp_length:buf<u64>=alloc(runtime(),1);
+    let mut at:u64=HEADER_BYTES();
+    let mut written:u64=0;
+    let mut failure:u64=0;
+    let mut k:u64=0;
+    while k<(batches) && failure==0 {
+        if k>0 {
+            report[8]=machine_pipeline.STAGE_LOWER();
+            progress_mark(progress,k,0);
+            let lower_code:u64=nova_machine_many.lower_many_batch(blob,spans,count,root,nodes,node_count,program,
+                                                    scopes,binds,fields,modules,words,capacity,
+                                                    text_out,text_length,out,out_count,length,report,
+                                                    k*batch_limit,batch_limit);
+            progress_mark(progress,k,1);
+            // THE LOWER'S OWN REPORT IS KEPT WHOLE: only the batch index and
+            // the stage are added.
+            if lower_code!=0 { failure=lower_code;report[9]=k; }
+        }
+        if failure==0 {
+            // THE TEXT OF THIS BATCH, EXACTLY. The emitter reads the spans
+            // out of it, so the source it is given is this batch's own text
+            // and not the buffer the text was written in.
+            let text_size:u64=text_length[0];
+            if text_size==0 || text_size>len(text_out) {
+                failure=refuse(report,machine_pipeline.STAGE_LOWER(),machine_pipeline.E_BOUND());
+                report[9]=k;
+            } else {
+                let source:buf<u8>=slice(text_out,0,text_size);
+                report[8]=machine_pipeline.STAGE_OBJECT();
+                progress_mark(progress,k,2);
+                let built:u64=machine_pipeline.build_object_from_image(words,words[3],source,temp,temp_length,report);
+                progress_mark(progress,k,3);
+                rt_free(runtime(),source);
+                // THE EMITTER'S OWN REPORT IS KEPT WHOLE on a refusal.
+                if built!=0 { failure=built;report[9]=k; }
+                else {
+                    let size:u64=temp_length[0];
+                    if size==0 || size>MAX_OBJECT_BYTES() {
+                        failure=refuse(report,machine_pipeline.STAGE_OBJECT(),machine_pipeline.E_BOUND());
+                        report[9]=k;
+                    } else if size>cap-at {
+                        failure=refuse(report,machine_pipeline.STAGE_DELIVER(),machine_pipeline.E_OUTPUT());
+                        report[9]=k;
+                    } else {
+                        // THE PAYLOAD, COPIED EXACTLY, AND THE DESCRIPTOR THAT
+                        // NAMES IT. The descriptor table is the linker's, and
+                        // its order is the batch order.
+                        let payload:buf<u8>=slice(temp,0,size);
+                        ntasm_pe.copy(out,at,payload);
+                        rt_free(runtime(),payload);
+                        ntasm_pe.put64(out,k*16,at);
+                        ntasm_pe.put64(out,k*16+8,size);
+                        at=at+size;
+                        written=written+1;
+                    }
+                }
+            }
+        }
+        // THE REPORT IS RESTORED: the object stage clears it, and the batch
+        // information is the caller's.
+        report[4]=batches;report[5]=reachable;report[6]=written;
+        report[7]=declared;report[10]=batch_limit;report[11]=emitted;
+        k=k+1;
+    }
+    rt_free(runtime(),temp);rt_free(runtime(),temp_length);
+    if failure!=0 {
+        length[0]=0;length[1]=0;report[6]=0;report[12]=0;report[13]=0;
+        report[10]=batch_limit;
+        return failure;
+    }
+    length[0]=at;length[1]=written;
+    report[4]=batches;report[5]=reachable;report[6]=written;
+    report[7]=declared;report[10]=batch_limit;report[11]=emitted;
+    report[12]=at;report[13]=1;
+    return 0;
+}

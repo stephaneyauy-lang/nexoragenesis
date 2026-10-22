@@ -1,0 +1,55 @@
+module stub_table_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import semantics;
+import stub_table;
+
+// out[0..3] carries the verdict of the pass selected by out[4], which is
+// read only when the caller passes at least eight words.
+//   out[4] = 0, or any value past 3: stub_table.check, out[0]=tables,
+//     out[1]=entries, out[2]=0, out[3]=0.
+//   out[4] = 1: stub_table.measure, out[0]=tables, out[1]=entries,
+//     out[2]=plan steps, out[3]=0.
+//   out[4] = 2: stub_table.lower, out[0]=tables, out[1]=records,
+//     out[2]=plan steps, out[3]=0, then twelve words per record and three
+//     words per plan step from out[4].
+//   out[4] = 3: stub_table.plan_for over the record whose canonical position
+//     is out[5], writing that one record and its plan from out[0]. This is the
+//     query channel that answers what the generator derives from a
+//     declaration the proven encoding cannot emit.
+// out[4] is consumed: the lowering writes its record region over the
+// selector, which is why the selector is read before the pass runs.
+// Returns 800 with no write to out when the source does not parse or when
+// out is shorter than four words. The scratch buffer and the tree are freed
+// on every path.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    let mut mode:u64=0;
+    let mut index:u64=0;
+    if len(out)>=8 { mode=out[4];index=out[5]; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false {
+        ntasm_ast.release(tree);
+        return 800;
+    }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let code:u64=semantics.index(source,tree,scratch);
+    if code!=0 {
+        if code!=800 {
+            out[0]=scratch[0];
+            out[1]=scratch[1];
+        }
+        rt_free(runtime(),scratch);
+        ntasm_ast.release(tree);
+        return code;
+    }
+    let mut verdict:u64=0;
+    if mode==1 { verdict=stub_table.measure(source,tree,out); }
+    else if mode==2 { verdict=stub_table.lower(source,tree,out); }
+    else if mode==3 { verdict=stub_table.plan_for(source,tree,out,index); }
+    else { verdict=stub_table.check(source,tree,out); }
+    rt_free(runtime(),scratch);
+    ntasm_ast.release(tree);
+    return verdict;
+}

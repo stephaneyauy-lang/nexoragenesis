@@ -1,0 +1,33 @@
+module comptime_purity_entry;
+
+import ntasm_parser;
+import ntasm_ast;
+import ntasm_macro_expand;
+
+// Gate entry for lot 32, comptime purity. out[0] on input selects nothing: the
+// request is always the expansion of the caller's own source.
+//
+// The five words this publishes are macro_expand's own publication and are not
+// re-derived here: out[0] the diagnostic code, out[1] the line, out[2] the
+// column, out[3] the reason, out[4] the produced node count. The reason is
+// where a channel answer lives -- 20 file read, 21 file write, 22 file close,
+// 23 diagnostic output -- and the gate reads that number, never a table it
+// wrote beside the call.
+//
+// The tree is borrowed and released on every path, refusals included, so the
+// gate sees no leak under detect_leaks=1.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<5 { return 800; }
+    out[0]=0;out[1]=0;out[2]=0;out[3]=0;out[4]=0;
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false {
+        // A source that does not parse never reaches the expander, so it has
+        // no channel answer to publish. The gate sees the refusal here and
+        // says so rather than reading an untouched zero as a decision.
+        ntasm_ast.release(tree);
+        return 900;
+    }
+    let code:u64=ntasm_macro_expand.expand(source,tree,out);
+    ntasm_ast.release(tree);
+    return code;
+}

@@ -1,0 +1,361 @@
+module ir_image;
+import ntasm_pe;
+
+// ===========================================================================
+// THE BYTE CONTAINER FOR AN IR IMAGE. This is the artefact ntir.nova and
+// machine_ir.nova did not have, and why they did not need one is worth stating
+// before the layout, because it is the whole justification for the file.
+//
+// Both IRs are a `buf<u64>`: host words, handed to the harness by pointer,
+// never written down. ntir.nova:44-63 and machine_ir.nova:63-76 each specify a
+// header, and each reader refuses a wrong tag or a wrong version
+// (ntir.nova:840-841, machine_ir.nova:2774-2775 and :2960-2961). That is real,
+// and for the NTIR it is exercised: tests_ntasm_ntir.c:576-577 damages the magic
+// and the version and demands 808.
+//
+// It is also, on its own, a header with nothing outside the process to be wrong
+// about. A u64 buffer has no byte order, no record alignment, no length and no
+// digest; it is a C ABI and it is exactly as portable as the compiler that made
+// it. The measure of the state this file was written from is one line:
+//
+//     grep -rn deserial --include=*.nova --include=*.c --include=*.h .  -> 0 hits
+//
+// No reader of an IR image had ever existed, in any language, anywhere in this
+// repository. The rejection paths above could only ever be reached by a caller
+// that already had the buffer in its hand, which is to say by the process that
+// had just written it.
+//
+// So this is NOT a second schema competing with the one inside ntir.nova. The
+// layout of the RECORDS stays exactly where it is and stays the sole property of
+// the module that owns it. This file owns the ENVELOPE: how a header and a run
+// of u64 records become bytes, and how bytes become a header and a run of u64
+// records again.
+//
+// IT DUPLICATES NO RECORD-LAYOUT CONSTANT, and that is the design decision worth
+// arguing about, because the obvious alternative is for this module to also
+// carry each image's header_words and node_words. It does not, for two reasons.
+// First, the stride and the count are ALREADY in the image's own header — NTIR
+// word 5 is NODE_WORDS and word 3 is node_count (ntir.nova:47-63) — and
+// ntir.verify already refuses a wrong one at 814, which tests_ntasm_ntir.c:578
+// exercises under the name "stride wrong". Second, a second copy of a constant
+// is a second thing to keep in step, and nxo.nova:18-35 exists to explain what
+// happens to this project when the version lives in two places: object.c and
+// nxo.nova each held the same fact twice and object.c had no way to notice they
+// disagreed. The container therefore knows NOTHING about what an NTIR is. It
+// hands back u64 words and stops. Deciding whether those words are an NTIR is
+// the job of the module that owns the NTIR, and it is ntir.verify's job alone.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS COPIED FROM nxo.nova, AND WHY. The NXD object format already answered
+// "how does a versioned container refuse a wrong input", and it answered it well,
+// so the mechanism is reused rather than reinvented:
+//
+//   1. THE TAG IS DERIVED FROM THE VERSION (nxo.nova:36-59). `version_digit`
+//      computes the four digits from FORMAT_VERSION and the tag is a rendering
+//      of the version rather than a second copy of it, so the eight tag bytes
+//      exist in exactly one function and a writer cannot emit a tag that
+//      disagrees with the version it wrote. Copied in shape, including the rule
+//      that an out-of-range index is 0 so a caller cannot read past the tag and
+//      believe it read a version.
+//
+//   2. A LOOP OVER tag_byte, NEVER A LIST OF LITERALS (nxo.nova:62-68). Read and
+//      emit ask the same question of the same function, so they cannot hold two
+//      different opinions about what this format is called. This is the direct
+//      consequence of copying 1, and it is the reason the mechanism is worth
+//      copying rather than the tag bytes being worth copying.
+//
+//   3. RESERVED WORDS, WRITTEN ZERO AND REFUSED NON-ZERO (nxo.nova:82-85
+//      `zeros`, :181 read, :252 `clear`). Copied, including the reason nxo.nova
+//      gives at :88-91: the writer zeroes them rather than trusting the
+//      allocator, so the emitted bytes are a property of this module and not of
+//      whatever memory the runtime handed back.
+//
+//   4. THE SIZE CROSS-CHECK (nxo.nova:186). The reader compares the length the
+//      header claims against the length it was actually given and refuses a
+//      file that is short OR long. A truncated file must never read as a
+//      shorter one.
+//
+//   5. REFUSE BEFORE ALLOCATE (nxo.nova:206). Every fixed field is checked
+//      before one record is materialised, so a corrupt file costs a rejection
+//      and not an allocation whose size was read out of the corrupt file.
+//
+//   6. A REFUSAL IS A CODE AND AN EMPTY BUFFER, NEVER A PARTIAL OBJECT
+//      (nxo.nova:68-74 `bad_read`/`bad_write`). Copied, so a caller that ignores
+//      the code gets something it can harmlessly free rather than a
+//      half-populated image it has no way to know is incomplete.
+//
+// WHAT IS NOT COPIED, and the omission is deliberate: the section table.
+// nxo.nova:187-196 carries three section records because an object file has
+// sections. An IR image is one flat run of records, so a section table would be
+// a structure with exactly one possible contents; adding it would be design for
+// its own sake, and it is the reason nxo's header is 240 bytes and this one is
+// 56.
+//
+// ---------------------------------------------------------------------------
+// THE LAYOUT. Little-endian throughout, fixed width, no padding, no alignment
+// requirement on the body.
+//
+//    0   8  tag         NTI0 or MIR1, then the four decimal digits of
+//                      FORMAT_VERSION. Byte 3 is the DOMAIN as an ASCII digit:
+//                      '0' is NTIR, '1' is Machine IR. See note 2 above for why
+//                      the domain appears both here and at offset 12.
+//    8   4  version     u32. FORMAT_VERSION, again as a number.
+//   12   4  domain      u32. DOMAIN_NTIR or DOMAIN_MACHINE_IR.
+//   16   4  word_bytes  u32. Always 8, and REFUSED otherwise. A reader willing
+//                      to accept a word size it does not have is a reader that
+//                      will misread the body, so this is a rejection and not a
+//                      tolerance.
+//   20   4  reserved0   u32, must be zero.
+//   24   8  word_count  u64. Total u64 records in the body, image header
+//                      included. Redundant against the image's own words 3 and
+//                      5 on purpose: it is a second and independent statement of
+//                      the same length, so a body and a header that disagree are
+//                      refused before either is believed.
+//   32   8  size        u64. Total bytes. Must equal the length handed to read.
+//   40   8  digest      u64. FNV-1a over every byte of the file except bytes
+//                      40..48, which are this field.
+//   48   8  reserved1   u64, must be zero.
+//   56   -  body        word_count u64, little-endian.
+//
+// WHY THE DIGEST, and it is the one field here that is not a structural check.
+// Every other field is a claim a reader can settle by comparison against a
+// constant or against the length it was given. The digest is a claim about
+// CONTENT, and it is the field that turns a buffer into an artefact: before it,
+// two IR images were comparable only by walking both of them inside one process
+// that had to hold both alive at once. It is FNV-1a because machine_ir.nova:
+// 837-846 already uses FNV-1a with these exact two constants, and a tree with two
+// FNV implementations and two different digests for the same name is a tree that
+// will one day disagree about which is which.
+//
+// WHAT THE DIGEST DOES NOT DO, stated because a digest that is only ever
+// compared against a value the same code just computed proves nothing at all.
+// It detects corruption and accidental divergence. It is NOT a signature: a file
+// that has been maliciously rewritten, digest and all, is accepted. A signature
+// is a different artefact with a different threat model and none is claimed here.
+//
+// ---------------------------------------------------------------------------
+// THE CODES, and why they are a fresh band. 8xx is spoken for up to 844 and 9xx
+// from 930, so 850..860 are unused across the whole tree. They are distinct from
+// every IR refusal code on purpose: a caller that gets 851 must be able to say
+// "this file is a revision I do not know" WITHOUT the possibility that the same
+// number came out of a node verifier, and the two are different failures with
+// different repairs. Collapsing them would have made the failure unattributable,
+// which is the defect class this project keeps finding.
+// ===========================================================================
+// Only the READ direction returns an owned buffer, and only because a reader
+// cannot know the caller's buffer is big enough before it has read the count
+// out of the file. `write` returns a code and fills the caller's own buffers.
+export struct ReadResult { code:u64,words:buf<u64>,word_count:u64 }
+// THE VERSION OF THE ENVELOPE. One number, and the tag's last four bytes are
+// derived from it rather than typed beside it, so a version and a tag that
+// disagree are not expressible. That is nxo.nova:36-59's mechanism reused, and
+// it is reused rather than reinvented as a fresh pair of constants because the
+// second copy is the defect, not the number.
+export fn FORMAT_VERSION()->u64 { return 1; }
+export fn HEADER_BYTES()->u64 { return 56; }
+export fn WORD_BYTES()->u64 { return 8; }
+export fn TAG_LENGTH()->u64 { return 8; }
+export fn DOMAIN_NTIR()->u64 { return 0; }
+export fn DOMAIN_MACHINE_IR()->u64 { return 1; }
+export fn MAX_BYTES()->u64 { return 67108864; }
+export fn MAX_WORDS()->u64 { return (MAX_BYTES()-HEADER_BYTES())/WORD_BYTES(); }
+
+export fn E_TAG()->u64 { return 850; }
+export fn E_VERSION()->u64 { return 851; }
+export fn E_DOMAIN()->u64 { return 852; }
+export fn E_WORDBYTES()->u64 { return 853; }
+export fn E_RESERVED()->u64 { return 854; }
+export fn E_SIZE()->u64 { return 855; }
+export fn E_COUNT()->u64 { return 856; }
+export fn E_DIGEST()->u64 { return 857; }
+export fn E_TRUNCATED()->u64 { return 858; }
+export fn E_INPUT()->u64 { return 859; }
+export fn E_CAPACITY()->u64 { return 860; }
+
+export fn domain_known(domain:u64)->bool {
+    if domain==DOMAIN_NTIR() { return true; }
+    return domain==DOMAIN_MACHINE_IR();
+}
+
+// ---- the tag, derived -----------------------------------------------------
+// The digit of FORMAT_VERSION at `index`, most significant first, as ASCII.
+// Out of range is 0, so a caller cannot walk off the end of the tag and come
+// back with a version it invented. This is nxo.nova:42-48's function, for the
+// reason nxo.nova:18-35 gives.
+fn version_byte(index:u64)->u64 {
+    if index>3 { return 0; }
+    let mut divisor:u64=1000;
+    let mut step:u64=0;
+    while step<index { divisor=divisor/10; step=step+1; }
+    return 48+(FORMAT_VERSION()/divisor)%10;
+}
+// Byte `index` of the tag. Bytes 0..2 are the family, byte 3 is the domain as a
+// digit, bytes 4..7 are the version. One function answers for all eight, so the
+// tag cannot exist in two places -- which is the entire point of deriving it.
+export fn tag_byte(domain:u64,index:u64)->u64 {
+    if index>=TAG_LENGTH() { return 0; }
+    if index==0 { if domain==DOMAIN_NTIR() { return 78; } return 77; }
+    if index==1 { if domain==DOMAIN_NTIR() { return 84; } return 73; }
+    if index==2 { if domain==DOMAIN_NTIR() { return 73; } return 82; }
+    if index==3 { return 48+domain; }
+    return version_byte(index-4);
+}
+
+// THE FAMILY: the three letters and the domain digit. A failure here is E_TAG
+// -- the reader was handed something that is not an IR image at all, or is the
+// other IR. It is checked separately from the version on purpose, because "not
+// our format" and "our format, a revision we do not know" are different
+// failures and a caller that cannot tell them apart cannot report either.
+fn family_ok(domain:u64,input:buf<u8>)->bool {
+    if len(input)<4 { return false; }
+    let mut i:u64=0;
+    while i<4 { if input[i]!=tag_byte(domain,i) { return false; } i=i+1; }
+    return true;
+}
+// THE VERSION DIGITS: a failure here is E_VERSION. The family was already
+// right, so the file IS an IR image of a revision this reader does not know.
+fn version_ok(input:buf<u8>)->bool {
+    let mut i:u64=4;
+    while i<TAG_LENGTH() { if input[i]!=version_byte(i-4) { return false; } i=i+1; }
+    return true;
+}
+
+// ---- the digest -----------------------------------------------------------
+// FNV-1a over an explicit byte range, skipping the digest field itself. The
+// skip is the only subtlety: hashing the field being written would be a fixed
+// point nobody solves, so the field is written zero, hashed around, and then
+// filled in.
+//
+// The range is an ARGUMENT rather than len(), and that is not a detail. `write`
+// emits into a caller-supplied buffer whose capacity is not the file's length,
+// and hashing the capacity would make the digest a property of the BUFFER
+// rather than of the image -- the same image would then carry a different
+// digest depending on how much room the caller's allocator happened to have.
+fn digest_range(input:buf<u8>,size:u64)->u64 {
+    if size<HEADER_BYTES() || size>len(input) { return 0; }
+    let mut h:u64=14695981039346656037;
+    let mut i:u64=0;
+    while i<size {
+        if i>=40 && i<48 { i=i+1; continue; }
+        h=h^(input[i]);
+        h=h*1099511628211;
+        i=i+1;
+    }
+    return h;
+}
+// The digest of a complete file, for a reader that was handed the whole thing.
+export fn digest(input:buf<u8>)->u64 { return digest_range(input,len(input)); }
+
+// ---- refusals -------------------------------------------------------------
+// A refusal is a CODE, and on every refusal the returned buffer is empty. The
+// caller must still free it. That is nxo.nova:68-74's rule and the reason for
+// it is worth restating: a half-populated image is the one return value a
+// caller has no way to recognise as incomplete, so this module never produces
+// one.
+fn bad_read(code:u64)->ReadResult {
+    let empty:buf<u64>=alloc(runtime(),0);
+    return ReadResult{code:code,words:empty,word_count:0};
+}
+
+// ---- write ----------------------------------------------------------------
+// The image is a `buf<u64>` of `count` records, which is exactly what
+// ntir.build and machine_ir.lower fill. The container does not look at one of
+// them: it is the wrong module's job to know what an NTIR record means, and a
+// container that checked a record would have to duplicate the IR's own layout
+// constants to do it.
+//
+// `out` and `length` are the CALLER's buffers. That is the convention
+// ntir.serialize and machine_ir.serialize already use, and the one that
+// matches the modules this container actually serves. nxo.emit allocates and
+// returns its own buffer instead, which is the right shape for an object file
+// and the wrong one here: the caller here is a harness that already owns a
+// scratch buffer and would have to free a second one per fixture.
+export fn write(domain:u64,words:buf<u64>,count:u64,out:buf<u8>,length:buf<u64>)->u64 {
+    if !domain_known(domain) { return E_DOMAIN(); }
+    if count==0 || count>MAX_WORDS() { return E_COUNT(); }
+    if len(words)<count { return E_INPUT(); }
+    if len(length)<1 { return E_INPUT(); }
+    let size:u64=HEADER_BYTES()+count*WORD_BYTES();
+    if size>MAX_BYTES() { return E_SIZE(); }
+    if len(out)<size { return E_CAPACITY(); }
+    let mut i:u64=0;
+    while i<TAG_LENGTH() { out[i]=u8(tag_byte(domain,i)); i=i+1; }
+    ntasm_pe.put32(out,8,FORMAT_VERSION());
+    ntasm_pe.put32(out,12,domain);
+    ntasm_pe.put32(out,16,WORD_BYTES());
+    ntasm_pe.put32(out,20,0);
+    ntasm_pe.put64(out,24,count);
+    ntasm_pe.put64(out,32,size);
+    // Bytes 40..48 are the digest and are filled in LAST, once every other byte
+    // of the file exists. Bytes 48..56 are reserved and are written zero rather
+    // than left to whatever the caller had in that buffer: `out` belongs to the
+    // caller, so it may hold anything, and an emitted file that inherited a
+    // stale reserved word would be a file this module refused to read back.
+    ntasm_pe.put64(out,40,0);
+    ntasm_pe.put64(out,48,0);
+    let mut j:u64=0;
+    while j<count {
+        ntasm_pe.put64(out,HEADER_BYTES()+j*WORD_BYTES(),words[j]);
+        j=j+1;
+    }
+    ntasm_pe.put64(out,40,digest_range(out,size));
+    length[0]=size;
+    return 0;
+}
+
+// ---- read -----------------------------------------------------------------
+// EVERY FIXED FIELD IS CHECKED BEFORE `alloc` IS CALLED. `count` is read out of
+// the file and is the size of the allocation a naive reader would make on the
+// strength of it, so nothing is allocated until `count` has been compared
+// against two independent facts: the length of the file this reader was given,
+// and the ceiling above. This is nxo.nova:206's rule, and it is the rule that
+// makes reading a hostile file safe rather than merely careful.
+export fn read(domain:u64,input:buf<u8>,capacity:u64)->ReadResult {
+    if !domain_known(domain) { return bad_read(E_DOMAIN()); }
+    let size:u64=len(input);
+    if size<HEADER_BYTES() { return bad_read(E_TRUNCATED()); }
+    if size>MAX_BYTES() { return bad_read(E_SIZE()); }
+    if !family_ok(domain,input) { return bad_read(E_TAG()); }
+    if !version_ok(input) { return bad_read(E_VERSION()); }
+    // The version is checked TWICE, in the tag and as the number at offset 8,
+    // and the two are compared against each other as well. That is redundant on
+    // purpose: the tag is derived from FORMAT_VERSION at run time, so a file
+    // that satisfies one of these and not the other could not have been written
+    // by this module. It can therefore only be an EDITED file, and the point of
+    // the cross-check is to notice exactly that.
+    let version:u64=ntasm_pe.read32(input,8);
+    if version!=FORMAT_VERSION() { return bad_read(E_VERSION()); }
+    if ntasm_pe.read32(input,12)!=domain { return bad_read(E_DOMAIN()); }
+    if ntasm_pe.read32(input,16)!=WORD_BYTES() { return bad_read(E_WORDBYTES()); }
+    if ntasm_pe.read32(input,20)!=0 { return bad_read(E_RESERVED()); }
+    if ntasm_pe.read64(input,48)!=0 { return bad_read(E_RESERVED()); }
+    let count:u64=ntasm_pe.read64(input,24);
+    if count==0 || count>MAX_WORDS() { return bad_read(E_COUNT()); }
+    if ntasm_pe.read64(input,32)!=(size) { return bad_read(E_SIZE()); }
+    // The body must be exactly what the header says it is, to the byte. This
+    // is what makes a truncated file a refusal: without it, a file cut in half
+    // would arrive as a shorter but internally consistent image.
+    if HEADER_BYTES()+count*WORD_BYTES()!=(size) { return bad_read(E_COUNT()); }
+    if count>capacity { return bad_read(E_CAPACITY()); }
+    if ntasm_pe.read64(input,40)!=(digest(input)) { return bad_read(E_DIGEST()); }
+    // Past this line every number used has been compared against a constant,
+    // against the length of the input, or against the file's own other copy of
+    // the same fact. Allocating is the first moment any of them is believed.
+    let out:buf<u64>=alloc(runtime(),count);
+    let mut i:u64=0;
+    while i<count {
+        out[i]=ntasm_pe.read64(input,HEADER_BYTES()+i*WORD_BYTES());
+        i=i+1;
+    }
+    return ReadResult{code:0,words:out,word_count:count};
+}
+
+// ---- the shapes, for a reader that wants to name what it is holding -------
+// These are the ENVELOPE's fields and nothing else. The image's own header
+// word 0 (the IR magic) and words 1 and 2 (its major and minor) are NOT read
+// here and are not named here: they belong to ntir.nova and machine_ir.nova,
+// which already publish and already check them, and a second reader of them
+// would be a second answer to a question two modules already answer.
+export fn size_of(input:buf<u8>)->u64 { return ntasm_pe.read64(input,32); }
+export fn word_count_of(input:buf<u8>)->u64 { return ntasm_pe.read64(input,24); }
+export fn digest_of(input:buf<u8>)->u64 { return ntasm_pe.read64(input,40); }

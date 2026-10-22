@@ -1,0 +1,20 @@
+module nova_native_driver_many_entry;
+import nova_native_driver_many;
+
+// THE APPLICATION ENTRY OF THE MANY PILOT, and it declares no function.
+//
+// This is the tests/ entry that names the pilot's module. The MODULE-SET census
+// of tests_ntasm_abi.c reads exactly that: a module joins the set by being
+// given an entry under tests/nova/tests that names it, and a module
+// of the directory with no such entry is reported by name. The name below is
+// also resolved against the compiler's own inputs, so a pilot absent from the
+// compile is refused with "Nova imported module is not among compiler inputs"
+// at nova.c's module_headers, instead of being a string a harness wrote down
+// and nobody checks against the tree.
+//
+// It declares no `main` and no other function ON PURPOSE, for the same reason
+// as the scalar entry: the pilot's own `export fn main()->u64` IS the
+// application, public_entry_v2 refuses a program carrying two, and the seed
+// harness runs the pilot's, with zero parameters, through the ABI2 wrapper. A
+// helper here would add a symbol and a function slot to the seed image that no
+// contract owns.

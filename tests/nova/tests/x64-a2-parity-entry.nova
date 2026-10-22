@@ -1,0 +1,40 @@
+// Gate entry for the A2 parity corpus: exactly ONE instruction statement of a
+// source body, encoded to out[0]=length and out[1..]=bytes, or a diagnostic with
+// out untouched.
+//
+// One statement and not a whole body: the older harnesses fed a body and read
+// the concatenation, so a case whose body happened to carry a second
+// instruction could report bytes that no single operand pair produced. Here the
+// entry refuses with 409 when the body holds zero or more than one statement
+// node, so the bytes a case compares are the bytes of its own operands.
+//
+// The entry does not re-derive any operand: x64_lower_fixed.encode_instruction
+// is the same export the lowerer calls, so this file adds a statement window
+// and nothing else.
+module x64_a2_parity_entry;import ntasm_ast;import ntasm_parser;import x64_lower_fixed;
+export fn main(source:buf<u8>,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<16{return 800;}
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false{ntasm_ast.release(tree);return 800;}
+    let mut found:u64=0;let mut id:u64=1;
+    while id<=tree.node_count {
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if node.kind==32 {
+            if found!=0{ntasm_ast.release(tree);return 409;}
+            found=id;
+        }
+        id=id+1;
+    }
+    if found==0{ntasm_ast.release(tree);return 409;}
+    let scratch:buf<u8>=alloc(runtime(),16);
+    let code:u64=x64_lower_fixed.encode_instruction(source,tree,found,features,cpl,scratch);
+    if code==0 {
+        let length:u64=scratch[0];
+        out[0]=u8(length);
+        let mut i:u64=0;
+        while i<length{out[1+i]=scratch[1+i];i=i+1;}
+    }
+    rt_free(runtime(),scratch);
+    ntasm_ast.release(tree);
+    return code;
+}

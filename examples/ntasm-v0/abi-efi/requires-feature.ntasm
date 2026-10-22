@@ -1,0 +1,17 @@
+module contract.feature
+target x86_64-nexora-uefi
+features {sse2}
+section .text {
+fn leaf()->u64
+effects {}
+clobbers {}
+requires {feature(sse2)} {
+return 42
+}
+export fn main()->u64
+effects {}
+clobbers {rax} {
+let answer:u64 = leaf();
+return answer
+}
+}

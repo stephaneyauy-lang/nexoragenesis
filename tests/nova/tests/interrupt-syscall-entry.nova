@@ -1,0 +1,57 @@
+module interrupt_syscall_entry;
+import ntasm_ast;import ntasm_parser;import ntasm_nxo;import ntasm_pe;
+import x64_fixed;import x64_lower_nxo;
+
+// Entry point for the interruption and syscall paths of A4.06.
+//
+// THE PARAMETER LIST IS THE ONE OF `x64-fixed-entry.nova`, CHARACTER FOR
+// CHARACTER IN SHAPE: `(first:buf<u8>, x:u64, y:u64, z:u64, out:buf<u8>)`, so
+// the host wrapper checks seven slots, and seven slots are what the harness
+// passes. That is not tidiness. The wrapper this entry runs behind guards
+// `count == param_count` and, for every buffer, `runtime_length(handle) ==
+// passed_length` (nova.c, ancre « guard(c, &q, binary(c, NTF_OP_NE, n,
+// loaded_args[i + 1], TY_BOOL, span), NV2_ARGUMENT, span) »). A shape that
+// differs from a proven one by one parameter is a shape whose arity has never
+// been exercised, and the first version of this file did differ — it took four
+// scalars and eight slots, and every single call came back `NV2_ARGUMENT`. The
+// lesson is the project's own: copy the shape that is proven, do not author a
+// new one.
+//
+//   x == 0 — ENCODEUR. `first` is the mnemonic, y is the feature mask, z is
+//            the privilege level, and x is left at zero so the operand count is
+//            zero. Delegates to x64_fixed.encode, which writes ONE BYTE per
+//            index: out[0] is the length, out[1..] the encoded bytes.
+//
+//   x == 1 — ABAISSEMENT. `first` is a .ntasm source, y is the privilege level
+//            the lowering is asked for. Every entry that existed in this tree
+//            passed y = 3, and the C reference lowers at 0 (codegen.c, ancre
+//            « NtX64Context context = {NT_X64_ALL_FEATURES, 0} »). Since
+//            swapgs, sysretq and iretq carry maximum_cpl = 0, a chain lowered
+//            in ring 3 refuses all three before a byte is written, and nobody
+//            had ever asked this chain for ring 0. That is the whole reason
+//            this mode exists.
+//
+// out = [size:u64][bytes] on success for the lowering mode. Every result is
+// transactional: on failure the output buffer keeps its previous content and
+// the code is non zero, which is the property the gate asserts on refusals.
+export fn main(first:buf<u8>,x:u64,y:u64,z:u64,out:buf<u8>)->u64 {
+    if x==0 {
+        return x64_fixed.encode(first,0,y,z,out);
+    }
+    if x==1 {
+        if len(out)<8 { return 827; }
+        let tree:ntasm_ast.Tree=ntasm_parser.parse(first,1);
+        if tree.ok==false { ntasm_ast.release(tree); return 800; }
+        let written:ntasm_nxo.WriteResult=x64_lower_nxo.build_function_bodies(first,tree,1,y);
+        ntasm_ast.release(tree);
+        let object_bytes:buf<u8>=written.bytes;
+        if written.code!=0 { rt_free(runtime(),object_bytes); return written.code; }
+        let size:u64=len(object_bytes);
+        if size>len(out)-8 { rt_free(runtime(),object_bytes); return 827; }
+        ntasm_pe.copy(out,8,object_bytes);
+        ntasm_pe.put64(out,0,size);
+        rt_free(runtime(),object_bytes);
+        return 0;
+    }
+    return 800;
+}

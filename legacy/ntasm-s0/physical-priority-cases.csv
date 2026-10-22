@@ -1,0 +1,6 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+physical-priority,PHYS-op-before-byte,file,legacy/ntasm-s0/diagnostic-priority/PHYS-op-before-byte.ntasm,131,6024163627bd693d3800bfc326dedbdc47c1b93074723ca1e48aa48a4b4fa78b,NGS0 E400 L0007 C0001 O00000040
+physical-priority,PHYS-format-before-byte,file,legacy/ntasm-s0/diagnostic-priority/PHYS-format-before-byte.ntasm,11,767b1ec35c2f5a87baa45628c1aa7eee27c3b2854b94d77c9620bc54623d0915,NGS0 E200 L0001 C0001 O00000000
+physical-priority,PHYS-ref-before-byte,file,legacy/ntasm-s0/diagnostic-priority/PHYS-ref-before-byte.ntasm,134,edd36f7249b14d4548c4cd3183d105435ccbcb7e134838f97e46e5e254ebc94b,NGS0 E301 L0006 C0005 O00000040
+physical-priority,PHYS-forward-after-byte,file,legacy/ntasm-s0/diagnostic-priority/PHYS-forward-after-byte.ntasm,137,46f82b115209cef58b218d6c6db3c26f2529ca187626a6fc94f34ea4986bb40e,NGS0 E100 L0006 C0003 O00000041
+physical-priority,PHYS-op-before-long,file,legacy/ntasm-s0/diagnostic-priority/PHYS-op-before-long.ntasm,384,0a47cc51c13f3cfc786757fd5a7c24c4a29406554b4c3f7dd53b047cecf91c4a,NGS0 E400 L0007 C0001 O00000040

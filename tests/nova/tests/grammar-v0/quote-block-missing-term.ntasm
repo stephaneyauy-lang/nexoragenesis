@@ -1,0 +1,3 @@
+module grammar.test
+target x86_64-nexora-none
+macro m()->ast.block { return quote(block){mov rax,1}; }

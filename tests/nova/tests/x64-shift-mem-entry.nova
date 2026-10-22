@@ -1,0 +1,39 @@
+// Gate entry for the memory destination of the two catalogue rows the encoder
+// could not state end to end: I12 M_1/M_CL/M_I8 (rol/ror/shl/shr/sar over
+// memory) and I19 form M (call/jmp through memory). One entry dispatches on a
+// family word so both new exports share the native operand description.
+//
+// kind1 is a register and kind3 is memory, the native numbering. The memory
+// descriptor is base 0..15 with 16 no base and 17 RIP, index 0..15 with 16 none,
+// scale, the displacement bits and segment 0/1/2, exactly as the two-register
+// and high8 entries pass it. count_kind is the native kind of the second
+// operand: 1 a register count, which only cl satisfies, and 2 an immediate
+// count, whose amount word is the folded two's complement the native shift
+// block range-checks against 255.
+//
+// Families 2 to 6 are the five unchanged historical exports of the very
+// instructions these two families complete, re-driven through this same entry so
+// the gate itself proves they are untouched. They read the words they need out
+// of the same frame: for family 3 the destination is the reg/high8/width triple,
+// for family 6 count_kind is the control kind, width the control width and
+// amount the control value.
+module x64_shift_mem_entry;
+import x64_fixed;
+export fn main(family:u64,name:buf<u8>,operand_count:u64,kind:u64,register:u64,high8:u64,width:u64,count_kind:u64,count_register:u64,amount:u64,base:u64,index:u64,scale:u64,displacement:u64,segment:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    // 0 rol/ror/shl/shr/sar over a memory destination: I12 M_1, M_CL and M_I8.
+    if family==0{return x64_fixed.encode_shift_memory(name,operand_count,kind,register,high8,width,count_kind,count_register,amount,base,index,scale,displacement,segment,features,cpl,out);}
+    // 1 call and jmp through a memory operand: I19 form M, width 64 only.
+    if family==1{return x64_fixed.encode_control_memory(name,operand_count,width,base,index,scale,displacement,segment,features,cpl,out);}
+    // 2 the immediate-count forms of the same family, I12 R_1 and R_I8.
+    if family==2{return x64_fixed.encode_shift_imm(name,operand_count,register,width,amount,features,cpl,out);}
+    // 3 the cl-count form of the same family, I12 R_CL.
+    if family==3{return x64_fixed.encode_shift_cl(name,operand_count,register,width,count_register,high8,features,cpl,out);}
+    // 4 inc/dec/not/neg, the digits that share the group-2 frame of the shifts.
+    if family==4{return x64_fixed.encode_unary(name,operand_count,register,width,features,cpl,out);}
+    // 5 the register spelling of the sixteen setcc, whose memory spelling is
+    // already carried by encode_setcc_operand.
+    if family==5{return x64_fixed.encode_setcc(name,operand_count,register,width,features,cpl,out);}
+    // 6 call and jmp over a relative displacement or a GPR64, I19 LABEL and R.
+    if family==6{return x64_fixed.encode_control(name,operand_count,count_kind,width,amount,1,features,cpl,out);}
+    return 800;
+}

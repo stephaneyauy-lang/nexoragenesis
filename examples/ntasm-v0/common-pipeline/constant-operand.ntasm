@@ -1,0 +1,11 @@
+module constant_operand
+target x86_64-nexora-uefi
+const limit:u64=99
+section .text {
+export fn main()->u64
+effects {}
+clobbers {rax} {
+mov rax,limit+1
+return rax
+}
+}

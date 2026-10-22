@@ -1,0 +1,6 @@
+module input_unsupported;
+fn main()->u64 {
+    let bytes:buf<u8>=alloc(runtime(),4);
+    return len(bytes);
+}
+

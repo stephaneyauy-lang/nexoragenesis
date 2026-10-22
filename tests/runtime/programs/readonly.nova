@@ -1,0 +1,11 @@
+module native_runtime_readonly;
+// Expected return0/error9; the return99 must never be reached.
+fn main()->u64 {
+    let destination:buf<u8>="42";
+    let source:buf<u8>=alloc(runtime(),2);
+    source[0]=65;
+    source[1]=66;
+    rt_copy(runtime(),destination,source,2);
+    return 99;
+}
+

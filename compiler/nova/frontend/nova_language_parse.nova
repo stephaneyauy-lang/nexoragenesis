@@ -1,0 +1,3352 @@
+module nova_language_parse;
+
+// LOT 151 -- AN ACTUAL NOVA PARSER, NOT A LEXER.
+//
+// WHAT THIS IS. `nova_language_lex.nova` walks a source buffer, cuts it into
+// identifier-shaped runs and reports WHICH of the eight Nova language keywords
+// occur in it. That is a token scan: it builds no tree, it nests nothing, it
+// knows no scope and it decides nothing. THIS module takes a Nova source
+// buffer and produces a NODE TREE -- declarations, statements, expressions and
+// blocks, nested -- with a SCOPE CHAIN, with shadowing resolved, with the
+// arguments and the return value of every function carrying their types, the
+// eight keywords distinguished from identifiers of the same shape, and a TYPE
+// LATTICE whose widths and register classes are carried ON THE NODE rather
+// than left to be inferred later.
+//
+// WHAT THIS IS NOT, and the sentence matters as much as the module:
+//   * NOT A COMPILER. Nothing here lowers, allocates a register, encodes,
+//     lays out or emits an instruction. The Machine IR is a different module.
+//   * NOT MACRO EXPANSION. `expand`, `comptime`, `$splice` and every other
+//     compile-time construct are A5 and the chain work. A module that expanded
+//     macros would be a DIFFERENT artefact, and claiming it here would be the
+//     failure the mission names: a deliverable's name stronger than the thing
+//     delivered.
+//   * NOT AN ABI. Calling convention, argument slots and stack layout are not
+//     decided here. A `buf<T>` parameter is typed and counted, never assigned
+//     two registers.
+//
+// WHY THE GRAMMAR HERE IS THE C FRONT END'S GRAMMAR AND NOT AN INVENTED ONE.
+// Every rule below was read out of `compiler/c/nova/frontend/nova.c` on this
+// tree, and the comment at each site names the function it came from. The
+// eight keywords are the lexer's eight (they are the C front end's own), the
+// precedence ladder is `precedence()`'s ladder with `||` and `&&` at 1 and 2
+// and `|` at 3, and the eleven builtin types are the eleven the reference
+// initialises its type table with. A parser that accepted a different language
+// than the one nova.c accepts would be a parser of nothing.
+//
+// THE GRAMMAR, IN THE ORDER THE REFERENCE PARSES IT.
+//   module_headers  : `module NAME;`
+//   collect_records : `[export] struct NAME { f:T, ... }`
+//   signatures      : `[export] fn NAME(p:T, ...) -> T { body }`
+//   parse_block     : `{ statement* }`
+//   parse_statement: block | `let [mut] n:T = e;` | `return e;`
+//                   | `if e { } else { }` | `while e { }`
+//                   | `n = e;` | `n.f = e;` | `f(e);`
+//   parse_expression: the precedence ladder of `precedence()`.
+//
+// THE THREE REFUSALS, AND WHY THEY ARE THREE AND NOT ONE.
+//   800  UNCLOSED_BRACE     a `{` was opened and the buffer ran out
+//   801  USE_BEFORE_DECL    a name used in a block before that block declares it
+//   802  TYPE_NOT_CARRYABLE a type applied to something that cannot carry it
+// Three codes, three reasons, three positions, three different needles. The
+// gate perturbs one real program three ways and requires the three answers to
+// differ in code AND reason AND position -- a single generic refusal would
+// satisfy "it refused" and would prove nothing about which rule fired.
+//
+// THE SCOPE CHAIN, AND WHY SHADOWING IS NOT A LOOKUP TABLE.
+// `lookup_optional` in the reference walks the variable array BACKWARDS and
+// takes the first active match, and `unique_local` refuses only a name already
+// live in the SAME scope. That is exactly a scope chain: a local declared in a
+// nested block shadows the enclosing one and both stay live. So the chain here
+// is a parent link per scope plus a live-binding list per scope, and resolution
+// walks scope->parent until it finds a live binding. A flat name table would
+// accept the shadowed program for the wrong reason and could not report WHICH
+// declaration a use resolved to; the node records the scope it resolved in, so
+// shadowing is a fact in the tree and not an inference.
+//
+// USE-BEFORE-DECLARATION IS ABOUT ORDER, NOT ABOUT VISIBILITY, and the two are
+// separated on purpose. A name that is not visible anywhere at all is a
+// different failure (803 UNDECLARED) and is NOT one of the three the brief
+// names. 801 is narrower and it is the interesting one: the name IS declared,
+// in THIS block, LATER. A forward reference is a real defect in a language
+// where every binding is introduced by a `let` that has not run yet. So this
+// parser resolves only against the bindings that exist AT THE USE, and when
+// there is none it asks whether this block declares the name LATER, which is a
+// bounded scan of the source ahead -- see `declared_later_in_block`. The gate
+// proves the distinction by perturbing a name that is never declared at all,
+// which must answer 803, not 801.
+//
+// THE TYPE LATTICE. Eleven types, from the reference's own initialisation of
+// its type table, with the width it gives each and the register class this
+// module can defend:
+//
+//   u8   u16  u32  u64   8/16/32/64 bits, class VALUE
+//   i8   i16  i32  i64   8/16/32/64 bits, class VALUE, signed
+//   bool               the reference gives it bits=8; class PREDICATE
+//   buf<u8> buf<u64>   64 bits, class ADDRESS
+//   runtime            the reference's TY_RUNTIME; 80 bits by ntir.nova's own
+//                      memory-descriptor rule, class ADDRESS
+//
+// THE REGISTER CLASS IS NOT A REGISTER. There is no register allocation in
+// this module and none is claimed: a class says what a value must SATISFY (a
+// general register, an address register, a predicate), not which physical
+// register it will land in. That vocabulary is `machine_ir.nova`'s own
+// four-value class word, which that module states is target-independent and is
+// NOT the NTIR physical family; using it here keeps ONE class word in the
+// tree instead of a fifth.
+//
+// AND THE LIMIT, STATED BECAUSE IT IS THE TEMPTING SPOT: this module does not
+// compute a register ASSIGNMENT, and no node carries a physical register. A
+// gate that wanted one would have to read it out of `register_widths.nova`,
+// which answers for a REGISTER SPELLING; a Nova source has none. A node whose
+// class is ADDRESS carries width 64 and says so, and there is no word on the
+// node that could be read as "this is rax". That is the honest absence.
+
+// ---- node layout ------------------------------------------------------------
+// One flat buffer of u64, NODE_WORDS words per one-based node id.
+//
+//   0  kind          a Nova language kind, from K_* below. NOT ast.nova's
+//                    numbering: ast.nova numbers the NTASM DIALECT's kinds and
+//                    thirty modules index those numbers directly, so reusing
+//                    them would be a claim about a different language.
+//   1  parent        this node's parent id, 0 at the root
+//   2  first_child   0 when the node has no children
+//   3  last_child
+//   4  next_sibling  0 when this is the last child of its parent
+//   5  name_start    byte offset of the name/identifier this node introduces
+//   6  name_end      byte offset one past it; name_end==name_start means the
+//                    node carries no name, which is a fact and not a default
+//   7  scope         the scope id this node was parsed IN
+//   8  resolved_scope  for a NAME node, the scope the name RESOLVED in. It
+//                    differs from word 7 exactly when a scope chain was walked,
+//                    and it is how shadowing is visible in the tree.
+//   9  type_width    bits, from the lattice. 0 when the node carries no width
+//  10  reg_class     REG_* below
+//  11  line          1-based, counted by the parser itself
+//  12  column        1-based
+//  13  aux           kind-specific: a keyword id, a mutability flag, an
+//                    operator's byte, a slot count. Documented per kind below.
+//  14  type_id       the lattice entry this node's type came from, 0 when it
+//                    carries no type. It is a SEPARATE word from aux because
+//                    aux already holds the keyword: an earlier version put the
+//                    type id in aux and overwrote `let mut`'s MUT with it, so
+//                    every `let` read back as aux==T_U64 and no `let` in the
+//                    tree could be told from another. MEASURED on the tree dump:
+//                    `let mut total` came back aux=4, which is T_U64 and is not
+//                    a keyword.
+//  15  decl_order / value
+//                    for a NAME node, the binding ordinal it resolved to; for
+//                    a DECLARATION, the ordinal it was bound at. Two nodes
+//                    carry the same number exactly when a use resolved to that
+//                    declaration. For a K_LITERAL node, carries the literal
+//                    value (Tok.value for integer literals, 1 for true, 0 for false).
+//                    No ambiguity because the kind distinguishes them strictly.
+//
+// WORD 14 REPLACED A `live` FLAG. Liveness is not a fact a node has to carry:
+// `resolve_any` already stops at each scope's floor, so a binding from a closed
+// scope is unreachable by construction. The word was a second, weaker copy of a
+// property the chain already enforces.
+
+export fn NODE_WORDS()->u64 { return 16; }
+
+// ---- the kinds --------------------------------------------------------------
+// A NEW NUMBERING for the Nova language, and deliberately not ast.nova's: the
+// two languages are different and a shared number would make a node mean two
+// things depending on which module read it.
+export fn K_MODULE()->u64 { return 1; }   // aux 0
+export fn K_IMPORT()->u64 { return 2; }   // aux 0
+export fn K_STRUCT()->u64 { return 3; }   // aux 1 when `export`
+export fn K_FIELD()->u64 { return 4; }    // aux 0
+export fn K_FN()->u64 { return 5; }       // aux 1 when `export`
+export fn K_PARAM()->u64 { return 6; }    // aux: ABI slot count, 2 for buf
+export fn K_RETURN()->u64 { return 7; }   // the declared return type
+export fn K_BLOCK()->u64 { return 8; }    // aux 0
+export fn K_LET()->u64 { return 9; }      // aux 1 when `mut`
+export fn K_ASSIGN()->u64 { return 10; }  // aux 0
+export fn K_RETURN_STMT()->u64 { return 11; }
+export fn K_WHILE()->u64 { return 12; }
+export fn K_IF()->u64 { return 13; }
+export fn K_NAME()->u64 { return 14; }    // a name USE; words 8 and 15 resolve
+export fn K_LITERAL()->u64 { return 15; } // aux: 0 decimal, 1 hex, 2 true, 3 false, 4 string
+export fn K_FIELD_ACCESS()->u64 { return 16; }
+export fn K_CALL()->u64 { return 17; }
+export fn K_BINARY()->u64 { return 18; }  // aux: the operator's byte
+export fn K_RECORD()->u64 { return 19; }  // NAME{a:1,b:2}
+export fn K_TYPE()->u64 { return 20; }    // a type annotation node
+export fn K_INDEX()->u64 { return 21; }   // buf[i] -> the ELEMENT type
+export fn K_BREAK()->u64 { return 22; }
+export fn K_CONTINUE()->u64 { return 23; }
+export fn K_UNARY()->u64 { return 24; }
+export fn K_PROGRAM()->u64 { return 25; }
+
+// ---- the eight keywords, and their aux values ------------------------------
+// The order is `keyword_words()`'s order in the lexer, which is the C front
+// end's own order of sites, and the read-back below is what the gate reads so
+// that a reordering here moves the gate with it.
+export fn KEY_EXPORT()->u64 { return 1; }
+export fn KEY_FN()->u64 { return 2; }
+export fn KEY_LET()->u64 { return 3; }
+export fn KEY_MODULE()->u64 { return 4; }
+export fn KEY_MUT()->u64 { return 5; }
+export fn KEY_RETURN()->u64 { return 6; }
+export fn KEY_STRUCT()->u64 { return 7; }
+export fn KEY_WHILE()->u64 { return 8; }
+
+// ---- the type lattice, and the register classes ----------------------------
+export fn T_U8()->u64 { return 1; }
+export fn T_U16()->u64 { return 2; }
+export fn T_U32()->u64 { return 3; }
+export fn T_U64()->u64 { return 4; }
+export fn T_I8()->u64 { return 5; }
+export fn T_I16()->u64 { return 6; }
+export fn T_I32()->u64 { return 7; }
+export fn T_I64()->u64 { return 8; }
+export fn T_BOOL()->u64 { return 9; }
+export fn T_BUF_U8()->u64 { return 10; }
+export fn T_BUF_U64()->u64 { return 11; }
+export fn T_RUNTIME()->u64 { return 12; }
+export fn T_LIMIT()->u64 { return 12; }
+
+// REG_NONE 0 is NOT a default for "unknown": it is the answer for a node that
+// carries no type at all (a block, an operator, a module), and a typed node
+// never gets it.
+export fn REG_NONE()->u64 { return 0; }
+export fn REG_VALUE()->u64 { return 1; }
+export fn REG_ADDRESS()->u64 { return 2; }
+export fn REG_PREDICATE()->u64 { return 3; }
+
+// ---- the refusal codes ------------------------------------------------------
+// 800 UNCLOSED_BRACE, 801 USE_BEFORE_DECL, 802 TYPE_NOT_CARRYABLE are the
+// three the gate perturbs for. 803 UNDECLARED is a fourth and is deliberately
+// NOT one of the three: it is the "the name does not exist at all" failure and
+// keeping it separate is what lets the gate tell 801 from 803 with a
+// perturbation that differs from both of the briefed ones.
+export fn E_UNCLOSED_BRACE()->u64 { return 800; }
+export fn E_USE_BEFORE_DECL()->u64 { return 801; }
+export fn E_TYPE_NOT_CARRYABLE()->u64 { return 802; }
+export fn E_UNDECLARED()->u64 { return 803; }
+export fn E_BAD_SYNTAX()->u64 { return 804; }
+export fn E_TOO_SMALL()->u64 { return 812; }
+
+// Reasons, distinct per code, published so a diagnostic names WHICH rule fired
+// and not only a number.
+export fn R_UNCLOSED_BRACE()->u64 { return 1; }
+export fn R_USE_BEFORE_DECL()->u64 { return 2; }
+export fn R_TYPE_NOT_CARRYABLE()->u64 { return 3; }
+export fn R_UNDECLARED()->u64 { return 4; }
+export fn R_BAD_SYNTAX()->u64 { return 5; }
+
+// ---- parser state -----------------------------------------------------------
+// One struct, carried BY REFERENCE through every call (the reference's own
+// idiom: `parse_expression(c, prec)` takes the Compiler and recurses). A Parser
+// holds no allocation of its own that outlives the call; `nodes`, `scopes` and
+// `binds` are the caller's buffers, so a refusal writes nothing outside them.
+struct Parser {
+    source:buf<u8>,size:u64,
+    cursor:u64,line:u64,column:u64,
+    nodes:buf<u64>,node_count:u64,node_capacity:u64,
+    scopes:buf<u64>,scope_count:u64,
+    binds:buf<u64>,bind_count:u64,binding_meta:buf<u64>,
+    fields:buf<u64>,field_count:u64,struct_count:u64,constructor_depth:u64,function_count:u64,function_words:u64,call_depth:u64,
+    scope:u64,depth:u64,fn_depth:u64,return_type:u64,live:u64,
+    code:u64,reason:u64,err_line:u64,err_column:u64,err_start:u64,
+    lex_value:u64,lex_start:u64,lex_end:u64,lex_line:u64,lex_column:u64,lex_hex:bool,
+    loop_top:u64,if_depth:u64,unary_depth:u64,
+    cache_cursor:u64,cache_valid:bool,cache_token:Tok,owned_head:Tok,
+    many:bool,units:buf<u64>,unit_count:u64,unit_index:u64,module_id:u64,lookup_module:u64,catalog_words:u64
+}
+
+// A scope record is three words: parent, depth, and the bind ordinal the scope
+// was opened at. A binding is six words: name_start, name_end, type_width,
+// reg_class, scope, ordinal.
+export fn SCOPE_WORDS()->u64 { return 3; }
+export fn BIND_WORDS()->u64 { return 6; }
+
+// ---- the eight keywords as bytes -------------------------------------------
+// A flat NUL-separated table in the lexer's order. `key_id` walks it, so the
+// bit the parser stores on a node and the word the gate prints come from ONE
+// table and cannot drift apart.
+// Compatibility table of eight base words; if/else and loop control are parsed separately.
+export fn keyword_words()->buf<u8> {
+    let words:buf<u8>="export\0fn\0let\0module\0mut\0return\0struct\0while\0";
+    return words;
+}
+export fn keyword_read_back(out:buf<u64>,base:u64)->u64 {
+    let words:buf<u8>=keyword_words();
+    let size:u64=len(words);
+    let mut i:u64=0;
+    while i<size { out[base+i]=words[i];i=i+1; }
+    rt_free(runtime(),words);
+    return size;
+}
+
+// Byte length of the word starting at `at`; 0 at or past the end.
+fn word_length(table:buf<u8>,at:u64)->u64 {
+    if at>=len(table) { return 0; }
+    let mut length:u64=0;
+    let mut cursor:u64=at;
+    while cursor<len(table) && table[cursor]!=0 { length=length+1;cursor=cursor+1; }
+    return length;
+}
+// The keyword id of source[start,end), or 0 when it is not one of the eight.
+// ONE WHOLE-IDENTIFIER WALK, and the length is compared BEFORE any byte is
+// compared, so `mutable` is refused on its length and never gets a byte
+// comparison at all. That is the property the lexer's gate already states; it
+// is kept here because a parser that re-derived the match differently would
+// quietly lose it.
+//
+// THE FIRST VERSION OF THIS LOOP SPUN, and it is recorded because the shape of
+// the bug is the shape this project's rules warn about. It read
+//     while at<size && candidate==true { ... }
+// where `candidate` was the SPAN-VALID flag, set once before the loop and never
+// changed by a match. On the first table word whose bytes equalled the name, the
+// body took neither branch -- `at` did not advance and `candidate` did not
+// clear -- so the loop re-tested the same slot forever. MEASURED: the parse of
+// a source containing `let` never returned, and the sweep that found it was
+// bounded by `timeout` rather than by anything in the module.
+//
+// So the loop now runs on a flag the body actually sets: `found` goes true on a
+// match and false when the table is exhausted, and `candidate` is only the
+// entry test. A loop whose condition the body cannot change is a loop whose
+// termination is not in the loop.
+fn key_id(source:buf<u8>,start:u64,end:u64)->u64 {
+    let table:buf<u8>=keyword_words();
+    let size:u64=len(table);
+    let candidate:bool=end>=start && end<=len(source);
+    if candidate==false { rt_free(runtime(),table);return 0; }
+    let name_len:u64=end-start;
+    let mut at:u64=0;
+    let mut id:u64=1;
+    let mut found:bool=false;
+    while at<size && found==false {
+        let length:u64=word_length(table,at);
+        if length!=name_len { at=at+length+1;id=id+1; }
+        else if span_equal(source,start,end,table,at)==true { found=true; }
+        else { at=at+length+1;id=id+1; }
+    }
+    rt_free(runtime(),table);
+    if found==false { return 0; }
+    return id;
+}
+fn span_equal(source:buf<u8>,start:u64,end:u64,table:buf<u8>,at:u64)->bool {
+    let length:u64=end-start;
+    let mut i:u64=0;
+    while i<length {
+        if source[start+i]!=table[at+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// ---- character classes ------------------------------------------------------
+fn is_space(ch:u64)->bool { return ch==32 || ch==9 || ch==13; }
+fn is_letter(ch:u64)->bool {
+    return (ch>=97 && ch<=122) || (ch>=65 && ch<=90) || ch==95;
+}
+fn is_digit(ch:u64)->bool { return ch>=48 && ch<=57; }
+fn is_hex(ch:u64)->bool {
+    return is_digit(ch) || (ch>=97 && ch<=102) || (ch>=65 && ch<=70);
+}
+fn is_name(ch:u64)->bool { return is_letter(ch) || is_digit(ch); }
+
+// ---- the tokenizer ----------------------------------------------------------
+// Skips whitespace and `//` comments, and REPORTS the position of every
+// significant byte through the four out-parameters, because every diagnostic in
+// this module has to name a line and a column and a byte offset. `stop` is the
+// set of bytes that cannot begin a token; it is a bitmask-free explicit test
+// because a mask over a u64 set would make the caller pass a table.
+struct Tok {
+    kind:u64,value:u64,start:u64,end:u64,line:u64,column:u64,
+    hex:bool,owned_next:Tok
+}
+// kind: 257 identifier, 258 number, 256 EOF, otherwise the byte itself.
+fn scan_token(p:Parser)->u64 {
+    let mut cursor:u64=p.cursor;
+    let mut line:u64=p.line;
+    let mut column:u64=p.column;
+    let size:u64=p.size;
+    let source:buf<u8>=p.source;
+    while cursor<size {
+        let ch:u64=source[cursor];
+        if is_space(ch) { cursor=cursor+1;column=column+1;continue; }
+        if ch==10 { cursor=cursor+1;line=line+1;column=1;continue; }
+        if ch==47 && cursor+1<size && source[cursor+1]==47 {
+            while cursor<size && source[cursor]!=10 { cursor=cursor+1;column=column+1; }
+            continue;
+        }
+        break;
+    }
+    if cursor>=size {
+        p.cursor=cursor;p.line=line;p.column=column;
+        p.lex_value=0;p.lex_start=cursor;p.lex_end=cursor;p.lex_line=line;p.lex_column=column;p.lex_hex=false;
+        return 256;
+    }
+    let start:u64=cursor;
+    let tok_line:u64=line;
+    let tok_column:u64=column;
+    let ch:u64=source[cursor];
+    let mut kind:u64=0;
+    let mut value:u64=0;
+    let mut hex:bool=false;
+    if ch==34 {
+        kind=259;
+        cursor=cursor+1;column=column+1;
+        let mut dec_len:u64=0;
+        let mut closed:bool=false;
+        while cursor<size {
+            let b:u64=source[cursor];
+            if b==10 || b==13 {
+                fail_at(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),tok_line,tok_column,start);
+                break;
+            }
+            if b==34 {
+                cursor=cursor+1;column=column+1;
+                closed=true;
+                break;
+            }
+            if b==92 {
+                cursor=cursor+1;column=column+1;
+                if cursor>=size {
+                    fail_at(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),tok_line,tok_column,start);
+                    break;
+                }
+                let esc:u64=source[cursor];
+                if esc==110 || esc==114 || esc==116 || esc==48 || esc==92 || esc==34 {
+                    dec_len=dec_len+1;
+                    cursor=cursor+1;column=column+1;
+                } else if esc==120 {
+                    cursor=cursor+1;column=column+1;
+                    if cursor+1>=size {
+                        fail_at(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),tok_line,tok_column,start);
+                        break;
+                    }
+                    let h1:u64=source[cursor];
+                    let h2:u64=source[cursor+1];
+                    if is_hex(h1)==false || is_hex(h2)==false {
+                        fail_at(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),tok_line,tok_column,start);
+                        break;
+                    }
+                    dec_len=dec_len+1;
+                    cursor=cursor+2;column=column+2;
+                } else {
+                    fail_at(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),tok_line,tok_column,start);
+                    break;
+                }
+            } else {
+                dec_len=dec_len+1;
+                cursor=cursor+1;column=column+1;
+            }
+        }
+        if closed==false && failed(p)==false {
+            fail_at(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),tok_line,tok_column,start);
+        }
+        value=dec_len;
+    } else if is_letter(ch) {
+        kind=257;
+        while cursor<size && is_name(source[cursor]) { cursor=cursor+1;column=column+1; }
+    } else if is_digit(ch) {
+        kind=258;
+        let mut base:u64=10;
+        if ch==48 && cursor+1<size && (source[cursor+1]==120 || source[cursor+1]==88) {
+            base=16;hex=true;cursor=cursor+2;column=column+2;
+        }
+        while cursor<size {
+            let digit:u64=source[cursor];
+            if base==16 && !is_hex(digit) { break; }
+            if base==10 && !is_digit(digit) { break; }
+            let mut part:u64=0;
+            if is_digit(digit) { part=digit-48; } else if digit>=97 { part=digit-87; }
+            else { part=digit-55; }
+            if value>(18446744073709551615-part)/base { value=18446744073709551615; }
+            else { value=value*base+part; }
+            cursor=cursor+1;column=column+1;
+        }
+    } else {
+        kind=ch;cursor=cursor+1;column=column+1;
+        if cursor<size {
+            let next:u64=source[cursor];
+            // The two-character tokens, packed as first*256+second, so `<=`
+            // is one token and never `<` then `=`, and `||` and `&&` are one
+            // token each rather than two identical bytes -- which matters,
+            // because two 124 bytes in a row would otherwise parse as two `|`
+            // at rank 3 and build a different tree than the reference builds.
+            //
+            // `->` IS IN THIS LIST AND ITS ABSENCE WAS MEASURED. A version that
+            // packed only the operators `precedence()` knows left `->` as two
+            // tokens, and `parse_fn` -- which tests for 45*256+62 -- then
+            // refused every function with a return type at the `-`. The
+            // diagnostic said 804 BAD_SYNTAX at 2:20 on
+            // `export fn f(a:u64) -> u64 {`, which is the arrow's own column.
+            // The cause is a set of two-character tokens that was built from
+            // the EXPRESSION table and not from the whole grammar.
+            if ch==45 && next==62 { kind=ch*256+next;cursor=cursor+1;column=column+1; }
+            else if ch==60 && (next==61 || next==60) { kind=ch*256+next;cursor=cursor+1;column=column+1; }
+            else if ch==62 && (next==61 || next==62) { kind=ch*256+next;cursor=cursor+1;column=column+1; }
+            else if ch==61 && next==61 { kind=ch*256+next;cursor=cursor+1;column=column+1; }
+            else if ch==33 && next==61 { kind=ch*256+next;cursor=cursor+1;column=column+1; }
+            else if ch==124 && next==124 { kind=ch*256+next;cursor=cursor+1;column=column+1; }
+            else if ch==38 && next==38 { kind=ch*256+next;cursor=cursor+1;column=column+1; }
+        }
+    }
+    p.cursor=cursor;p.line=line;p.column=column;
+    p.lex_value=value;p.lex_start=start;p.lex_end=cursor;
+    p.lex_line=tok_line;p.lex_column=tok_column;p.lex_hex=hex;
+    return kind;
+}
+
+// Cache d'un seul jeton immuable par position curseur. Permet d'eviter une
+// seconde allocation lors de peek() suivi de next_token() sans muter l'objet.
+// Limitation : un Tok immuable reste alloue par jeton consomme ; ceci allegre
+// la pression memoire des prepasses sans pretendre a une absence totale de garbage.
+fn release_tokens(head:Tok)->u64 {
+    let mut cur:Tok=head;
+    while cur!=null {
+        let next:Tok=cur.owned_next;
+        rt_free(runtime(),cur);
+        cur=next;
+    }
+    return 0;
+}
+fn next_token(p:Parser)->Tok {
+    if p.cache_valid==true && p.cache_cursor==p.cursor {
+        let t:Tok=p.cache_token;
+        p.cursor=t.end;
+        p.line=t.line;
+        p.column=t.column+(t.end-t.start);
+        return t;
+    }
+    let in_cur:u64=p.cursor;
+    let kind:u64=scan_token(p);
+    let tok:Tok=Tok{kind:kind,value:p.lex_value,start:p.lex_start,end:p.lex_end,
+                   line:p.lex_line,column:p.lex_column,hex:p.lex_hex,
+                   owned_next:p.owned_head};
+    p.owned_head=tok;
+    if failed(p)==false {
+        p.cache_cursor=in_cur;
+        p.cache_valid=true;
+        p.cache_token=tok;
+    }
+    return tok;
+}
+
+// ---- scopes -----------------------------------------------------------------
+// `open_scope` links the new scope to the current one and returns its id, or 0
+// when there is no room -- and 0 is NOT the same answer as "no scope". The
+// caller checks for 0 and refuses with E_TOO_SMALL; a version that returned
+// the id it could not store would let the parser keep building a tree whose
+// scope chain was silently truncated, which is the forbidden shape: an
+// invalid answer where a refusal was owed.
+fn open_scope(p:Parser)->u64 {
+    let id:u64=p.scope_count+1;
+    if (id-1)*SCOPE_WORDS()+SCOPE_WORDS()>len(p.scopes) { return 0; }
+    let at:u64=(id-1)*SCOPE_WORDS();
+    p.scopes[at]=p.scope;
+    p.scopes[at+1]=p.depth;
+    p.scopes[at+2]=p.bind_count;
+    p.scope_count=id;
+    p.scope=id;
+    p.depth=p.depth+1;
+    return id;
+}
+fn close_scope(p:Parser)->u64 {
+    if p.scope==0 { return 0; }
+    let at:u64=(p.scope-1)*SCOPE_WORDS();
+    p.depth=p.scopes[at+1];
+    p.scope=p.scopes[at];
+    return 0;
+}
+// A binding goes into the CURRENT scope. `ordinal` is its position among the
+// live bindings, and `declare` returns it: this is the number a later use
+// resolves to, and its ORDER is what makes a use-before-declaration
+// detectable at all.
+// A binding goes into the CURRENT scope and its ordinal is its id among the
+// live bindings. That ORDER is what makes a use-before-declaration detectable
+// at all: a later use resolves to an ordinal, and an ordinal below the scope's
+// floor was not yet declared when the scope opened. Returns 0 when there is no
+// room, and 0 is refused by the caller rather than read as "declared as 0" --
+// 0 is already the sentinel for "no binding".
+fn declare(p:Parser,start:u64,end:u64,width:u64,class:u64,type_id:u64,is_mut:bool)->u64 {
+    let id:u64=p.bind_count+1;
+    if p.function_words>len(p.binds) { return 0; }
+    if id*BIND_WORDS()>len(p.binds)-p.function_words { return 0; }
+    let meta_at:u64=(id-1)*2;
+    if meta_at+1>=len(p.binding_meta) { return 0; }
+    let at:u64=(id-1)*BIND_WORDS();
+    p.binds[at]=start;p.binds[at+1]=end;p.binds[at+2]=width;
+    p.binds[at+3]=class;p.binds[at+4]=p.scope;p.binds[at+5]=id;
+    p.bind_count=id;
+    p.binding_meta[meta_at]=type_id;
+    let mut mut_flag:u64=0;
+    if is_mut { mut_flag=1; }
+    p.binding_meta[meta_at+1]=mut_flag;
+    return id;
+}
+// The ordinal at which `scope` began, so a resolution can refuse a binding
+// declared AFTER the use point. This is the whole of use-before-declaration:
+// the binding exists, but not yet.
+fn scope_floor(p:Parser,scope:u64)->u64 {
+    if scope==0 { return 0; }
+    if scope>p.scope_count { return 0; }
+    return p.scopes[(scope-1)*SCOPE_WORDS()+2];
+}
+// Resolution itself is `resolve_any` below, and it lives there rather than here
+// for a reason that is about the REFUSALS and not about tidiness: the floor test
+// that separates "declared later" from "not declared at all" must not be folded
+// into the search, or the two failures become one answer.
+//
+// AND THE COMPARISON IS BY NAME TEXT, NEVER BY BYTE OFFSET. That is the second
+// defect this module had, and it is worth recording because the offset form
+// LOOKS correct and is not: a binding records where its name was DECLARED, and
+// a use is somewhere else in the buffer entirely, so `let mut t` at offset 29
+// and the `t` in `while t<a` at offset 61 can never be the same pair of
+// numbers. MEASURED: every use of a local was answered 803 UNDECLARED, on a
+// source the reference parses, at 4:7 -- the `t` of `while t<a`.
+// decls.nova's `same_name` is the same lesson in the same tree: compare the
+// source text over the two spans, with the lengths compared first.
+fn same_name(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end { return false; }
+    if a_end>len(source) || b_end>len(source) { return false; }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+fn bind_width(p:Parser,id:u64)->u64 {
+    if id==0 || id>p.bind_count { return 0; }
+    return p.binds[(id-1)*BIND_WORDS()+2];
+}
+fn bind_class(p:Parser,id:u64)->u64 {
+    if id==0 || id>p.bind_count { return 0; }
+    return p.binds[(id-1)*BIND_WORDS()+3];
+}
+fn bind_scope(p:Parser,id:u64)->u64 {
+    if id==0 || id>p.bind_count { return 0; }
+    return p.binds[(id-1)*BIND_WORDS()+4];
+}
+
+// ---- the type lattice -------------------------------------------------------
+// Eleven entries: width in bits and the register class this module can defend.
+// A type name that is not one of the eleven REFUSES with 802 rather than
+// answering width 0, because width 0 is what an untyped node carries and a
+// mistyped node carrying it would be indistinguishable from a node that never
+// had a type.
+fn lattice_width_ctx(p:Parser,t:u64)->u64 {
+    if t>T_LIMIT() && t<=T_LIMIT()+p.struct_count { return 64; }
+    return lattice_width(t);
+}
+fn lattice_class_ctx(p:Parser,t:u64)->u64 {
+    if t>T_LIMIT() && t<=T_LIMIT()+p.struct_count { return REG_ADDRESS(); }
+    return lattice_class(t);
+}
+fn lattice_width(t:u64)->u64 {
+    if t==T_U8() { return 8; }
+    if t==T_U16() { return 16; }
+    if t==T_U32() { return 32; }
+    if t==T_U64() { return 64; }
+    if t==T_I8() { return 8; }
+    if t==T_I16() { return 16; }
+    if t==T_I32() { return 32; }
+    if t==T_I64() { return 64; }
+    if t==T_BOOL() { return 8; }
+    if t==T_BUF_U8() { return 64; }
+    if t==T_BUF_U64() { return 64; }
+    if t==T_RUNTIME() { return 80; }
+    return 0;
+}
+fn lattice_class(t:u64)->u64 {
+    if t==T_BOOL() { return REG_PREDICATE(); }
+    if t==T_BUF_U8() || t==T_BUF_U64() || t==T_RUNTIME() { return REG_ADDRESS(); }
+    if t>=T_U8() && t<=T_I64() { return REG_VALUE(); }
+    return REG_NONE();
+}
+fn lattice_known(t:u64)->bool { return t>=T_U8() && t<=T_LIMIT(); }
+// The element type of a `buf<T>`, or 0 when T is not a buffer. Used to reject a
+// `buf<buf<u8>>`, which the reference's `type_parse_inner` cannot produce.
+fn lattice_element(t:u64)->u64 {
+    if t==T_BUF_U8() { return T_U8(); }
+    if t==T_BUF_U64() { return T_U64(); }
+    return 0;
+}
+fn lattice_name(t:u64)->buf<u8> {
+    if t==T_U8() { return "u8\0"; }
+    if t==T_U16() { return "u16\0"; }
+    if t==T_U32() { return "u32\0"; }
+    if t==T_U64() { return "u64\0"; }
+    if t==T_I8() { return "i8\0"; }
+    if t==T_I16() { return "i16\0"; }
+    if t==T_I32() { return "i32\0"; }
+    if t==T_I64() { return "i64\0"; }
+    if t==T_BOOL() { return "bool\0"; }
+    if t==T_BUF_U8() { return "buf<u8>\0"; }
+    if t==T_BUF_U64() { return "buf<u64>\0"; }
+    if t==T_RUNTIME() { return "runtime\0"; }
+    return "\0";
+}
+export fn lattice_read_back(out:buf<u64>,base:u64)->u64 {
+    let mut t:u64=T_U8();
+    let mut n:u64=0;
+    while t<=T_LIMIT() {
+        let name:buf<u8>=lattice_name(t);
+        let size:u64=len(name);
+        out[base+n]=t;
+        out[base+n+1]=lattice_width(t);
+        out[base+n+2]=lattice_class(t);
+        out[base+n+3]=size;
+        let mut i:u64=0;
+        while i<size { out[base+n+4+i]=name[i];i=i+1; }
+        rt_free(runtime(),name);
+        n=n+4+size;
+        t=t+1;
+    }
+    return n;
+}
+
+// ---- nodes ------------------------------------------------------------------
+// `node` allocates one node and initialises every word, INCLUDING the ones that
+// mean "none". A node with an uninitialised word is not a node this module is
+// willing to hand out: the gate reads all sixteen words of every node, and a
+// stale word would read as a fact. Returns 0 when the tree is full, and 0 is
+// refused by the caller -- never read as a node.
+fn node(p:Parser,kind:u64,start:u64,line:u64,column:u64)->u64 {
+    let id:u64=p.node_count+1;
+    if (id-1)*NODE_WORDS()+NODE_WORDS()>len(p.nodes) { return 0; }
+    let at:u64=(id-1)*NODE_WORDS();
+    let nodes:buf<u64>=p.nodes;
+    nodes[at]=kind;
+    nodes[at+1]=p.scope;      // parent is set by attach, not here
+    nodes[at+2]=0;nodes[at+3]=0;nodes[at+4]=0;
+    nodes[at+5]=start;nodes[at+6]=start;
+    nodes[at+7]=p.scope;      // the scope this node was parsed IN
+    nodes[at+8]=0;           // the scope a NAME resolved IN
+    nodes[at+9]=0;           // type_width
+    nodes[at+10]=0;          // reg_class
+    nodes[at+11]=line;nodes[at+12]=column;
+    nodes[at+13]=0;          // aux
+    nodes[at+14]=0;          // type_id
+    nodes[at+15]=0;          // decl_order
+    p.node_count=id;
+    return id;
+}
+fn nput(p:Parser,id:u64,field:u64,value:u64)->u64 {
+    if id==0 || id>p.node_count { return 0; }
+    p.nodes[(id-1)*NODE_WORDS()+field]=value;
+    return 0;
+}
+fn nget(p:Parser,id:u64,field:u64)->u64 {
+    if id==0 || id>p.node_count { return 0; }
+    return p.nodes[(id-1)*NODE_WORDS()+field];
+}
+// `attach` links `child` as the last child of `parent`, maintaining both the
+// first_child/last_child pair and the next_sibling chain, and setting the
+// child's parent. This is what makes the tree NESTED rather than flat.
+fn attach(p:Parser,parent:u64,child:u64)->u64 {
+    if parent==0 || child==0 { return 0; }
+    let last:u64=nget(p,parent,3);
+    if last==0 { nput(p,parent,2,child); }
+    else { nput(p,last,4,child); }
+    nput(p,parent,3,child);
+    nput(p,child,1,parent);
+    return child;
+}
+fn name_span(p:Parser,id:u64,start:u64,end:u64)->u64 {
+    nput(p,id,5,start);nput(p,id,6,end);return 0;
+}
+fn typed(p:Parser,id:u64,width:u64,class:u64)->u64 {
+    nput(p,id,9,width);nput(p,id,10,class);return 0;
+}
+
+// ---- the four refusals ------------------------------------------------------
+// One site, and it keeps the FIRST error: `if p.code!=0 { return; }` at the top
+// is what makes three perturbations distinguishable, because a parser that
+// kept parsing after a refusal would overwrite the first code with a later one
+// and two different defects would report the same answer.
+fn fail_at(p:Parser,code:u64,reason:u64,line:u64,column:u64,start:u64)->u64 {
+    if p.code!=0 { return 0; }
+    p.code=code;p.reason=reason;p.err_line=line;p.err_column=column;p.err_start=start;
+    return 0;
+}
+fn fail_tok(p:Parser,code:u64,reason:u64,t:Tok)->u64 {
+    return fail_at(p,code,reason,t.line,t.column,t.start);
+}
+fn failed(p:Parser)->bool { return p.code!=0; }
+
+// ---- types ------------------------------------------------------------------
+// The type id for an identifier-shaped token, or 0 when the token is not one of
+// the eleven. Whole-identifier again: `u64x` is not `u64` and `u8` is not
+// `u64`.
+fn lookup_struct_type(p:Parser,start:u64,end:u64)->u64 {
+    let mut i:u64=0;
+    while i<p.struct_count {
+        let at:u64=len(p.fields)-(i+1)*3;
+        if same_name(p.source,p.fields[at],p.fields[at+1],start,end)==true {
+            let owner_m:u64=unit_of_offset(p,p.fields[at]);
+            if p.many==false || owner_m==p.lookup_module {
+                return p.fields[at+2];
+            }
+        }
+        i=i+1;
+    }
+    return 0;
+}
+fn type_of(source:buf<u8>,start:u64,end:u64)->u64 {
+    let size:u64=end-start;
+    if size==2 {
+        if source[start]==117 && source[start+1]==56 { return T_U8(); }
+        if source[start]==105 && source[start+1]==56 { return T_I8(); }
+    }
+    if size==3 {
+        if source[start]==117 && source[start+1]==54 && source[start+2]==52 { return T_U64(); }
+        if source[start]==117 && source[start+1]==51 && source[start+2]==50 { return T_U32(); }
+        if source[start]==117 && source[start+1]==49 && source[start+2]==54 { return T_U16(); }
+        if source[start]==105 && source[start+1]==54 && source[start+2]==52 { return T_I64(); }
+        if source[start]==105 && source[start+1]==51 && source[start+2]==50 { return T_I32(); }
+        if source[start]==105 && source[start+1]==49 && source[start+2]==54 { return T_I16(); }
+    }
+    if size==4 && source[start]==98 && source[start+1]==111 &&
+       source[start+2]==111 && source[start+3]==108 { return T_BOOL(); }
+    if size==7 && source[start]==114 && source[start+1]==117 &&
+       source[start+2]==110 && source[start+3]==116 && source[start+4]==105 &&
+       source[start+5]==109 && source[start+6]==101 { return T_RUNTIME(); }
+    return 0;
+}
+// One type annotation, as a K_TYPE node carrying the width and the class. This
+// is the ONLY place a type is turned into a width, so every width in the tree
+// came from the lattice and none was written by a caller.
+fn parse_type(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    let id:u64=node(p,K_TYPE(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    name_span(p,id,t.start,t.end);
+    if t.kind!=257 {
+        // THE THIRD REFUSAL, and its sharpest form. A type in a position that
+        // must hold a type, holding something else, is 802 TYPE_NOT_CARRYABLE
+        // -- not a syntax error, because the syntax was fine: the SYNTAX carried
+        // a type that cannot live there. `let x:;` and `fn f(a:) -> ` both land
+        // here and both are 802.
+        fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+        return 0;
+    }
+    if t.end-t.start==3 && p.source[t.start]==98 &&
+       p.source[t.start+1]==117 && p.source[t.start+2]==102 {
+        let lt:Tok=next_token(p);
+        if failed(p)==true { return 0; }
+        if lt.kind!=60 {
+            fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+            return 0;
+        }
+        let elem:Tok=next_token(p);
+        if failed(p)==true { return 0; }
+        let mut elem_type:u64=0;
+        if elem.kind==257 {
+            if elem.end-elem.start==2 && p.source[elem.start]==117 && p.source[elem.start+1]==56 {
+                elem_type=T_U8();
+            } else if elem.end-elem.start==3 && p.source[elem.start]==117 &&
+                      p.source[elem.start+1]==54 && p.source[elem.start+2]==52 {
+                elem_type=T_U64();
+            }
+        }
+        if elem_type==0 {
+            fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),elem);
+            return 0;
+        }
+        let gt:Tok=next_token(p);
+        if failed(p)==true { return 0; }
+        let mut close_end:u64=gt.end;
+        if gt.kind==62*256+61 {
+            p.cursor=gt.end-1;
+            p.line=gt.line;
+            p.column=gt.column+1;
+            close_end=gt.end-1;
+        } else if gt.kind!=62 {
+            fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),gt);
+            return 0;
+        }
+        name_span(p,id,t.start,close_end);
+        if elem_type==T_U8() {
+            typed(p,id,lattice_width(T_BUF_U8()),lattice_class(T_BUF_U8()));
+            nput(p,id,13,T_BUF_U8());
+            nput(p,id,14,T_BUF_U8());
+            return id;
+        }
+        if elem_type==T_U64() {
+            typed(p,id,lattice_width(T_BUF_U64()),lattice_class(T_BUF_U64()));
+            nput(p,id,13,T_BUF_U64());
+            nput(p,id,14,T_BUF_U64());
+            return id;
+        }
+    }
+    let mut ty:u64=0;
+    let pdot:Tok=peek(p);
+    if pdot.kind==46 && p.many==true {
+        step(p);
+        let item_tok:Tok=next_token(p);
+        if item_tok.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),item_tok);return 0; }
+        let target_mid:u64=resolve_imported_module(p,t.start,t.end);
+        if target_mid==0 { fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),t);return 0; }
+        if is_declared_export(p,target_mid,item_tok.start,item_tok.end,K_STRUCT())==false {
+            fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),item_tok);return 0;
+        }
+        let saved_lm:u64=p.lookup_module;
+        p.lookup_module=target_mid;
+        ty=lookup_struct_type(p,item_tok.start,item_tok.end);
+        p.lookup_module=saved_lm;
+        name_span(p,id,t.start,item_tok.end);
+    } else {
+        ty=type_of(p.source,t.start,t.end);
+        if ty==0 {
+            ty=lookup_struct_type(p,t.start,t.end);
+        }
+    }
+    if ty==0 {
+        fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+        return 0;
+    }
+    typed(p,id,lattice_width_ctx(p,ty),lattice_class_ctx(p,ty));
+    nput(p,id,13,ty);
+    nput(p,id,14,ty);
+    return id;
+}
+
+// ---- the precedence ladder --------------------------------------------------
+// `precedence()`'s own numbers, from the C front end: `||` and `&&` at 1 and 2,
+// `|` 3, `^` 4, `&` 5, equality 6, relational 7, shifts 8, additive 9,
+// multiplicative 10, and 0 for everything else. The two-character tokens are
+// packed by the tokenizer as first*256+second, and aux stores the full compound token kind.
+fn precedence(kind:u64)->u64 {
+    if kind==124*256+124 { return 1; }   // ||
+    if kind==38*256+38 { return 2; }     // &&
+    if kind==124 { return 3; }
+    if kind==94 { return 4; }
+    if kind==38 { return 5; }
+    if kind==61*256+61 { return 6; }   // ==
+    if kind==33*256+61 { return 6; }   // !=
+    if kind==60 { return 7; }
+    if kind==62 { return 7; }
+    if kind==60*256+61 { return 7; }   // <=
+    if kind==62*256+61 { return 7; }   // >=
+    if kind==60*256+60 { return 8; }   // <<
+    if kind==62*256+62 { return 8; }   // >>
+    if kind==43 { return 9; }
+    if kind==45 { return 9; }
+    if kind==42 { return 10; }
+    if kind==47 { return 10; }
+    if kind==37 { return 10; }
+    return 0;
+}
+fn operator_byte(kind:u64)->u64 {
+    return kind;
+}
+// A comparison or a logical operator yields a predicate; an arithmetic one
+// yields the wider of its two integer operands. That is `parse_expression`'s
+// own typing rule at the C front end, and a bool operand to an arithmetic
+// operator is 802 rather than a width of 0.
+fn binary_class(op:u64,a_class:u64,b_class:u64)->u64 {
+    let rank:u64=precedence(op);
+    if rank==1 || rank==2 { return REG_PREDICATE(); }
+    if rank>=6 && rank<=7 { return REG_PREDICATE(); }
+    if a_class!=REG_VALUE() || b_class!=REG_VALUE() { return REG_NONE(); }
+    return REG_VALUE();
+}
+// The WIDTH of an arithmetic result is the wider of the two operands, and it
+// is computed SEPARATELY from the class. Only logical (ranks 1, 2) and
+// comparison (ranks 6, 7) operators yield width 8 (predicate); bitwise,
+// shifts and arithmetic preserve operand width.
+fn binary_width(op:u64,a_width:u64,b_width:u64)->u64 {
+    let rank:u64=precedence(op);
+    if rank==1 || rank==2 || rank==6 || rank==7 { return 8; }
+    if a_width>=b_width { return a_width; }
+    return b_width;
+}
+
+// ---- expressions ------------------------------------------------------------
+fn parse_expression(p:Parser,minimum:u64)->u64 {
+    // `parse_postfix`, NOT `parse_primary`. The reference's `parse_expression`
+    // calls `primary`, and `primary` is the loop that consumes `.`, `[` and a
+    // call's argument list -- so a parser that reached for `parse_primary` here
+    // could never see `slot.count` or `bytes[0]` inside an expression at all.
+    // The first version of this line did exactly that, and the postfix forms
+    // were unreachable from every operator's right operand.
+    let mut left:u64=parse_postfix(p);
+    if failed(p)==true { return 0; }
+    let mut comparisons:bool=false;
+    while failed(p)==false {
+        let t:Tok=peek(p);
+        let rank:u64=precedence(t.kind);
+        if rank==0 || rank<minimum { break; }
+        if rank==6 && comparisons==true { break; }
+        if rank==6 { comparisons=true; }
+        step(p);
+        let id:u64=node(p,K_BINARY(),t.start,t.line,t.column);
+        if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        nput(p,id,13,operator_byte(t.kind));
+        let a_class:u64=nget(p,left,10);
+        let b_id:u64=parse_expression(p,rank+1);
+        if failed(p)==true { return 0; }
+        let b_class:u64=nget(p,b_id,10);
+        attach(p,id,left);
+        attach(p,id,b_id);
+        let class:u64=binary_class(t.kind,a_class,b_class);
+        if rank!=1 && rank!=2 && rank<6 && class==REG_NONE() {
+            // An arithmetic operator over something that is not an integer
+            // value. 802 again, and it is a TYPE question, not a syntax one.
+            fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+            return 0;
+        }
+        // NO INLINE `if` IN ARGUMENT POSITION. The reference parses a
+        // conditional as a STATEMENT (nova.c's parse_statement has no
+        // conditional-expression production, and `atom`/`primary` never reach
+        // one), so `typed(p,id,if c { a } else { b },k)` is not Nova and the
+        // front end answers "Nova unknown or out-of-scope variable" at the
+        // `if` -- measured on this exact line, 749:20, before it was written
+        // this way. The value is therefore bound by a statement first.
+        typed(p,id,binary_width(t.kind,nget(p,left,9),nget(p,b_id,9)),class);
+        left=id;
+    }
+    return left;
+}
+
+// ---- constructeurs d'enregistrements (K_RECORD) ----------------------------
+// Un noeud K_RECORD porte une largeur porteuse de 64 bits, la classe REG_ADDRESS,
+// et son mot 14 contient l'identifiant du type d'enregistrement (> T_LIMIT).
+// Ses enfants directs sont des K_FIELD d'initialisation distincts des champs de
+// declaration (distingues par leur parent K_RECORD) :
+//   - mot 14 : type attendu du champ ;
+//   - mot 15 : ordinal de DECLARATION du champ dans le struct (base 0), independant
+//              de l'ordre des initialisateurs dans la source ;
+//   - mots 5/6 : etendue de source du nom du membre ;
+//   - exactement un enfant contenant l'expression de valeur coercee.
+//
+// constructor_depth limite l'imbrication des constructeurs a 128 par securite ;
+// cela ne garantit pas la parite globale de profondeur avec enter() du front C.
+// L'inference et la coercition d'expressions numeriques/constantes servent ici
+// a typer les initialisateurs sans pretendre etre un verificateur de type complet.
+fn struct_field_count(p:Parser,owner:u64)->u64 {
+    let mut count:u64=0;
+    let mut i:u64=0;
+    while i<p.field_count {
+        if p.fields[i*4+3]==owner { count=count+1; }
+        i=i+1;
+    }
+    return count;
+}
+fn record_field_index(p:Parser,owner:u64,start:u64,end:u64)->u64 {
+    let mut i:u64=0;
+    while i<p.field_count {
+        let at:u64=i*4;
+        if p.fields[at+3]==owner {
+            if same_name(p.source,p.fields[at],p.fields[at+1],start,end)==true {
+                return i+1;
+            }
+        }
+        i=i+1;
+    }
+    return 0;
+}
+fn record_field_ordinal(p:Parser,owner:u64,idx0:u64)->u64 {
+    let mut ord:u64=0;
+    let mut i:u64=0;
+    while i<idx0 {
+        if p.fields[i*4+3]==owner { ord=ord+1; }
+        i=i+1;
+    }
+    return ord;
+}
+fn is_integer_type(t:u64)->bool {
+    return t>=T_U8() && t<=T_I64();
+}
+fn is_signed_integer(t:u64)->bool {
+    return t>=T_I8() && t<=T_I64();
+}
+fn is_unsigned_integer(t:u64)->bool {
+    return t>=T_U8() && t<=T_U64();
+}
+fn integer_in_range(val:u64,target_ty:u64)->bool {
+    if target_ty==T_U8() { return val<=255; }
+    if target_ty==T_U16() { return val<=65535; }
+    if target_ty==T_U32() { return val<=4294967295; }
+    if target_ty==T_U64() { return true; }
+    if target_ty==T_I8() { return val<=127; }
+    if target_ty==T_I16() { return val<=32767; }
+    if target_ty==T_I32() { return val<=2147483647; }
+    if target_ty==T_I64() { return val<=9223372036854775807; }
+    return false;
+}
+fn is_unary_minus_chain(p:Parser,expr_id:u64)->bool {
+    if expr_id==0 || expr_id>p.node_count { return false; }
+    let k:u64=nget(p,expr_id,0);
+    if k==K_LITERAL() {
+        let aux:u64=nget(p,expr_id,13);
+        return aux==0 || aux==1;
+    }
+    if k==K_UNARY() {
+        let op:u64=nget(p,expr_id,13);
+        if op!=45 { return false; }
+        let child:u64=nget(p,expr_id,2);
+        return is_unary_minus_chain(p,child);
+    }
+    return false;
+}
+fn coerce_unary_minus_chain(p:Parser,expr_id:u64,target_ty:u64,is_neg:bool)->bool {
+    if expr_id==0 || expr_id>p.node_count { return false; }
+    let k:u64=nget(p,expr_id,0);
+    if k==K_LITERAL() {
+        let val:u64=nget(p,expr_id,15);
+        if is_neg==true {
+            if is_signed_integer(target_ty)==false { return false; }
+            if target_ty==T_I8() && val<=128 {
+                publish_expr_type(p,expr_id,target_ty);
+                return true;
+            }
+            if target_ty==T_I16() && val<=32768 {
+                publish_expr_type(p,expr_id,target_ty);
+                return true;
+            }
+            if target_ty==T_I32() && val<=2147483648 {
+                publish_expr_type(p,expr_id,target_ty);
+                return true;
+            }
+            if target_ty==T_I64() && val<=9223372036854775808 {
+                publish_expr_type(p,expr_id,target_ty);
+                return true;
+            }
+            return false;
+        } else {
+            if integer_in_range(val,target_ty)==true {
+                publish_expr_type(p,expr_id,target_ty);
+                return true;
+            }
+            return false;
+        }
+    }
+    if k==K_UNARY() {
+        let op:u64=nget(p,expr_id,13);
+        if op==45 {
+            let child:u64=nget(p,expr_id,2);
+            let next_neg:bool=!is_neg;
+            if coerce_unary_minus_chain(p,child,target_ty,next_neg)==true {
+                publish_expr_type(p,expr_id,target_ty);
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+fn publish_expr_type(p:Parser,id:u64,ty:u64)->u64 {
+    if id==0 || id>p.node_count { return 0; }
+    typed(p,id,lattice_width_ctx(p,ty),lattice_class_ctx(p,ty));
+    nput(p,id,14,ty);
+    return ty;
+}
+fn is_constant_integer_expr(p:Parser,id:u64)->bool {
+    if id==0 || id>p.node_count { return false; }
+    let k:u64=nget(p,id,0);
+    if k==K_LITERAL() {
+        let aux:u64=nget(p,id,13);
+        return aux==0 || aux==1;
+    }
+    if k==K_UNARY() {
+        let op:u64=nget(p,id,13);
+        if op==45 || op==126 {
+            let child:u64=nget(p,id,2);
+            return is_constant_integer_expr(p,child);
+        }
+        return false;
+    }
+    if k==K_BINARY() {
+        let op:u64=nget(p,id,13);
+        let prec:u64=precedence(op);
+        if prec!=3 && prec!=4 && prec!=5 && prec!=8 && prec!=9 && prec!=10 { return false; }
+        let left:u64=nget(p,id,2);
+        if left==0 { return false; }
+        let right:u64=nget(p,left,4);
+        if right==0 { return false; }
+        return is_constant_integer_expr(p,left) && is_constant_integer_expr(p,right);
+    }
+    return false;
+}
+fn coerce_constant_expr(p:Parser,expr_id:u64,target_ty:u64)->bool {
+    if expr_id==0 || expr_id>p.node_count { return false; }
+    if is_unary_minus_chain(p,expr_id)==true {
+        return coerce_unary_minus_chain(p,expr_id,target_ty,false);
+    }
+    if is_constant_integer_expr(p,expr_id)==false { return false; }
+    let k:u64=nget(p,expr_id,0);
+    if k==K_LITERAL() {
+        let val:u64=nget(p,expr_id,15);
+        if integer_in_range(val,target_ty)==false { return false; }
+        publish_expr_type(p,expr_id,target_ty);
+        return true;
+    }
+    if k==K_UNARY() {
+        let op:u64=nget(p,expr_id,13);
+        if op==126 || op==45 {
+            let child:u64=nget(p,expr_id,2);
+            if child!=0 && coerce_constant_expr(p,child,target_ty)==true {
+                publish_expr_type(p,expr_id,target_ty);
+                return true;
+            }
+        }
+        return false;
+    }
+    if k==K_BINARY() {
+        let op:u64=nget(p,expr_id,13);
+        let prec:u64=precedence(op);
+        if prec!=3 && prec!=4 && prec!=5 && prec!=8 && prec!=9 && prec!=10 { return false; }
+        let left:u64=nget(p,expr_id,2);
+        let right:u64=nget(p,left,4);
+        if left==0 || right==0 { return false; }
+        if coerce_constant_expr(p,left,target_ty)==false { return false; }
+        if coerce_constant_expr(p,right,target_ty)==false { return false; }
+        publish_expr_type(p,expr_id,target_ty);
+        return true;
+    }
+    return false;
+}
+
+fn infer_expr_type(p:Parser,id:u64)->u64 {
+    if id==0 || id>p.node_count { return 0; }
+    let mut ty:u64=nget(p,id,14);
+    if ty!=0 { return ty; }
+    let k:u64=nget(p,id,0);
+    if k==K_LITERAL() {
+        let aux:u64=nget(p,id,13);
+        if aux==5 { return 0; }
+        if aux==2 || aux==3 { return publish_expr_type(p,id,T_BOOL()); }
+        let w:u64=nget(p,id,9);
+        if w==8 { return publish_expr_type(p,id,T_U8()); }
+        if w==16 { return publish_expr_type(p,id,T_U16()); }
+        if w==32 { return publish_expr_type(p,id,T_U32()); }
+        return publish_expr_type(p,id,T_U64());
+    }
+    if k==K_UNARY() {
+        let op:u64=nget(p,id,13);
+        let child:u64=nget(p,id,2);
+        if child==0 { return 0; }
+        let cty:u64=infer_expr_type(p,child);
+        if op==33 {
+            if cty==T_BOOL() { return publish_expr_type(p,id,T_BOOL()); }
+            return 0;
+        }
+        if op==126 || op==45 {
+            if is_integer_type(cty)==true { return publish_expr_type(p,id,cty); }
+            return 0;
+        }
+        return 0;
+    }
+    if k==K_BINARY() {
+        let op:u64=nget(p,id,13);
+        let prec:u64=precedence(op);
+        let left:u64=nget(p,id,2);
+        if left==0 { return 0; }
+        let right:u64=nget(p,left,4);
+        if right==0 { return 0; }
+        let mut lty:u64=infer_expr_type(p,left);
+        let mut rty:u64=infer_expr_type(p,right);
+        if prec==6 {
+            let l_null:bool=nget(p,left,0)==K_LITERAL() && nget(p,left,13)==5;
+            let r_null:bool=nget(p,right,0)==K_LITERAL() && nget(p,right,13)==5;
+            if l_null==true && r_null==true { return 0; }
+            if l_null==true && rty>T_LIMIT() && rty<=T_LIMIT()+p.struct_count {
+                publish_expr_type(p,left,rty);
+                lty=rty;
+            } else if r_null==true && lty>T_LIMIT() && lty<=T_LIMIT()+p.struct_count {
+                publish_expr_type(p,right,lty);
+                rty=lty;
+            }
+        }
+        if lty==0 || rty==0 { return 0; }
+        if prec==1 || prec==2 {
+            if lty==T_BOOL() && rty==T_BOOL() { return publish_expr_type(p,id,T_BOOL()); }
+            return 0;
+        }
+        if prec==6 {
+            if lty==T_BOOL() && rty==T_BOOL() { return publish_expr_type(p,id,T_BOOL()); }
+            if lty>T_LIMIT() && rty>T_LIMIT() && lty==rty { return publish_expr_type(p,id,T_BOOL()); }
+            if is_integer_type(lty) && is_integer_type(rty) {
+                if is_signed_integer(lty)!=is_signed_integer(rty) {
+                    if is_unsigned_integer(lty) && is_constant_integer_expr(p,left) {
+                        if coerce_constant_expr(p,left,rty)==true { lty=rty; }
+                    } else if is_unsigned_integer(rty) && is_constant_integer_expr(p,right) {
+                        if coerce_constant_expr(p,right,lty)==true { rty=lty; }
+                    }
+                }
+                if is_signed_integer(lty)==is_signed_integer(rty) {
+                    return publish_expr_type(p,id,T_BOOL());
+                }
+            }
+            return 0;
+        }
+        if prec==7 {
+            if is_integer_type(lty) && is_integer_type(rty) {
+                if is_signed_integer(lty)!=is_signed_integer(rty) {
+                    if is_unsigned_integer(lty) && is_constant_integer_expr(p,left) {
+                        if coerce_constant_expr(p,left,rty)==true { lty=rty; }
+                    } else if is_unsigned_integer(rty) && is_constant_integer_expr(p,right) {
+                        if coerce_constant_expr(p,right,lty)==true { rty=lty; }
+                    }
+                }
+                if is_signed_integer(lty)==is_signed_integer(rty) {
+                    return publish_expr_type(p,id,T_BOOL());
+                }
+            }
+            return 0;
+        }
+        if prec==8 {
+            if is_integer_type(lty) && is_unsigned_integer(rty) {
+                return publish_expr_type(p,id,lty);
+            }
+            return 0;
+        }
+        if (prec>=3 && prec<=5) || prec==9 || prec==10 {
+            if is_integer_type(lty) && is_integer_type(rty) {
+                if is_signed_integer(lty)!=is_signed_integer(rty) {
+                    if is_unsigned_integer(lty) && is_constant_integer_expr(p,left) {
+                        if coerce_constant_expr(p,left,rty)==true { lty=rty; }
+                    } else if is_unsigned_integer(rty) && is_constant_integer_expr(p,right) {
+                        if coerce_constant_expr(p,right,lty)==true { rty=lty; }
+                    }
+                }
+                if is_signed_integer(lty)==is_signed_integer(rty) {
+                    let lw:u64=lattice_width(lty);
+                    let rw:u64=lattice_width(rty);
+                    let mut res_ty:u64=lty;
+                    if lw<rw { res_ty=rty; }
+                    return publish_expr_type(p,id,res_ty);
+                }
+            }
+            return 0;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+fn check_and_coerce_field(p:Parser,expected_ty:u64,expr_id:u64,tok:Tok)->bool {
+    if expr_id==0 { return false; }
+    let ek:u64=nget(p,expr_id,0);
+    if (expected_ty==T_BUF_U8() || expected_ty==T_BUF_U64()) && ek==K_CALL() && nget(p,expr_id,13)==3 {
+        nput(p,expr_id,14,expected_ty);
+        typed(p,expr_id,lattice_width_ctx(p,expected_ty),lattice_class_ctx(p,expected_ty));
+        return true;
+    }
+    if expected_ty==T_BOOL() {
+        return infer_expr_type(p,expr_id)==T_BOOL();
+    }
+    if is_integer_type(expected_ty) {
+        let actual_ty:u64=infer_expr_type(p,expr_id);
+        if is_integer_type(actual_ty) && is_signed_integer(expected_ty)==is_signed_integer(actual_ty) {
+            let ew:u64=lattice_width(expected_ty);
+            let aw:u64=lattice_width(actual_ty);
+            if ew>=aw { return true; }
+        }
+        return coerce_constant_expr(p,expr_id,expected_ty);
+    }
+    if expected_ty>T_LIMIT() || expected_ty==T_BUF_U8() || expected_ty==T_BUF_U64() || expected_ty==T_RUNTIME() {
+        if expected_ty>T_LIMIT() && expected_ty<=T_LIMIT()+p.struct_count {
+            if ek==K_LITERAL() && nget(p,expr_id,13)==5 {
+                publish_expr_type(p,expr_id,expected_ty);
+                return true;
+            }
+        }
+        return infer_expr_type(p,expr_id)==expected_ty;
+    }
+    return false;
+}
+fn parse_record_constructor(p:Parser,type_id:u64,t:Tok)->u64 {
+    if p.constructor_depth>=128 {
+        fail_tok(p,E_TOO_SMALL(),0,t);
+        return 0;
+    }
+    p.constructor_depth=p.constructor_depth+1;
+    step(p);
+    let id:u64=node(p,K_RECORD(),t.start,t.line,t.column);
+    if id==0 {
+        p.constructor_depth=p.constructor_depth-1;
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);
+        return 0;
+    }
+    name_span(p,id,t.start,t.end);
+    typed(p,id,64,REG_ADDRESS());
+    nput(p,id,14,type_id);
+    let expected_count:u64=struct_field_count(p,type_id);
+    let mut fields_seen:u64=0;
+    while failed(p)==false {
+        let c:Tok=peek(p);
+        if failed(p)==true { break; }
+        if c.kind==256 {
+            fail_at(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),c.line,c.column,c.start);
+            break;
+        }
+        if c.kind==125 { step(p);break; }
+        let fname:Tok=next_token(p);
+        if failed(p)==true { break; }
+        if fname.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),fname);break; }
+        let mut child:u64=nget(p,id,2);
+        let mut dup:bool=false;
+        while child!=0 {
+            let cs:u64=nget(p,child,5);
+            let ce:u64=nget(p,child,6);
+            if same_name(p.source,cs,ce,fname.start,fname.end)==true { dup=true;break; }
+            child=nget(p,child,4);
+        }
+        if dup==true { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),fname);break; }
+        let fidx1:u64=record_field_index(p,type_id,fname.start,fname.end);
+        if fidx1==0 { fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),fname);break; }
+        let idx0:u64=fidx1-1;
+        let ftype:u64=p.fields[idx0*4+2];
+        let ford:u64=record_field_ordinal(p,type_id,idx0);
+        let fnode:u64=node(p,K_FIELD(),fname.start,fname.line,fname.column);
+        if fnode==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),fname);break; }
+        name_span(p,fnode,fname.start,fname.end);
+        typed(p,fnode,lattice_width_ctx(p,ftype),lattice_class_ctx(p,ftype));
+        nput(p,fnode,14,ftype);
+        nput(p,fnode,15,ford);
+        attach(p,id,fnode);
+        fields_seen=fields_seen+1;
+        let colon:Tok=next_token(p);
+        if failed(p)==true { break; }
+        if colon.kind!=58 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),colon);break; }
+        let val:u64=parse_expression(p,0);
+        if failed(p)==true { break; }
+        attach(p,fnode,val);
+        if check_and_coerce_field(p,ftype,val,fname)==false {
+            fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),fname);
+            break;
+        }
+        let sep:Tok=peek(p);
+        if failed(p)==true { break; }
+        if sep.kind==44 { step(p);continue; }
+        if sep.kind==125 { step(p);break; }
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),sep);
+        break;
+    }
+    p.constructor_depth=p.constructor_depth-1;
+    if failed(p)==true { return 0; }
+    if fields_seen!=expected_count {
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);
+        return 0;
+    }
+    return id;
+}
+fn intrinsic_id(source:buf<u8>,start:u64,end:u64)->u64 {
+    if start>end || end>len(source) { return 0; }
+    let sz:u64=end-start;
+    if sz==7 {
+        if source[start]==114 && source[start+1]==117 && source[start+2]==110 && source[start+3]==116 && source[start+4]==105 && source[start+5]==109 && source[start+6]==101 { return 1; }
+    }
+    if sz==3 && source[start]==108 && source[start+1]==101 && source[start+2]==110 { return 2; }
+    if sz==5 && source[start]==97 && source[start+1]==108 && source[start+2]==108 && source[start+3]==111 && source[start+4]==99 { return 3; }
+    if sz==5 && source[start]==115 && source[start+1]==108 && source[start+2]==105 && source[start+3]==99 && source[start+4]==101 { return 4; }
+    if sz==7 && source[start]==114 && source[start+1]==116 && source[start+2]==95 && source[start+3]==102 && source[start+4]==114 && source[start+5]==101 && source[start+6]==101 { return 5; }
+    if sz==12 && source[start]==114 && source[start+1]==116 && source[start+2]==95 && source[start+3]==111 && source[start+4]==112 && source[start+5]==101 && source[start+6]==110 && source[start+7]==95 && source[start+8]==114 && source[start+9]==101 && source[start+10]==97 && source[start+11]==100 { return 6; }
+    if sz==11 && source[start]==114 && source[start+1]==116 && source[start+2]==95 && source[start+3]==111 && source[start+4]==112 && source[start+5]==101 && source[start+6]==110 && source[start+7]==95 && source[start+8]==110 && source[start+9]==101 && source[start+10]==119 { return 7; }
+    if sz==7 && source[start]==114 && source[start+1]==116 && source[start+2]==95 && source[start+3]==114 && source[start+4]==101 && source[start+5]==97 && source[start+6]==100 { return 8; }
+    if sz==8 && source[start]==114 && source[start+1]==116 && source[start+2]==95 && source[start+3]==119 && source[start+4]==114 && source[start+5]==105 && source[start+6]==116 && source[start+7]==101 { return 9; }
+    if sz==8 && source[start]==114 && source[start+1]==116 && source[start+2]==95 && source[start+3]==99 && source[start+4]==108 && source[start+5]==111 && source[start+6]==115 && source[start+7]==101 { return 10; }
+    if sz==7 && source[start]==114 && source[start+1]==116 && source[start+2]==95 && source[start+3]==100 && source[start+4]==105 && source[start+5]==97 && source[start+6]==103 { return 11; }
+    if sz==7 && source[start]==114 && source[start+1]==116 && source[start+2]==95 && source[start+3]==99 && source[start+4]==111 && source[start+5]==112 && source[start+6]==121 { return 12; }
+    if sz==2 && source[start]==117 && source[start+1]==56 { return 13; }
+    if sz==3 && source[start]==117 && source[start+1]==49 && source[start+2]==54 { return 14; }
+    if sz==3 && source[start]==117 && source[start+1]==51 && source[start+2]==50 { return 15; }
+    if sz==3 && source[start]==117 && source[start+1]==54 && source[start+2]==52 { return 16; }
+    if sz==2 && source[start]==105 && source[start+1]==56 { return 17; }
+    if sz==3 && source[start]==105 && source[start+1]==49 && source[start+2]==54 { return 18; }
+    if sz==3 && source[start]==105 && source[start+1]==51 && source[start+2]==50 { return 19; }
+    if sz==3 && source[start]==105 && source[start+1]==54 && source[start+2]==52 { return 20; }
+    return 0;
+}
+fn is_buffer_type(t:u64)->bool {
+    return t==T_BUF_U8() || t==T_BUF_U64();
+}
+fn check_assign_compat(p:Parser,expected_ty:u64,expr_id:u64,tok:Tok)->bool {
+    if expected_ty==0 || expr_id==0 { return false; }
+    let ek:u64=nget(p,expr_id,0);
+    if is_buffer_type(expected_ty)==true && ek==K_CALL() && nget(p,expr_id,13)==3 {
+        nput(p,expr_id,14,expected_ty);
+        typed(p,expr_id,lattice_width_ctx(p,expected_ty),lattice_class_ctx(p,expected_ty));
+        return true;
+    }
+    return check_and_coerce_field(p,expected_ty,expr_id,tok);
+}
+fn intrinsic_expected_arity(iid:u64)->u64 {
+    if iid==1 { return 0; }
+    if iid==2 || (iid>=13 && iid<=20) { return 1; }
+    if iid==3 || iid==5 || iid==6 || iid==7 || iid==10 || iid==11 { return 2; }
+    if iid==4 || iid==8 || iid==9 { return 3; }
+    if iid==12 { return 4; }
+    return 0;
+}
+fn parse_intrinsic_call(p:Parser,iid:u64,t:Tok)->u64 {
+    if p.call_depth>=128 { fail_tok(p,E_TOO_SMALL(),0,t);return 0; }
+    p.call_depth=p.call_depth+1;
+    let open:Tok=next_token(p);
+    if failed(p)==true { p.call_depth=p.call_depth-1;return 0; }
+    if open.kind!=40 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),open);return 0; }
+    let expected_arity:u64=intrinsic_expected_arity(iid);
+    let mut a0:u64=0;let mut a1:u64=0;let mut a2:u64=0;let mut a3:u64=0;
+    let mut count:u64=0;
+    while failed(p)==false {
+        let c:Tok=peek(p);
+        if failed(p)==true { p.call_depth=p.call_depth-1;return 0; }
+        if c.kind==41 { break; }
+        if c.kind==256 { p.call_depth=p.call_depth-1;fail_tok(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),c);return 0; }
+        if count>=expected_arity {
+            p.call_depth=p.call_depth-1;
+            fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),c);
+            return 0;
+        }
+        let arg:u64=parse_expression(p,0);
+        if failed(p)==true { p.call_depth=p.call_depth-1;return 0; }
+        if count==0 { a0=arg; }
+        else if count==1 { a1=arg; }
+        else if count==2 { a2=arg; }
+        else if count==3 { a3=arg; }
+        count=count+1;
+        let sep:Tok=peek(p);
+        if failed(p)==true { p.call_depth=p.call_depth-1;return 0; }
+        if sep.kind==44 {
+            step(p);
+            let after_sep:Tok=peek(p);
+            if after_sep.kind==41 {
+                p.call_depth=p.call_depth-1;
+                fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),after_sep);
+                return 0;
+            }
+            continue;
+        }
+        if sep.kind==41 { break; }
+        p.call_depth=p.call_depth-1;
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),sep);
+        return 0;
+    }
+    let close:Tok=next_token(p);
+    if failed(p)==true { p.call_depth=p.call_depth-1;return 0; }
+    if close.kind!=41 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),close);return 0; }
+    if count!=expected_arity { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),close);return 0; }
+    let mut ret_ty:u64=0;
+    if iid==1 {
+        if count!=0 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        ret_ty=T_RUNTIME();
+    } else if iid==2 {
+        if count!=1 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        let ty0:u64=infer_expr_type(p,a0);
+        if is_buffer_type(ty0)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=T_U64();
+    } else if iid==3 {
+        if count!=2 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        if infer_expr_type(p,a0)!=T_RUNTIME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        if check_and_coerce_field(p,T_U64(),a1,t)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=T_BUF_U8();
+    } else if iid==4 {
+        if count!=3 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        let k0:u64=nget(p,a0,0);
+        if k0!=K_NAME() && k0!=K_FIELD_ACCESS() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        let ty0:u64=infer_expr_type(p,a0);
+        if is_buffer_type(ty0)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        if check_and_coerce_field(p,T_U64(),a1,t)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        if check_and_coerce_field(p,T_U64(),a2,t)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=ty0;
+    } else if iid==5 {
+        if count!=2 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        if infer_expr_type(p,a0)!=T_RUNTIME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        let k1:u64=nget(p,a1,0);
+        if k1!=K_NAME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        let ty1:u64=infer_expr_type(p,a1);
+        let mut ok_free:bool=is_buffer_type(ty1);
+        if ty1>T_LIMIT() && ty1<=T_LIMIT()+p.struct_count { ok_free=true; }
+        if ok_free==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=T_U64();
+    } else if iid==6 || iid==7 || iid==11 {
+        if count!=2 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        if infer_expr_type(p,a0)!=T_RUNTIME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        let k1:u64=nget(p,a1,0);
+        if k1!=K_NAME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        let ty1:u64=infer_expr_type(p,a1);
+        if is_buffer_type(ty1)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=T_U64();
+    } else if iid==8 || iid==9 {
+        if count!=3 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        if infer_expr_type(p,a0)!=T_RUNTIME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        if check_and_coerce_field(p,T_U64(),a1,t)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        let k2:u64=nget(p,a2,0);
+        if k2!=K_NAME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        let ty2:u64=infer_expr_type(p,a2);
+        if is_buffer_type(ty2)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=T_U64();
+    } else if iid==10 {
+        if count!=2 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        if infer_expr_type(p,a0)!=T_RUNTIME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        if check_and_coerce_field(p,T_U64(),a1,t)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=T_U64();
+    } else if iid==12 {
+        if count!=4 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        if infer_expr_type(p,a0)!=T_RUNTIME() { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        if check_and_coerce_field(p,T_BUF_U8(),a1,t)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        if check_and_coerce_field(p,T_BUF_U8(),a2,t)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        if check_and_coerce_field(p,T_U64(),a3,t)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=T_U64();
+    } else if iid>=13 && iid<=20 {
+        if count!=1 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        let in_ty:u64=infer_expr_type(p,a0);
+        if is_integer_type(in_ty)==false { p.call_depth=p.call_depth-1;fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+        ret_ty=iid-12;
+    } else {
+        p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0;
+    }
+    let id:u64=node(p,K_CALL(),t.start,t.line,t.column);
+    if id==0 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    name_span(p,id,t.start,t.end);
+    typed(p,id,lattice_width_ctx(p,ret_ty),lattice_class_ctx(p,ret_ty));
+    nput(p,id,13,iid);
+    nput(p,id,14,ret_ty);
+    nput(p,id,15,0);
+    if count>=1 { attach(p,id,a0); }
+    if count>=2 { attach(p,id,a1); }
+    if count>=3 { attach(p,id,a2); }
+    if count>=4 { attach(p,id,a3); }
+    p.call_depth=p.call_depth-1;
+    return id;
+}
+
+fn parse_primary(p:Parser)->u64 {
+    let t:Tok=peek(p);
+    if failed(p)==true { return 0; }
+    if t.kind==33 || t.kind==126 || t.kind==45 {
+        step(p);
+        if p.unary_depth>=128 { fail_tok(p,E_TOO_SMALL(),0,t);return 0; }
+        p.unary_depth=p.unary_depth+1;
+        let operand:u64=parse_expression(p,11);
+        p.unary_depth=p.unary_depth-1;
+        if failed(p)==true { return 0; }
+        let op_ty:u64=infer_expr_type(p,operand);
+        let id:u64=node(p,K_UNARY(),t.start,t.line,t.column);
+        if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        name_span(p,id,t.start,t.end);
+        nput(p,id,13,t.kind);
+        attach(p,id,operand);
+        if t.kind==33 {
+            if op_ty!=T_BOOL() { fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0; }
+            typed(p,id,8,REG_PREDICATE());
+            nput(p,id,14,T_BOOL());
+        } else {
+            if is_integer_type(op_ty)==false {
+                fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0;
+            }
+            typed(p,id,lattice_width_ctx(p,op_ty),lattice_class_ctx(p,op_ty));
+            nput(p,id,14,op_ty);
+        }
+        return id;
+    }
+    next_token(p);
+    if failed(p)==true { return 0; }
+    if t.kind==259 {
+        let id:u64=node(p,K_LITERAL(),t.start,t.line,t.column);
+        if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        name_span(p,id,t.start,t.end);
+        typed(p,id,64,REG_ADDRESS());
+        nput(p,id,13,4);
+        nput(p,id,14,T_BUF_U8());
+        nput(p,id,15,t.value);
+        return id;
+    }
+    if t.kind==258 {
+        let id:u64=node(p,K_LITERAL(),t.start,t.line,t.column);
+        if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        name_span(p,id,t.start,t.end);
+        let mut literal_aux:u64=0;
+        if t.hex==true { literal_aux=1; }
+        nput(p,id,13,literal_aux);
+        nput(p,id,14,T_U64());
+        nput(p,id,15,t.value);
+        typed(p,id,64,REG_VALUE());
+        return id;
+    }
+    if t.kind==40 {
+        let inner:u64=parse_expression(p,0);
+        let close:Tok=next_token(p);
+        if close.kind!=41 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),close);return 0; }
+        return inner;
+    }
+    if t.kind==257 {
+        // `true` and `false` are predicates, and they are NOT among the eight
+        // language keywords -- they are literals the grammar gives a type to.
+        if t.end-t.start==4 && p.source[t.start]==116 && p.source[t.start+1]==114 &&
+           p.source[t.start+2]==117 && p.source[t.start+3]==101 {
+            let id:u64=node(p,K_LITERAL(),t.start,t.line,t.column);
+            if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+            name_span(p,id,t.start,t.end);
+            nput(p,id,13,2);
+            nput(p,id,14,T_BOOL());
+            nput(p,id,15,1);
+            typed(p,id,8,REG_PREDICATE());
+            return id;
+        }
+        if t.end-t.start==5 && p.source[t.start]==102 && p.source[t.start+1]==97 &&
+           p.source[t.start+2]==108 && p.source[t.start+3]==115 &&
+           p.source[t.start+4]==101 {
+            let id:u64=node(p,K_LITERAL(),t.start,t.line,t.column);
+            if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+            name_span(p,id,t.start,t.end);
+            nput(p,id,13,3);
+            nput(p,id,14,T_BOOL());
+            nput(p,id,15,0);
+            typed(p,id,8,REG_PREDICATE());
+            return id;
+        }
+        if t.end-t.start==4 && p.source[t.start]==110 && p.source[t.start+1]==117 &&
+           p.source[t.start+2]==108 && p.source[t.start+3]==108 {
+            let id:u64=node(p,K_LITERAL(),t.start,t.line,t.column);
+            if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+            name_span(p,id,t.start,t.end);
+            nput(p,id,13,5);
+            nput(p,id,14,0);
+            nput(p,id,15,0);
+            typed(p,id,0,REG_NONE());
+            return id;
+        }
+        let next:Tok=peek(p);
+        if next.kind==46 && p.many==true && resolve_any(p,t.start,t.end,p.bind_count)==0 {
+            step(p);
+            let item_tok:Tok=next_token(p);
+            if item_tok.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),item_tok);return 0; }
+            let after_item:Tok=peek(p);
+            if after_item.kind==40 {
+                let target_mid:u64=resolve_imported_module(p,t.start,t.end);
+                if target_mid==0 { fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),t);return 0; }
+                if is_declared_export(p,target_mid,item_tok.start,item_tok.end,K_FN())==false {
+                    fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),item_tok);return 0;
+                }
+                let saved_lm:u64=p.lookup_module;
+                p.lookup_module=target_mid;
+                let h:u64=lookup_fn_signature(p,item_tok.start,item_tok.end);
+                p.lookup_module=saved_lm;
+                if h==0 { fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),item_tok);return 0; }
+                return parse_direct_call(p,h,item_tok);
+            }
+            if after_item.kind==123 {
+                let target_mid:u64=resolve_imported_module(p,t.start,t.end);
+                if target_mid==0 { fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),t);return 0; }
+                if is_declared_export(p,target_mid,item_tok.start,item_tok.end,K_STRUCT())==false {
+                    fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),item_tok);return 0;
+                }
+                let saved_lm:u64=p.lookup_module;
+                p.lookup_module=target_mid;
+                let type_id:u64=lookup_struct_type(p,item_tok.start,item_tok.end);
+                p.lookup_module=saved_lm;
+                if type_id==0 { fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),item_tok);return 0; }
+                return parse_record_constructor(p,type_id,item_tok);
+            }
+            fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),after_item);
+            return 0;
+        }
+        if next.kind==40 {
+            let iid:u64=intrinsic_id(p.source,t.start,t.end);
+            if iid!=0 { return parse_intrinsic_call(p,iid,t); }
+            let h:u64=lookup_fn_signature(p,t.start,t.end);
+            if h!=0 { return parse_direct_call(p,h,t); }
+            fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),t);
+            return 0;
+        }
+        if next.kind==123 && resolve_any(p,t.start,t.end,p.bind_count)==0 {
+            let type_id:u64=lookup_struct_type(p,t.start,t.end);
+            if type_id!=0 { return parse_record_constructor(p,type_id,t); }
+        }
+        return parse_use(p,t);
+    }
+    fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);
+    return 0;
+}
+
+// A name USE. This is where the scope chain is walked and where the second
+// refusal lives.
+//
+// THE TWO FAILURES, AND WHY 801 NEEDS A LOOKAHEAD RATHER THAN A BIGGER ORDINAL.
+//   803 UNDECLARED        no scope on the chain holds this name at all
+//   801 USE_BEFORE_DECL   no scope on the chain holds it YET, but THIS block
+//                         declares it LATER
+//
+// MEASURED, and this is the defect the gate found: the two used to collapse.
+// `resolve_any` searches ordinals from `here` DOWNWARD and therefore returns
+// only ids at or below `here`, so `binding > here` in `parse_use` was
+// UNREACHABLE and 801 could not be produced by any input at all. The reason is
+// in `parse_let`, which binds AFTER parsing the initialiser (the reference's
+// own order -- `variable_new` runs after `parse_expression`), so at the moment
+// a forward reference is resolved the binding simply is not in the table yet.
+// No amount of ordinal arithmetic recovers a binding that does not exist.
+//
+// So the ORDER test is a scan of the SOURCE AHEAD, bounded to this block, and
+// not a comparison of two numbers that were already bounded to be equal. The
+// bound is the closing `}` of the block the use is in: a `let` in a NESTED
+// block is a different scope and does not declare anything here, and a `let`
+// after this block's `}` is outside it. Everything before the use has already
+// been parsed, so the scan starts at the cursor and never re-reads the source.
+fn declared_later_in_block(p:Parser,start:u64,end:u64)->bool {
+    let saved_cursor:u64=p.cursor;
+    let saved_line:u64=p.line;
+    let saved_column:u64=p.column;
+    let mut depth:u64=0;
+    let mut found:bool=false;
+    while found==false {
+        let t:Tok=next_token(p);
+        if t.kind==256 { break; }
+        if t.kind==123 { depth=depth+1;continue; }
+        if t.kind==125 {
+            if depth==0 { break; }
+            depth=depth-1;continue;
+        }
+        if depth!=0 { continue; }
+        if t.kind!=257 { continue; }
+        // `let`, whole-identifier and by BYTE: three bytes, l e t.
+        if t.end-t.start!=3 { continue; }
+        if p.source[t.start]!=108 || p.source[t.start+1]!=101 ||
+           p.source[t.start+2]!=116 { continue; }
+        let mut name:Tok=next_token(p);
+        // `let mut x` -- `mut` is the optional word between them.
+        if name.kind==257 && name.end-name.start==3 && p.source[name.start]==109 &&
+           p.source[name.start+1]==117 && p.source[name.start+2]==116 {
+            name=next_token(p);
+        }
+        if name.kind==257 && same_name(p.source,name.start,name.end,start,end)==true {
+            found=true;
+        }
+    }
+    p.cursor=saved_cursor;p.line=saved_line;p.column=saved_column;
+    return found;
+}
+//
+// AND WHY THE FLOOR IS NOT THE ORDER TEST. An earlier version compared the
+// ordinal against `scope_floor(p, p.scope)` -- the CURRENT scope's floor --
+// and that is wrong, and measurably so: `while t < a` with `let mut t` in the
+// ENCLOSING block was answered 801, because the enclosing `t` has a higher
+// ordinal than the floor of the `while`'s own scope. Every binding in a parent
+// scope was made before this scope existed, so that floor says nothing about a
+// PARENT's bindings and comparing against it rejects correct programs.
+fn find_decl_type(p:Parser,binding:u64)->u64 {
+    if binding==0 || binding>p.bind_count { return 0; }
+    let meta_at:u64=(binding-1)*2;
+    if meta_at>=len(p.binding_meta) { return 0; }
+    return p.binding_meta[meta_at];
+}
+fn parse_use(p:Parser,t:Tok)->u64 {
+    let id:u64=node(p,K_NAME(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    name_span(p,id,t.start,t.end);
+    let here:u64=p.bind_count;
+    let binding:u64=resolve_any(p,t.start,t.end,here);
+    if binding==0 {
+        if declared_later_in_block(p,t.start,t.end)==true {
+            fail_tok(p,E_USE_BEFORE_DECL(),R_USE_BEFORE_DECL(),t);
+            return 0;
+        }
+        fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),t);
+        return 0;
+    }
+    let owner:u64=bind_scope(p,binding);
+    nput(p,id,8,owner);
+    nput(p,id,15,binding);
+    let ty:u64=find_decl_type(p,binding);
+    nput(p,id,14,ty);
+    typed(p,id,bind_width(p,binding),bind_class(p,binding));
+    return id;
+}
+// `resolve_any` walks scope->parent looking for a binding that both MATCHES the
+// name and is LIVE: `here` is the parser's own position in the source, so the
+// walk covers exactly the bindings made so far and nothing later. That bound is
+// what stops a closed scope's binding from being reachable, and it is NOT an
+// order test -- a binding this block declares LATER is not in the table yet at
+// all, so the order question is `declared_later_in_block` above and this walk
+// answers only "is it here yet". Returning 0 means "not yet or not at all",
+// and the caller is the one place that tells those two apart.
+fn resolve_any(p:Parser,start:u64,end:u64,here:u64)->u64 {
+    let mut scope:u64=p.scope;
+    let mut ceiling:u64=here;
+    while scope!=0 && scope<=p.scope_count {
+        let parent:u64=p.scopes[(scope-1)*SCOPE_WORDS()];
+        if parent==0 { break; }
+        let floor:u64=scope_floor(p,scope);
+        let mut id:u64=ceiling;
+        while id>floor {
+            let at:u64=(id-1)*BIND_WORDS();
+            if p.binds[at+4]==scope && same_name(p.source,p.binds[at],p.binds[at+1],start,end)==true { return id; }
+            id=id-1;
+        }
+        if floor<ceiling { ceiling=floor; }
+        scope=parent;
+    }
+    return 0;
+}
+
+// ---- lookahead --------------------------------------------------------------
+// `peek` is `next_token` without the advance: it saves the three cursor words,
+// runs the tokenizer, and writes them back. So a loop that peeks and then steps
+// consumes exactly one token, and the restore is three assignments on one line
+// rather than three that a later edit could split apart.
+fn peek(p:Parser)->Tok {
+    let saved_cursor:u64=p.cursor;
+    let saved_line:u64=p.line;
+    let saved_column:u64=p.column;
+    let t:Tok=next_token(p);
+    p.cursor=saved_cursor;p.line=saved_line;p.column=saved_column;
+    return t;
+}
+fn step(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    return t.kind;
+}
+fn word_is2(source:buf<u8>,start:u64,end:u64,a:u64,b:u64)->bool {
+    return end-start==2 && source[start]==a && source[start+1]==b;
+}
+fn word_is4(source:buf<u8>,start:u64,end:u64,a:u64,b:u64,c:u64,d:u64)->bool {
+    return end-start==4 && source[start]==a && source[start+1]==b &&
+           source[start+2]==c && source[start+3]==d;
+}
+
+// ---- record fields ----------------------------------------------------------
+// The type of `source[start,end)` when it names a field of a `struct` with owner
+// `struct_id` in this buffer, or 0 when it names none.
+fn record_field(p:Parser,struct_id:u64,start:u64,end:u64)->u64 {
+    let mut i:u64=0;
+    while i<p.field_count {
+        let at:u64=i*4;
+        if p.fields[at+3]==struct_id && same_name(p.source,p.fields[at],p.fields[at+1],start,end)==true {
+            return p.fields[at+2];
+        }
+        i=i+1;
+    }
+    return 0;
+}
+
+// ---- postfix ----------------------------------------------------------------
+// `.field`, `name(args)` and `buf[i]`. A field access carries the FIELD's width
+// and class, not the record's: the value the expression denotes is the field.
+// A record declaration node (K_STRUCT) carries width 0 and REG_NONE, but
+// record-typed values and variables carry carrier width 64 and REG_ADDRESS.
+fn parse_postfix(p:Parser)->u64 {
+    let mut x:u64=parse_primary(p);
+    if failed(p)==true { return 0; }
+    while failed(p)==false {
+        let t:Tok=peek(p);
+        if t.kind==46 {
+            step(p);
+            let f:Tok=next_token(p);
+            if f.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),f);return 0; }
+            let receiver_type:u64=nget(p,x,14);
+            if receiver_type<=T_LIMIT() || receiver_type>T_LIMIT()+p.struct_count || nget(p,x,10)!=REG_ADDRESS() {
+                fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0;
+            }
+            let id:u64=node(p,K_FIELD_ACCESS(),t.start,t.line,t.column);
+            if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+            name_span(p,id,f.start,f.end);
+            attach(p,id,x);
+            let field:u64=record_field(p,receiver_type,f.start,f.end);
+            if field==0 {
+                fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),f);return 0;
+            }
+            typed(p,id,lattice_width_ctx(p,field),lattice_class_ctx(p,field));
+            nput(p,id,14,field);
+            x=id;
+            continue;
+        }
+        if t.kind==40 {
+            fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),t);
+            return 0;
+        }
+        if t.kind==91 {
+            step(p);
+            let id:u64=node(p,K_INDEX(),t.start,t.line,t.column);
+            if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+            attach(p,id,x);
+            let index:u64=parse_expression(p,0);
+            if failed(p)==true { return 0; }
+            attach(p,id,index);
+            let recv_ty:u64=infer_expr_type(p,x);
+            let element:u64=lattice_element(recv_ty);
+            if element==0 {
+                fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+                return 0;
+            }
+            let idx_ty:u64=infer_expr_type(p,index);
+            if is_integer_type(idx_ty)==false {
+                fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+                return 0;
+            }
+            typed(p,id,lattice_width_ctx(p,element),lattice_class_ctx(p,element));
+            nput(p,id,13,element);
+            nput(p,id,14,element);
+            let close:Tok=next_token(p);
+            if close.kind!=93 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),close);return 0; }
+            x=id;
+            continue;
+        }
+        break;
+    }
+    return x;
+}
+// A `(` argument list and a `{` record initialiser are the same walk, because
+// the corpus writes both: `f(a,b)` and `Slot{count:0,limit:8}`. `:` is accepted
+// as an initializer separator because only the record form uses it.
+fn parse_arguments(p:Parser,parent:u64,h:u64)->u64 {
+    let expected_count:u64=sig_param_count(p,h);
+    let mut arg_count:u64=0;
+    while failed(p)==false {
+        let c:Tok=peek(p);
+        if failed(p)==true { return 0; }
+        if c.kind==41 { break; }
+        if c.kind==256 { fail_tok(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),c);return 0; }
+        if arg_count>=expected_count {
+            fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),c);
+            return 0;
+        }
+        let arg:u64=parse_expression(p,0);
+        if failed(p)==true { return 0; }
+        let expected_ty:u64=sig_param_type(p,h,arg_count);
+        if expected_ty==T_BUF_U8() || expected_ty==T_BUF_U64() {
+            let ak:u64=nget(p,arg,0);
+            if ak!=K_NAME() && ak!=K_FIELD_ACCESS() {
+                fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),c);
+                return 0;
+            }
+        }
+        if check_and_coerce_field(p,expected_ty,arg,c)==false {
+            fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),c);
+            return 0;
+        }
+        attach(p,parent,arg);
+        arg_count=arg_count+1;
+        let sep:Tok=peek(p);
+        if failed(p)==true { return 0; }
+        if sep.kind==44 { step(p);continue; }
+        if sep.kind==41 { break; }
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),sep);
+        return 0;
+    }
+    let close:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    if close.kind!=41 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),close);return 0; }
+    if arg_count!=expected_count { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),close);return 0; }
+    return 1;
+}
+
+// ---- statements -------------------------------------------------------------
+fn binding_is_mutable(p:Parser,binding:u64)->bool {
+    if binding==0 || binding>p.bind_count { return false; }
+    let meta_at:u64=(binding-1)*2;
+    if meta_at+1>=len(p.binding_meta) { return false; }
+    return p.binding_meta[meta_at+1]==1;
+}
+fn check_allocation_contexts(p:Parser)->u64 {
+    let mut i:u64=1;
+    while i<=p.node_count {
+        if nget(p,i,0)==K_CALL() {
+            let aux:u64=nget(p,i,13);
+            if aux==3 || aux==4 {
+                let parent:u64=nget(p,i,1);
+                let mut ok:bool=false;
+                if parent!=0 {
+                    let pk:u64=nget(p,parent,0);
+                    let pt:u64=nget(p,parent,14);
+                    if pk==K_LET() && is_buffer_type(pt)==true {
+                        let first_child:u64=nget(p,parent,2);
+                        if first_child==i {
+                            ok=true;
+                        }
+                    } else if pk==K_ASSIGN() && is_buffer_type(pt)==true {
+                        let lhs:u64=nget(p,parent,2);
+                        if lhs!=0 && nget(p,lhs,0)==K_NAME() {
+                            let rhs:u64=nget(p,lhs,4);
+                            if rhs==i {
+                                ok=true;
+                            }
+                        }
+                    }
+                }
+                if ok==false {
+                    fail_at(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),nget(p,i,11),nget(p,i,12),nget(p,i,5));
+                    return 0;
+                }
+            }
+        }
+        i=i+1;
+    }
+    return 1;
+}
+
+fn word_is5(source:buf<u8>,start:u64,end:u64,a:u64,b:u64,c:u64,d:u64,e:u64)->bool {
+    return end-start==5 && source[start]==a && source[start+1]==b &&
+           source[start+2]==c && source[start+3]==d && source[start+4]==e;
+}
+fn word_is8(source:buf<u8>,start:u64,end:u64,a:u64,b:u64,c:u64,d:u64,e:u64,f:u64,g:u64,h:u64)->bool {
+    return end-start==8 && source[start]==a && source[start+1]==b &&
+           source[start+2]==c && source[start+3]==d && source[start+4]==e &&
+           source[start+5]==f && source[start+6]==g && source[start+7]==h;
+}
+fn parse_if_inner(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    let id:u64=node(p,K_IF(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    let condition:u64=parse_expression(p,0);
+    if failed(p)==true { return 0; }
+    attach(p,id,condition);
+    if infer_expr_type(p,condition)!=T_BOOL() {
+        fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+        return 0;
+    }
+    let then_branch:u64=parse_block(p);
+    if failed(p)==true { return 0; }
+    attach(p,id,then_branch);
+    let e:Tok=peek(p);
+    if word_is4(p.source,e.start,e.end,101,108,115,101)==false { return id; }
+    step(p);
+    let after_else:Tok=peek(p);
+    let mut else_branch:u64=0;
+    if word_is2(p.source,after_else.start,after_else.end,105,102)==true {
+        else_branch=parse_if(p);
+    } else {
+        else_branch=parse_block(p);
+    }
+    if failed(p)==true { return 0; }
+    attach(p,id,else_branch);
+    return id;
+}
+
+fn parse_statement(p:Parser)->u64 {
+    let t:Tok=peek(p);
+    if failed(p)==true { return 0; }
+    if t.kind==257 && word_is5(p.source,t.start,t.end,98,114,101,97,107)==true {
+        step(p);
+        if p.loop_top==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        let semi:Tok=next_token(p);
+        if semi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),semi);return 0; }
+        let id:u64=node(p,K_BREAK(),t.start,t.line,t.column);
+        if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        name_span(p,id,t.start,t.end);
+        nput(p,id,15,p.loop_top);
+        return id;
+    }
+    if t.kind==257 && word_is8(p.source,t.start,t.end,99,111,110,116,105,110,117,101)==true {
+        step(p);
+        if p.loop_top==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        let semi:Tok=next_token(p);
+        if semi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),semi);return 0; }
+        let id:u64=node(p,K_CONTINUE(),t.start,t.line,t.column);
+        if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+        name_span(p,id,t.start,t.end);
+        nput(p,id,15,p.loop_top);
+        return id;
+    }
+    if t.kind==123 { return parse_block(p); }
+    let keyword:u64=key_id(p.source,t.start,t.end);
+    if keyword==KEY_LET() { return parse_let(p); }
+    if keyword==KEY_RETURN() { return parse_return(p); }
+    if keyword==KEY_WHILE() { return parse_while(p); }
+    if word_is2(p.source,t.start,t.end,105,102) { return parse_if(p); }
+    let first:u64=parse_postfix(p);
+    if failed(p)==true { return 0; }
+    let eq:Tok=peek(p);
+    if eq.kind==61 {
+        step(p);
+        let id:u64=node(p,K_ASSIGN(),eq.start,eq.line,eq.column);
+        if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),eq);return 0; }
+        attach(p,id,first);
+        let value:u64=parse_expression(p,0);
+        if failed(p)==true { return 0; }
+        let fk:u64=nget(p,first,0);
+        if fk!=K_NAME() && fk!=K_FIELD_ACCESS() && fk!=K_INDEX() {
+            fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),eq);return 0;
+        }
+        if fk==K_NAME() {
+            let b_id:u64=nget(p,first,15);
+            if binding_is_mutable(p,b_id)==false {
+                fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),eq);return 0;
+            }
+        }
+        let target_ty:u64=infer_expr_type(p,first);
+        if check_and_coerce_field(p,target_ty,value,eq)==false {
+            fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),eq);return 0;
+        }
+        attach(p,id,value);
+        typed(p,id,nget(p,first,9),nget(p,first,10));
+        nput(p,id,14,target_ty);
+        let semi:Tok=next_token(p);
+        if semi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),semi);return 0; }
+        return id;
+    }
+    let semi:Tok=next_token(p);
+    if semi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),semi);return 0; }
+    return first;
+}
+
+fn parse_let(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    let id:u64=node(p,K_LET(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    let m:Tok=peek(p);
+    let mut mutable:u64=0;
+    if key_id(p.source,m.start,m.end)==KEY_MUT() { step(p);mutable=1; }
+    // aux is MUT when `mut` was written and LET when it was not, so the node
+    // records which of the two forms introduced the binding. The reference
+    // carries the same bit: `unsigned mut = (unsigned)keyword(c, "mut")`.
+    let mut let_aux:u64=KEY_LET();
+    if mutable==1 { let_aux=KEY_MUT(); }
+    nput(p,id,13,let_aux);
+    let n:Tok=next_token(p);
+    if n.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),n);return 0; }
+    name_span(p,id,n.start,n.end);
+    let colon:Tok=next_token(p);
+    if colon.kind!=58 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),colon);return 0; }
+    let declared:u64=parse_type(p);
+    if failed(p)==true { return 0; }
+    let eq:Tok=next_token(p);
+    if eq.kind!=61 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),eq);return 0; }
+    let value:u64=parse_expression(p,0);
+    if failed(p)==true { return 0; }
+    attach(p,id,value);
+    // THE BINDING IS MADE AFTER THE INITIALISER IS PARSED, and that order is
+    // what makes `let x:u64=x;` a use-before-declaration rather than a
+    // recursive definition. It is the reference's order too: `variable_new`
+    // runs after `parse_expression` in `parse_statement`.
+    let decl_type:u64=nget(p,declared,13);
+    if check_and_coerce_field(p,decl_type,value,t)==false {
+        fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);return 0;
+    }
+    let binding:u64=declare(p,n.start,n.end,nget(p,declared,9),nget(p,declared,10),decl_type,mutable==1);
+    if binding==0 { fail_tok(p,E_TOO_SMALL(),0,t);return 0; }
+    typed(p,id,nget(p,declared,9),nget(p,declared,10));
+    nput(p,id,15,binding);nput(p,id,14,decl_type);
+    let semi:Tok=next_token(p);
+    if semi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),semi);return 0; }
+    return id;
+}
+
+fn parse_return(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    let id:u64=node(p,K_RETURN_STMT(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    nput(p,id,13,KEY_RETURN());
+    let value:u64=parse_expression(p,0);
+    if failed(p)==true { return 0; }
+    attach(p,id,value);
+    // A returned predicate from a function declared `-> u64` is 802, and the
+    // reference refuses the same shape: `compatible(c, x, FN(c,function).
+    // return_type, ...)` fails with "Nova type mismatch". Keeping the declared
+    // width on the statement and dropping the disagreement would publish a
+    // `return` of u64 for a value that is a bool.
+    if check_and_coerce_field(p,p.return_type,value,t)==false {
+        fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+        return 0;
+    }
+    typed(p,id,lattice_width_ctx(p,p.return_type),lattice_class_ctx(p,p.return_type));
+    nput(p,id,13,p.return_type);
+    nput(p,id,14,p.return_type);
+    let semi:Tok=next_token(p);
+    if semi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),semi);return 0; }
+    return id;
+}
+
+fn parse_while(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    let id:u64=node(p,K_WHILE(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    nput(p,id,13,KEY_WHILE());
+    let condition:u64=parse_expression(p,0);
+    if failed(p)==true { return 0; }
+    attach(p,id,condition);
+    if infer_expr_type(p,condition)!=T_BOOL() {
+        fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),t);
+        return 0;
+    }
+    let saved_loop:u64=p.loop_top;
+    p.loop_top=id;
+    let body:u64=parse_block(p);
+    p.loop_top=saved_loop;
+    if failed(p)==true { return 0; }
+    attach(p,id,body);
+    typed(p,id,8,REG_PREDICATE());
+    return id;
+}
+
+fn parse_if(p:Parser)->u64 {
+    if p.if_depth>=128 { fail_tok(p,E_TOO_SMALL(),0,peek(p));return 0; }
+    p.if_depth=p.if_depth+1;
+    let res:u64=parse_if_inner(p);
+    p.if_depth=p.if_depth-1;
+    return res;
+}
+
+fn parse_block(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    if t.kind!=123 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    let id:u64=node(p,K_BLOCK(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    let scope:u64=open_scope(p);
+    if scope==0 { fail_tok(p,E_TOO_SMALL(),0,t);return 0; }
+    while failed(p)==false {
+        let c:Tok=peek(p);
+        if c.kind==256 {
+            fail_at(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),c.line,c.column,c.start);
+            return 0;
+        }
+        if c.kind==125 { step(p);break; }
+        let statement:u64=parse_statement(p);
+        if failed(p)==true { return 0; }
+        attach(p,id,statement);
+    }
+    close_scope(p);
+    return id;
+}
+
+// ---- declarations -----------------------------------------------------------
+fn parse_struct(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    let id:u64=node(p,K_STRUCT(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    let n:Tok=next_token(p);
+    if n.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),n);return 0; }
+    name_span(p,id,n.start,n.end);
+    nput(p,id,13,KEY_STRUCT());
+    let struct_id:u64=lookup_struct_type(p,n.start,n.end);
+    nput(p,id,14,struct_id);
+    let open:Tok=next_token(p);
+    if open.kind!=123 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),open);return 0; }
+    while failed(p)==false {
+        let c:Tok=peek(p);
+        if c.kind==256 {
+            fail_at(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),c.line,c.column,c.start);
+            return 0;
+        }
+        if c.kind==125 { step(p);break; }
+        let f:Tok=next_token(p);
+        if f.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),f);return 0; }
+        let colon:Tok=next_token(p);
+        if colon.kind!=58 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),colon);return 0; }
+        let declared:u64=parse_type(p);
+        if failed(p)==true { return 0; }
+        let field:u64=node(p,K_FIELD(),f.start,f.line,f.column);
+        if field==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),f);return 0; }
+        name_span(p,field,f.start,f.end);
+        typed(p,field,nget(p,declared,9),nget(p,declared,10));
+        nput(p,field,13,nget(p,declared,13));
+        nput(p,field,14,nget(p,declared,14));
+        attach(p,id,field);
+        let sep:Tok=peek(p);
+        if sep.kind==44 { step(p); }
+        else if sep.kind!=125 {
+            fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),sep);return 0;
+        }
+    }
+    return id;
+}
+fn parse_fn(p:Parser)->u64 {
+    let t:Tok=next_token(p);
+    if failed(p)==true { return 0; }
+    let id:u64=node(p,K_FN(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    nput(p,id,13,KEY_FN());
+    let n:Tok=next_token(p);
+    if n.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),n);return 0; }
+    name_span(p,id,n.start,n.end);
+    let fn_sig_h:u64=lookup_fn_signature(p,n.start,n.end);
+    if fn_sig_h!=0 {
+        nput(p,id,14,sig_return_type(p,fn_sig_h));
+        nput(p,id,15,sig_ordinal(p,fn_sig_h));
+    }
+    let open:Tok=next_token(p);
+    if open.kind!=40 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),open);return 0; }
+    // The function scope opens BEFORE the parameters are bound, so a parameter
+    // shares a scope with the body's outermost local -- which is what the
+    // reference does (`c->scope = 0`, then `variable_new` per parameter).
+    let scope:u64=open_scope(p);
+    if scope==0 { fail_tok(p,E_TOO_SMALL(),0,t);return 0; }
+    p.return_type=0;
+    while failed(p)==false {
+        let c:Tok=peek(p);
+        if c.kind==41 { step(p);break; }
+        if c.kind==256 {
+            fail_at(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),c.line,c.column,c.start);
+            close_scope(p);return 0;
+        }
+        let a:Tok=next_token(p);
+        if a.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),a);close_scope(p);return 0; }
+        let colon:Tok=next_token(p);
+        if colon.kind!=58 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),colon);close_scope(p);return 0; }
+        let declared:u64=parse_type(p);
+        if failed(p)==true { close_scope(p);return 0; }
+        let parameter:u64=node(p,K_PARAM(),a.start,a.line,a.column);
+        if parameter==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),a);close_scope(p);return 0; }
+        name_span(p,parameter,a.start,a.end);
+        // A buffer parameter occupies TWO ABI slots and everything else one
+        // (nova.c: `unsigned slots = is_buffer(c, type) ? 2 : 1`), and aux
+        // carries that COUNT. It is a slot count and NOT a register assignment:
+        // no register is named here and none is implied.
+        let ty:u64=nget(p,declared,13);
+        let mut slots:u64=1;
+        if lattice_element(ty)!=0 { slots=2; }
+        nput(p,parameter,13,slots);
+        typed(p,parameter,nget(p,declared,9),nget(p,declared,10));
+        attach(p,id,parameter);
+        let binding:u64=declare(p,a.start,a.end,nget(p,declared,9),nget(p,declared,10),ty,false);
+        if binding==0 { fail_tok(p,E_TOO_SMALL(),0,a);close_scope(p);return 0; }
+        nput(p,parameter,15,binding);nput(p,parameter,14,ty);
+        let sep:Tok=peek(p);
+        if sep.kind==44 { step(p);continue; }
+        if sep.kind==41 { step(p);break; }
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),sep);close_scope(p);return 0;
+    }
+    let arrow:Tok=next_token(p);
+    if arrow.kind!=45*256+62 {
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),arrow);close_scope(p);return 0;
+    }
+    let returned:u64=parse_type(p);
+    if failed(p)==true { close_scope(p);return 0; }
+    let return_node:u64=node(p,K_RETURN(),arrow.start,arrow.line,arrow.column);
+    if return_node==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),arrow);close_scope(p);return 0; }
+    typed(p,return_node,nget(p,returned,9),nget(p,returned,10));
+    nput(p,return_node,13,nget(p,returned,13));
+    nput(p,return_node,14,nget(p,returned,13));
+    attach(p,id,return_node);
+    p.return_type=nget(p,returned,13);
+    let body:u64=parse_block(p);
+    if failed(p)==true { close_scope(p);return 0; }
+    attach(p,id,body);
+    close_scope(p);
+    return id;
+}
+
+fn prepass_skip_body(p:Parser)->bool {
+    let mut depth:u64=1;
+    while depth>0 && p.cursor<p.size && failed(p)==false {
+        let kind:u64=scan_token(p);
+        if failed(p)==true { return false; }
+        if kind==256 { return false; }
+        if kind==123 { depth=depth+1; }
+        else if kind==125 { depth=depth-1; }
+    }
+    return depth==0 && failed(p)==false;
+}
+fn collect_records(p:Parser)->u64 {
+    let ok_names:u64=collect_records_names(p);
+    if ok_names==0 || failed(p)==true { return 0; }
+    return collect_records_fields(p);
+}
+
+// ---- the top level ----------------------------------------------------------
+// ---- signatures de fonctions et appels directs (K_CALL) --------------------
+// Un noeud K_CALL porte le type de retour reel de la fonction appelee au mot 14,
+// et l'ordinal de declaration de la fonction cible au mot 15 (identique au mot 15
+// du K_FN). Ses enfants directs sont les expressions d'arguments logiques ;
+// les arguments de type tampon (buf) occupent 2 slots ABI au bas niveau mais
+// ne creent pas de noeud AST d'argument supplementaire.
+//
+// Les signatures sont stockees depuis la FIN du tampon `binds` de l'appelant,
+// pendant que les liaisons (bindings) a 6 mots progressent depuis le debut :
+//   - en-tete (5 mots) : nameStart, nameEnd, returnType, paramCount, ordinal ;
+//   - triplets precedents (3 mots par parametre) : paramType, nameStart, nameEnd.
+// La capacite verifie rigoureusement la non-collision sans modifier le pas de 6 mots.
+// call_depth limite la recursion d'appels a 128 par securite (sans affirmer une
+// parite globale avec le C). Le parseur reste pour l'instant mono-module ; les
+// imports et les intrinsèques restent a traiter pour le self-host complet.
+fn lookup_fn_signature(p:Parser,start:u64,end:u64)->u64 {
+    let mut scanned_words:u64=0;
+    while scanned_words<p.function_words {
+        if len(p.binds)<scanned_words+5 { return 0; }
+        let head:u64=len(p.binds)-(scanned_words+5);
+        let s_start:u64=p.binds[head];
+        let s_end:u64=p.binds[head+1];
+        let p_count:u64=p.binds[head+3];
+        let total:u64=5+p_count*3;
+        if same_name(p.source,s_start,s_end,start,end)==true {
+            let owner_m:u64=unit_of_offset(p,s_start);
+            if p.many==false || owner_m==p.lookup_module {
+                return head+1;
+            }
+        }
+        scanned_words=scanned_words+total;
+    }
+    return 0;
+}
+fn sig_name_start(p:Parser,h:u64)->u64 { return p.binds[h-1]; }
+fn sig_name_end(p:Parser,h:u64)->u64 { return p.binds[h]; }
+fn sig_return_type(p:Parser,h:u64)->u64 { return p.binds[h+1]; }
+fn sig_param_count(p:Parser,h:u64)->u64 { return p.binds[h+2]; }
+fn sig_ordinal(p:Parser,h:u64)->u64 { return p.binds[h+3]; }
+fn sig_param_type(p:Parser,h:u64,i:u64)->u64 {
+    let head:u64=h-1;
+    return p.binds[head-(i+1)*3];
+}
+fn sig_param_name_start(p:Parser,h:u64,i:u64)->u64 {
+    let head:u64=h-1;
+    return p.binds[head-(i+1)*3+1];
+}
+fn sig_param_name_end(p:Parser,h:u64,i:u64)->u64 {
+    let head:u64=h-1;
+    return p.binds[head-(i+1)*3+2];
+}
+fn collect_signatures(p:Parser)->u64 {
+    let saved_cursor:u64=p.cursor;
+    let saved_line:u64=p.line;
+    let saved_column:u64=p.column;
+    let saved_nodes:u64=p.node_count;
+    let mut top_depth:u64=0;
+    while p.cursor<p.size && failed(p)==false {
+        let t:Tok=next_token(p);
+        if failed(p)==true { break; }
+        if t.kind==256 { break; }
+        if t.kind==123 { top_depth=top_depth+1;continue; }
+        if t.kind==125 {
+            if top_depth>0 { top_depth=top_depth-1; }
+            continue;
+        }
+        if top_depth!=0 { continue; }
+        let kw:u64=key_id(p.source,t.start,t.end);
+        if kw==KEY_STRUCT() {
+            let sname:Tok=next_token(p);
+            if failed(p)==true { break; }
+            let sopen:Tok=next_token(p);
+            if failed(p)==true { break; }
+            if sopen.kind==123 { prepass_skip_body(p); }
+        } else if kw==KEY_FN() {
+            let fname:Tok=next_token(p);
+            if failed(p)==true { break; }
+            if fname.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),fname);break; }
+            if lookup_fn_signature(p,fname.start,fname.end)!=0 {
+                fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),fname);break;
+            }
+            let open:Tok=next_token(p);
+            if failed(p)==true { break; }
+            if open.kind!=40 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),open);break; }
+            let mut p_count:u64=0;
+            let mut abi_slots:u64=0;
+            let sig_start_words:u64=p.function_words;
+            if sig_start_words>len(p.binds) { fail_tok(p,E_TOO_SMALL(),0,fname);break; }
+            if len(p.binds)-sig_start_words<5 { fail_tok(p,E_TOO_SMALL(),0,fname);break; }
+            let binds_active:u64=p.bind_count*BIND_WORDS();
+            if (len(p.binds)-sig_start_words)-5<binds_active { fail_tok(p,E_TOO_SMALL(),0,fname);break; }
+            while failed(p)==false {
+                let c:Tok=peek(p);
+                if failed(p)==true { break; }
+                if c.kind==41 { step(p);break; }
+                if c.kind==256 { fail_tok(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),c);break; }
+                let pname:Tok=next_token(p);
+                if failed(p)==true { break; }
+                if pname.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),pname);break; }
+                let colon:Tok=next_token(p);
+                if failed(p)==true { break; }
+                if colon.kind!=58 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),colon);break; }
+                let declared:u64=parse_type(p);
+                if failed(p)==true { break; }
+                let p_type:u64=nget(p,declared,13);
+                p.node_count=saved_nodes;
+                let mut cost:u64=1;
+                if p_type==T_BUF_U8() || p_type==T_BUF_U64() { cost=2; }
+                abi_slots=abi_slots+cost;
+                if abi_slots>64 { fail_tok(p,E_TOO_SMALL(),0,pname);break; }
+                let mut pi:u64=0;
+                let mut pdup:bool=false;
+                let temp_head:u64=len(p.binds)-(sig_start_words+5);
+                while pi<p_count {
+                    let prev_s:u64=p.binds[temp_head-(pi+1)*3+1];
+                    let prev_e:u64=p.binds[temp_head-(pi+1)*3+2];
+                    if same_name(p.source,prev_s,prev_e,pname.start,pname.end)==true { pdup=true; }
+                    pi=pi+1;
+                }
+                if pdup==true { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),pname);break; }
+                let need_words:u64=sig_start_words+5+(p_count+1)*3;
+                let binds_used:u64=p.bind_count*BIND_WORDS();
+                if need_words+binds_used>len(p.binds) { fail_tok(p,E_TOO_SMALL(),0,pname);break; }
+                let p_at:u64=temp_head-(p_count+1)*3;
+                p.binds[p_at]=p_type;
+                p.binds[p_at+1]=pname.start;
+                p.binds[p_at+2]=pname.end;
+                p_count=p_count+1;
+                let sep:Tok=peek(p);
+                if failed(p)==true { break; }
+                if sep.kind==44 { step(p);continue; }
+                if sep.kind==41 { step(p);break; }
+                fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),sep);break;
+            }
+            if failed(p)==true { break; }
+            let arrow:Tok=next_token(p);
+            if failed(p)==true { break; }
+            if arrow.kind!=45*256+62 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),arrow);break; }
+            let ret_node:u64=parse_type(p);
+            if failed(p)==true { break; }
+            let ret_type:u64=nget(p,ret_node,13);
+            p.node_count=saved_nodes;
+            let f_head:u64=len(p.binds)-(sig_start_words+5);
+            let ordinal:u64=p.function_count+1;
+            p.binds[f_head]=fname.start;
+            p.binds[f_head+1]=fname.end;
+            p.binds[f_head+2]=ret_type;
+            p.binds[f_head+3]=p_count;
+            p.binds[f_head+4]=ordinal;
+            p.function_count=ordinal;
+            p.function_words=sig_start_words+5+p_count*3;
+            let b_open:Tok=next_token(p);
+            if failed(p)==true { break; }
+            if b_open.kind!=123 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),b_open);break; }
+            prepass_skip_body(p);
+        }
+    }
+    p.cursor=saved_cursor;p.line=saved_line;p.column=saved_column;
+    p.node_count=saved_nodes;
+    if failed(p)==true { return 0; }
+    return 1;
+}
+fn parse_direct_call(p:Parser,h:u64,t:Tok)->u64 {
+    if p.call_depth>=128 { fail_tok(p,E_TOO_SMALL(),0,t);return 0; }
+    p.call_depth=p.call_depth+1;
+    let open:Tok=next_token(p);
+    if failed(p)==true { p.call_depth=p.call_depth-1;return 0; }
+    if open.kind!=40 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),open);return 0; }
+    let id:u64=node(p,K_CALL(),t.start,t.line,t.column);
+    if id==0 { p.call_depth=p.call_depth-1;fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    name_span(p,id,t.start,t.end);
+    let ret_type:u64=sig_return_type(p,h);
+    let ord:u64=sig_ordinal(p,h);
+    typed(p,id,lattice_width_ctx(p,ret_type),lattice_class_ctx(p,ret_type));
+    nput(p,id,14,ret_type);
+    nput(p,id,15,ord);
+    let ok:u64=parse_arguments(p,id,h);
+    p.call_depth=p.call_depth-1;
+    if ok==0 || failed(p)==true { return 0; }
+    return id;
+}
+
+fn parse_module(p:Parser)->u64 {
+    if p.many==false {
+        collect_records(p);
+        if failed(p)==true { return 0; }
+        collect_signatures(p);
+        if failed(p)==true { return 0; }
+    }
+    let t:Tok=peek(p);
+    if key_id(p.source,t.start,t.end)!=KEY_MODULE() {
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0;
+    }
+    step(p);
+    let id:u64=node(p,K_MODULE(),t.start,t.line,t.column);
+    if id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);return 0; }
+    nput(p,id,13,KEY_MODULE());
+    let n:Tok=next_token(p);
+    if n.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),n);return 0; }
+    name_span(p,id,n.start,n.end);
+    let mut m_tag:u64=0;
+    if p.many==true { m_tag=p.module_id; }
+    nput(p,id,15,m_tag);
+    let semi:Tok=next_token(p);
+    if semi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),semi);return 0; }
+    while failed(p)==false {
+        let im:Tok=peek(p);
+        if im.kind==257 && im.end-im.start==6 && p.source[im.start]==105 && p.source[im.start+1]==109 && p.source[im.start+2]==112 && p.source[im.start+3]==111 && p.source[im.start+4]==114 && p.source[im.start+5]==116 {
+            if p.many==false {
+                fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),im);
+                return 0;
+            }
+            step(p);
+            let target_tok:Tok=next_token(p);
+            if target_tok.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),target_tok);return 0; }
+            let isemi:Tok=next_token(p);
+            if isemi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),isemi);return 0; }
+            let mut t_mod_id:u64=0;
+            let mut u_i:u64=0;
+            while u_i<p.unit_count {
+                let ub:u64=u_i*9;
+                if same_name(p.source,p.units[ub+3],p.units[ub+4],target_tok.start,target_tok.end)==true {
+                    t_mod_id=p.units[ub+2];
+                    break;
+                }
+                u_i=u_i+1;
+            }
+            if t_mod_id==0 {
+                fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),target_tok);
+                return 0;
+            }
+            let imp_node:u64=node(p,K_IMPORT(),im.start,im.line,im.column);
+            if imp_node==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),im);return 0; }
+            name_span(p,imp_node,target_tok.start,target_tok.end);
+            nput(p,imp_node,15,t_mod_id);
+            attach(p,id,imp_node);
+            continue;
+        }
+        break;
+    }
+    let scope:u64=open_scope(p);
+    if scope==0 { fail_tok(p,E_TOO_SMALL(),0,t);return 0; }
+    while failed(p)==false {
+        let c:Tok=peek(p);
+        if c.kind==256 { break; }
+        let mut exported:u64=0;
+        if key_id(p.source,c.start,c.end)==KEY_EXPORT() { step(p);exported=1; }
+        let h:Tok=peek(p);
+        if failed(p)==true { break; }
+        let keyword:u64=key_id(p.source,h.start,h.end);
+        let mut child:u64=0;
+        if keyword==KEY_STRUCT() { child=parse_struct(p); }
+        else if keyword==KEY_FN() { child=parse_fn(p); }
+        else { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),h); }
+        if failed(p)==true { return 0; }
+        // `export` is recorded on the declaration's aux, so visibility is a
+        // property OF the node rather than a separate wrapper: one node per
+        // declaration, and the word that says it is visible says it there.
+        if exported==1 { nput(p,child,13,KEY_EXPORT()); }
+        attach(p,id,child);
+    }
+    close_scope(p);
+    return id;
+}
+
+// ---- the entry --------------------------------------------------------------
+// `parse` is the artefact's boundary. It takes the source and FOUR
+// caller-owned buffers -- nodes, scopes, binds, fields -- and writes a result
+// word block. Nothing is allocated and nothing is freed, so a refusal leaves the
+// caller's memory as it found it: the tree is simply not there, and `code` says
+// why.
+//
+// The result block is NINE words and every one is written on EVERY path,
+// including the failing ones:
+//   0 code            0 on success
+//   1 reason          the R_* for that code
+//   2 err_line        1-based, from the offending token
+//   3 err_column      1-based
+//   4 err_start       byte offset of the offending token
+//   5 node_count      0 on any refusal: a partial tree is never published
+//   6 root            the module node id, 1
+//   7 scope_count
+//   8 bind_count
+//
+// WHY node_count IS ZERO ON A REFUSAL. A half-built tree whose links are
+// consistent but whose types are not is the most dangerous thing this module
+// could hand back: every id is in range and the content is wrong. So a refusal
+// publishes zero and a reader cannot walk a partial tree even by accident.
+export fn parse(source:buf<u8>,nodes:buf<u64>,scopes:buf<u64>,binds:buf<u64>,
+               fields:buf<u64>,out:buf<u64>)->u64 {
+    if len(out)<9 { return E_TOO_SMALL(); }
+    let mut i:u64=0;
+    while i<9 { out[i]=0;i=i+1; }
+    let dummy_units:buf<u64>=binds;
+    let binding_meta:buf<u64>=alloc(runtime(),(len(binds)/BIND_WORDS())*2);
+    let p:Parser=Parser{source:source,size:len(source),cursor:0,line:1,column:1,
+        nodes:nodes,node_count:0,node_capacity:len(nodes),scopes:scopes,
+        scope_count:0,binds:binds,bind_count:0,binding_meta:binding_meta,fields:fields,field_count:0,struct_count:0,constructor_depth:0,function_count:0,function_words:0,call_depth:0,
+        scope:0,depth:0,fn_depth:0,return_type:0,live:0,code:0,reason:0,
+        err_line:1,err_column:1,err_start:0,
+        lex_value:0,lex_start:0,lex_end:0,lex_line:1,lex_column:1,lex_hex:false,
+        loop_top:0,if_depth:0,unary_depth:0,
+        cache_cursor:0,cache_valid:false,
+        cache_token:null,owned_head:null,
+        many:false,units:dummy_units,unit_count:0,unit_index:0,module_id:1,lookup_module:1,catalog_words:0};
+    let root:u64=parse_module(p);
+    if failed(p)==false && root!=0 {
+        check_allocation_contexts(p);
+    }
+    let end:Tok=peek(p);
+    let mut ret_code:u64=0;
+    if failed(p)==true || root==0 {
+        out[0]=p.code;out[1]=p.reason;out[2]=p.err_line;out[3]=p.err_column;
+        out[4]=p.err_start;out[5]=0;out[6]=0;out[7]=0;out[8]=0;
+        ret_code=p.code;
+        if ret_code==0 { ret_code=E_BAD_SYNTAX(); }
+    } else if end.kind!=256 {
+        fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),end);
+        out[0]=p.code;out[1]=p.reason;out[2]=p.err_line;out[3]=p.err_column;
+        out[4]=p.err_start;out[5]=0;out[6]=0;out[7]=0;out[8]=0;
+        ret_code=p.code;
+    } else {
+        out[5]=p.node_count;out[6]=root;out[7]=p.scope_count;out[8]=p.bind_count;
+        ret_code=0;
+    }
+    release_tokens(p.owned_head);
+    rt_free(runtime(),binding_meta);
+    rt_free(runtime(),p);
+    return ret_code;
+}
+
+export fn parse_many(source_blob:buf<u8>,source_spans:buf<u64>,source_count:u64,root_idx:u64,
+                     nodes:buf<u64>,scopes:buf<u64>,binds:buf<u64>,fields:buf<u64>,
+                     modules_buf:buf<u64>,out:buf<u64>)->u64 {
+    if len(out)<9 { return E_TOO_SMALL(); }
+    let mut oi:u64=0;
+    while oi<9 { out[oi]=0;oi=oi+1; }
+    if source_count==0 || source_count>64 || root_idx>=source_count {
+        out[0]=E_BAD_SYNTAX();out[1]=R_BAD_SYNTAX();
+        if source_count>64 { out[0]=E_TOO_SMALL(); }
+        return out[0];
+    }
+    if len(source_spans)<source_count*2 {
+        out[0]=E_TOO_SMALL();return out[0];
+    }
+    let units_needed:u64=source_count*9;
+    if len(modules_buf)<units_needed {
+        out[0]=E_TOO_SMALL();return out[0];
+    }
+    let blob_sz:u64=len(source_blob);
+    let mut ui:u64=0;
+    while ui<source_count {
+        let off:u64=source_spans[ui*2];
+        let slen:u64=source_spans[ui*2+1];
+        if off>blob_sz || slen>blob_sz-off {
+            out[0]=E_BAD_SYNTAX();out[1]=R_BAD_SYNTAX();return out[0];
+        }
+        let mut uj:u64=0;
+        while uj<ui {
+            let o_off:u64=source_spans[uj*2];
+            let o_len:u64=source_spans[uj*2+1];
+            if (off<o_off+o_len) && (o_off<off+slen) {
+                out[0]=E_BAD_SYNTAX();out[1]=R_BAD_SYNTAX();return out[0];
+            }
+            uj=uj+1;
+        }
+        modules_buf[ui*9]=off;
+        modules_buf[ui*9+1]=off+slen;
+        modules_buf[ui*9+2]=0;
+        modules_buf[ui*9+3]=0;
+        modules_buf[ui*9+4]=0;
+        modules_buf[ui*9+5]=0;
+        modules_buf[ui*9+6]=0;
+        modules_buf[ui*9+7]=0;
+        modules_buf[ui*9+8]=0;
+        ui=ui+1;
+    }
+    let binding_meta:buf<u64>=alloc(runtime(),(len(binds)/BIND_WORDS())*2);
+    let p:Parser=Parser{source:source_blob,size:blob_sz,cursor:0,line:1,column:1,
+        nodes:nodes,node_count:0,node_capacity:len(nodes),scopes:scopes,
+        scope_count:0,binds:binds,bind_count:0,binding_meta:binding_meta,fields:fields,field_count:0,struct_count:0,constructor_depth:0,function_count:0,function_words:0,call_depth:0,
+        scope:0,depth:0,fn_depth:0,return_type:0,live:0,code:0,reason:0,
+        err_line:1,err_column:1,err_start:0,
+        lex_value:0,lex_start:0,lex_end:0,lex_line:1,lex_column:1,lex_hex:false,
+        loop_top:0,if_depth:0,unary_depth:0,
+        cache_cursor:0,cache_valid:false,
+        cache_token:null,owned_head:null,
+        many:true,units:modules_buf,unit_count:source_count,unit_index:0,module_id:1,lookup_module:1,catalog_words:0};
+
+    let mut assigned_mods:u64=0;
+    ui=0;
+    while ui<source_count {
+        set_unit(p,ui);
+        let t:Tok=next_token(p);
+        if failed(p)==true { break; }
+        if key_id(p.source,t.start,t.end)!=KEY_MODULE() {
+            fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),t);break;
+        }
+        let mname:Tok=next_token(p);
+        if failed(p)==true { break; }
+        if mname.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),mname);break; }
+        let semi:Tok=next_token(p);
+        if failed(p)==true { break; }
+        if semi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),semi);break; }
+        let base:u64=ui*9;
+        modules_buf[base+3]=mname.start;
+        modules_buf[base+4]=mname.end;
+        let mut found_mid:u64=0;
+        let mut uj2:u64=0;
+        while uj2<ui {
+            let obase:u64=uj2*9;
+            if same_name(p.source,modules_buf[obase+3],modules_buf[obase+4],mname.start,mname.end)==true {
+                found_mid=modules_buf[obase+2];
+                break;
+            }
+            uj2=uj2+1;
+        }
+        if found_mid==0 {
+            assigned_mods=assigned_mods+1;
+            found_mid=assigned_mods;
+        }
+        modules_buf[base+2]=found_mid;
+        ui=ui+1;
+    }
+    release_tokens(p.owned_head);
+    p.owned_head=null;
+    p.cache_valid=false;
+
+    if failed(p)==false {
+        ui=0;
+        while ui<source_count {
+            set_unit(p,ui);
+            let mod_kw:Tok=next_token(p);
+            let mod_nm:Tok=next_token(p);
+            let mod_sm:Tok=next_token(p);
+            let mut mask:u64=0;
+            while p.cursor<p.size && failed(p)==false {
+                let im:Tok=peek(p);
+                if im.kind==257 && im.end-im.start==6 && p.source[im.start]==105 && p.source[im.start+1]==109 && p.source[im.start+2]==112 && p.source[im.start+3]==111 && p.source[im.start+4]==114 && p.source[im.start+5]==116 {
+                    step(p);
+                    let target_tok:Tok=next_token(p);
+                    if target_tok.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),target_tok);break; }
+                    let isemi:Tok=next_token(p);
+                    if isemi.kind!=59 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),isemi);break; }
+                    let mut t_mid:u64=0;
+                    let mut uj3:u64=0;
+                    while uj3<source_count {
+                        let obase2:u64=uj3*9;
+                        if same_name(p.source,modules_buf[obase2+3],modules_buf[obase2+4],target_tok.start,target_tok.end)==true {
+                            t_mid=modules_buf[obase2+2];
+                            break;
+                        }
+                        uj3=uj3+1;
+                    }
+                    if t_mid==0 {
+                        fail_tok(p,E_UNDECLARED(),R_UNDECLARED(),target_tok);
+                        break;
+                    }
+                    let shift:u64=t_mid-1;
+                    let mut bit:u64=1;
+                    let mut bs:u64=0;
+                    while bs<shift {
+                        bit=bit*2;
+                        bs=bs+1;
+                    }
+                    mask=mask | bit;
+                    continue;
+                }
+                break;
+            }
+            modules_buf[ui*9+8]=mask;
+            if failed(p)==true { break; }
+            ui=ui+1;
+        }
+    }
+    release_tokens(p.owned_head);
+    p.owned_head=null;
+    p.cache_valid=false;
+
+    if failed(p)==false {
+        ui=0;
+        while ui<source_count {
+            set_unit(p,ui);
+            let mod_kw:Tok=next_token(p);
+            let mod_nm:Tok=next_token(p);
+            let mod_sm:Tok=next_token(p);
+            while p.cursor<p.size && failed(p)==false {
+                let im:Tok=peek(p);
+                if im.kind==257 && im.end-im.start==6 && p.source[im.start]==105 && p.source[im.start+1]==109 && p.source[im.start+2]==112 && p.source[im.start+3]==111 && p.source[im.start+4]==114 && p.source[im.start+5]==116 {
+                    step(p);
+                    next_token(p);
+                    next_token(p);
+                    continue;
+                }
+                break;
+            }
+            let cur_mid:u64=modules_buf[ui*9+2];
+            let mut top_depth:u64=0;
+            while p.cursor<p.size && failed(p)==false {
+                let t:Tok=next_token(p);
+                if failed(p)==true { break; }
+                if t.kind==256 { break; }
+                if t.kind==123 { top_depth=top_depth+1;continue; }
+                if t.kind==125 {
+                    if top_depth>0 { top_depth=top_depth-1; }
+                    continue;
+                }
+                if top_depth!=0 { continue; }
+                let mut is_exp:u64=0;
+                let kw:u64=key_id(p.source,t.start,t.end);
+                let mut decl_kw:u64=kw;
+                if kw==KEY_EXPORT() {
+                    is_exp=1;
+                    let next_kw_tok:Tok=next_token(p);
+                    if failed(p)==true { break; }
+                    decl_kw=key_id(p.source,next_kw_tok.start,next_kw_tok.end);
+                }
+                if decl_kw==KEY_STRUCT() || decl_kw==KEY_FN() {
+                    let decl_name:Tok=next_token(p);
+                    if failed(p)==true { break; }
+                    if decl_name.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),decl_name);break; }
+                    let mut knd:u64=K_FN();
+                    if decl_kw==KEY_STRUCT() { knd=K_STRUCT(); }
+                    let cat_pos:u64=units_needed+p.catalog_words;
+                    if cat_pos+5>len(modules_buf) {
+                        fail_tok(p,E_TOO_SMALL(),0,decl_name);
+                        break;
+                    }
+                    modules_buf[cat_pos]=decl_name.start;
+                    modules_buf[cat_pos+1]=decl_name.end;
+                    modules_buf[cat_pos+2]=cur_mid;
+                    modules_buf[cat_pos+3]=knd;
+                    modules_buf[cat_pos+4]=is_exp;
+                    p.catalog_words=p.catalog_words+5;
+                    while p.cursor<p.size && failed(p)==false {
+                        let ob:Tok=next_token(p);
+                        if failed(p)==true { break; }
+                        if ob.kind==256 { break; }
+                        if ob.kind==123 {
+                            prepass_skip_body(p);
+                            break;
+                        }
+                    }
+                }
+            }
+            if failed(p)==true { break; }
+            ui=ui+1;
+        }
+    }
+    release_tokens(p.owned_head);
+    p.owned_head=null;
+    p.cache_valid=false;
+
+    if failed(p)==false {
+        ui=0;
+        while ui<source_count {
+            set_unit(p,ui);
+            collect_records_names(p);
+            if failed(p)==true { break; }
+            ui=ui+1;
+        }
+    }
+    release_tokens(p.owned_head);
+    p.owned_head=null;
+    p.cache_valid=false;
+
+    if failed(p)==false {
+        ui=0;
+        while ui<source_count {
+            set_unit(p,ui);
+            collect_records_fields(p);
+            if failed(p)==true { break; }
+            ui=ui+1;
+        }
+    }
+    release_tokens(p.owned_head);
+    p.owned_head=null;
+    p.cache_valid=false;
+
+    if failed(p)==false {
+        ui=0;
+        while ui<source_count {
+            set_unit(p,ui);
+            collect_signatures(p);
+            if failed(p)==true { break; }
+            ui=ui+1;
+        }
+    }
+    release_tokens(p.owned_head);
+    p.owned_head=null;
+    p.cache_valid=false;
+
+    let mut prog_id:u64=0;
+    if failed(p)==false {
+        prog_id=node(p,K_PROGRAM(),0,1,1);
+        if prog_id==0 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),next_token(p)); }
+        else {
+            nput(p,prog_id,15,modules_buf[root_idx*9+2]);
+            ui=0;
+            while ui<source_count {
+                set_unit(p,ui);
+                let m_node:u64=parse_module(p);
+                if failed(p)==true { break; }
+                attach(p,prog_id,m_node);
+                ui=ui+1;
+            }
+        }
+    }
+    if failed(p)==false && prog_id!=0 {
+        check_allocation_contexts(p);
+    }
+    let mut ret_code:u64=0;
+    if failed(p)==true || prog_id==0 {
+        out[0]=p.code;out[1]=p.reason;out[2]=p.err_line;out[3]=p.err_column;
+        out[4]=p.err_start;out[5]=0;out[6]=0;out[7]=0;out[8]=0;
+        ret_code=p.code;
+        if ret_code==0 { ret_code=E_BAD_SYNTAX(); }
+    } else {
+        out[5]=p.node_count;out[6]=prog_id;out[7]=p.scope_count;out[8]=p.bind_count;
+        ret_code=0;
+    }
+    release_tokens(p.owned_head);
+    rt_free(runtime(),binding_meta);
+    rt_free(runtime(),p);
+    return ret_code;
+}
+
+// The strides and the result size are exported so the C harness reads its own
+// numbers out of the EXECUTED module instead of repeating them as literals. A
+// harness holding its own copy of the 16 goes stale the moment this file
+// changes the stride, and the tree would then be read at the wrong offset.
+export fn node_words()->u64 { return NODE_WORDS(); }
+export fn scope_words()->u64 { return SCOPE_WORDS(); }
+export fn bind_words()->u64 { return BIND_WORDS(); }
+export fn result_words()->u64 { return 9; }
+// Prefix layout in fields: bottom words are [start, end, field_type, owner_struct_type] per field.
+export fn field_words()->u64 { return 4; }
+
+// ---- the shape, published so the harness cannot hold a stale copy ----------
+// Thirty-seven words: the two strides, the scope stride, the four refusal codes
+// with their four reasons, the four register classes and the twenty-two node kinds.
+// A harness that held its own literals would read the node array at the wrong
+// moment this file changed the stride, and it would print green numbers over a
+// misaligned tree -- the shape of a gate that measures nothing.
+export fn shape_read_back(out:buf<u64>,base:u64)->u64 {
+    if base>len(out) || len(out)-base<38 { return 0; }
+    out[base]=NODE_WORDS();
+    out[base+1]=9;                       // the result block, see parse()
+    out[base+2]=E_UNCLOSED_BRACE();
+    out[base+3]=E_USE_BEFORE_DECL();
+    out[base+4]=E_TYPE_NOT_CARRYABLE();
+    out[base+5]=E_UNDECLARED();
+    out[base+6]=R_UNCLOSED_BRACE();
+    out[base+7]=R_USE_BEFORE_DECL();
+    out[base+8]=R_TYPE_NOT_CARRYABLE();
+    out[base+9]=R_UNDECLARED();
+    out[base+10]=REG_NONE();
+    out[base+11]=REG_VALUE();
+    out[base+12]=REG_ADDRESS();
+    out[base+13]=REG_PREDICATE();
+    out[base+14]=K_MODULE();
+    out[base+15]=K_STRUCT();
+    out[base+16]=K_FIELD();
+    out[base+17]=K_FN();
+    out[base+18]=K_PARAM();
+    out[base+19]=K_RETURN();
+    out[base+20]=K_BLOCK();
+    out[base+21]=K_LET();
+    out[base+22]=K_ASSIGN();
+    out[base+23]=K_RETURN_STMT();
+    out[base+24]=K_WHILE();
+    out[base+25]=K_IF();
+    out[base+26]=K_NAME();
+    out[base+27]=K_LITERAL();
+    out[base+28]=K_FIELD_ACCESS();
+    out[base+29]=K_CALL();
+    out[base+30]=K_BINARY();
+    out[base+31]=K_TYPE();
+    out[base+32]=K_INDEX();
+    out[base+33]=K_RECORD();
+    // THE SCOPE STRIDE, published for the same reason as the node stride: a
+    // harness that walks the parent chain needs it, and a harness holding its
+    // own copy of the 3 goes stale the moment the scope record changes shape.
+    out[base+34]=SCOPE_WORDS();
+    out[base+35]=K_BREAK();
+    out[base+36]=K_CONTINUE();
+    out[base+37]=K_UNARY();
+    return 38;
+}
+
+fn unit_of_offset(p:Parser,off:u64)->u64 {
+    if p.many==false { return 1; }
+    let mut u:u64=0;
+    while u<p.unit_count {
+        let base:u64=u*9;
+        let s:u64=p.units[base];
+        let e:u64=p.units[base+1];
+        if off>=s && off<e { return p.units[base+2]; }
+        u=u+1;
+    }
+    return 0;
+}
+fn set_unit(p:Parser,idx:u64)->u64 {
+    release_tokens(p.owned_head);
+    p.owned_head=null;
+    p.cache_token=null;
+    p.cache_valid=false;
+    p.unit_index=idx;
+    let base:u64=idx*9;
+    p.cursor=p.units[base];
+    p.size=p.units[base+1];
+    p.module_id=p.units[base+2];
+    p.lookup_module=p.units[base+2];
+    p.line=1;
+    p.column=1;
+    return 0;
+}
+fn collect_records_names(p:Parser)->u64 {
+    let saved_cursor:u64=p.cursor;
+    let saved_line:u64=p.line;
+    let saved_column:u64=p.column;
+    let saved_nodes:u64=p.node_count;
+    let mut top_depth:u64=0;
+    while p.cursor<p.size && failed(p)==false {
+        let t:Tok=next_token(p);
+        if failed(p)==true { break; }
+        if t.kind==256 { break; }
+        if t.kind==123 { top_depth=top_depth+1;continue; }
+        if t.kind==125 {
+            if top_depth>0 { top_depth=top_depth-1; }
+            continue;
+        }
+        if top_depth!=0 { continue; }
+        let kw:u64=key_id(p.source,t.start,t.end);
+        if kw==KEY_STRUCT() {
+            let name:Tok=next_token(p);
+            if failed(p)==true { break; }
+            if name.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),name);break; }
+            if lookup_struct_type(p,name.start,name.end)!=0 {
+                fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),name);break;
+            }
+            let type_id:u64=T_LIMIT()+p.struct_count+1;
+            let st_idx:u64=p.struct_count+1;
+            if len(p.fields)<st_idx*3 { fail_tok(p,E_TOO_SMALL(),0,name);break; }
+            let at:u64=len(p.fields)-st_idx*3;
+            if at<p.field_count*4 { fail_tok(p,E_TOO_SMALL(),0,name);break; }
+            p.fields[at]=name.start;
+            p.fields[at+1]=name.end;
+            p.fields[at+2]=type_id;
+            p.struct_count=p.struct_count+1;
+            let open:Tok=next_token(p);
+            if failed(p)==true { break; }
+            if open.kind!=123 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),open);break; }
+            if prepass_skip_body(p)==false {
+                if failed(p)==false { fail_tok(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),open); }
+                break;
+            }
+        } else if kw==KEY_FN() {
+            let fname:Tok=next_token(p);
+            if failed(p)==true { break; }
+            while p.cursor<p.size && failed(p)==false {
+                let h:Tok=next_token(p);
+                if failed(p)==true { break; }
+                if h.kind==256 { break; }
+                if h.kind==123 {
+                    if prepass_skip_body(p)==false && failed(p)==true { break; }
+                    break;
+                }
+            }
+        }
+    }
+    p.cursor=saved_cursor;p.line=saved_line;p.column=saved_column;
+    p.node_count=saved_nodes;
+    if failed(p)==true { return 0; }
+    return 1;
+}
+fn collect_records_fields(p:Parser)->u64 {
+    let saved_cursor:u64=p.cursor;
+    let saved_line:u64=p.line;
+    let saved_column:u64=p.column;
+    let saved_nodes:u64=p.node_count;
+    let mut top_depth:u64=0;
+    while p.cursor<p.size && failed(p)==false {
+        let t:Tok=next_token(p);
+        if failed(p)==true { break; }
+        if t.kind==256 { break; }
+        if t.kind==123 { top_depth=top_depth+1;continue; }
+        if t.kind==125 {
+            if top_depth>0 { top_depth=top_depth-1; }
+            continue;
+        }
+        if top_depth!=0 { continue; }
+        let kw:u64=key_id(p.source,t.start,t.end);
+        if kw==KEY_STRUCT() {
+            let name:Tok=next_token(p);
+            if failed(p)==true { break; }
+            let struct_id:u64=lookup_struct_type(p,name.start,name.end);
+            let open:Tok=next_token(p);
+            if failed(p)==true { break; }
+            let mut f_start_idx:u64=p.field_count;
+            while p.cursor<p.size && failed(p)==false {
+                let c:Tok=peek(p);
+                if failed(p)==true { break; }
+                if c.kind==256 { fail_tok(p,E_UNCLOSED_BRACE(),R_UNCLOSED_BRACE(),c);break; }
+                if c.kind==125 { step(p);break; }
+                let f:Tok=next_token(p);
+                if failed(p)==true { break; }
+                if f.kind!=257 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),f);break; }
+                let mut chk:u64=f_start_idx;
+                let mut dup:bool=false;
+                while chk<p.field_count {
+                    let chk_at:u64=chk*4;
+                    if same_name(p.source,p.fields[chk_at],p.fields[chk_at+1],f.start,f.end)==true {
+                        dup=true;
+                    }
+                    chk=chk+1;
+                }
+                if dup==true { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),f);break; }
+                let colon:Tok=next_token(p);
+                if failed(p)==true { break; }
+                if colon.kind!=58 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),colon);break; }
+                let declared:u64=parse_type(p);
+                if failed(p)==true { break; }
+                let f_type:u64=nget(p,declared,13);
+                p.node_count=saved_nodes;
+                if f_type==T_RUNTIME() { fail_tok(p,E_TYPE_NOT_CARRYABLE(),R_TYPE_NOT_CARRYABLE(),f);break; }
+                let fat:u64=p.field_count*4;
+                let top_limit:u64=len(p.fields)-p.struct_count*3;
+                if fat+4>top_limit { fail_tok(p,E_TOO_SMALL(),0,f);break; }
+                p.fields[fat]=f.start;
+                p.fields[fat+1]=f.end;
+                p.fields[fat+2]=f_type;
+                p.fields[fat+3]=struct_id;
+                p.field_count=p.field_count+1;
+                let sep:Tok=peek(p);
+                if failed(p)==true { break; }
+                if sep.kind==44 { step(p); }
+                else if sep.kind!=125 { fail_tok(p,E_BAD_SYNTAX(),R_BAD_SYNTAX(),sep);break; }
+            }
+        } else if kw==KEY_FN() {
+            let fname:Tok=next_token(p);
+            if failed(p)==true { break; }
+            while p.cursor<p.size && failed(p)==false {
+                let h:Tok=next_token(p);
+                if failed(p)==true { break; }
+                if h.kind==256 { break; }
+                if h.kind==123 {
+                    if prepass_skip_body(p)==false && failed(p)==true { break; }
+                    break;
+                }
+            }
+        }
+    }
+    p.cursor=saved_cursor;p.line=saved_line;p.column=saved_column;
+    p.node_count=saved_nodes;
+    if failed(p)==true { return 0; }
+    return 1;
+}
+
+
+fn get_module_import_mask(p:Parser,mid:u64)->u64 {
+    let mut mask:u64=0;
+    let mut u:u64=0;
+    while u<p.unit_count {
+        let b:u64=u*9;
+        if p.units[b+2]==mid {
+            mask=mask | p.units[b+8];
+        }
+        u=u+1;
+    }
+    return mask;
+}
+fn resolve_imported_module(p:Parser,start:u64,end:u64)->u64 {
+    let mut target_mid:u64=0;
+    let mut u:u64=0;
+    while u<p.unit_count {
+        let b:u64=u*9;
+        if same_name(p.source,p.units[b+3],p.units[b+4],start,end)==true {
+            target_mid=p.units[b+2];
+            break;
+        }
+        u=u+1;
+    }
+    if target_mid==0 { return 0; }
+    let current_mask:u64=get_module_import_mask(p,p.module_id);
+    let shift:u64=target_mid-1;
+    let mut bit:u64=1;
+    let mut s:u64=0;
+    while s<shift {
+        bit=bit*2;
+        s=s+1;
+    }
+    if (current_mask & bit)==0 { return 0; }
+    return target_mid;
+}
+fn is_declared_export(p:Parser,mid:u64,start:u64,end:u64,kind:u64)->bool {
+    let catalog_start:u64=p.unit_count*9;
+    let mut idx:u64=0;
+    while idx<p.catalog_words {
+        let at:u64=catalog_start+idx;
+        if p.units[at+2]==mid && p.units[at+3]==kind {
+            if same_name(p.source,p.units[at],p.units[at+1],start,end)==true {
+                return p.units[at+4]==1;
+            }
+        }
+        idx=idx+5;
+    }
+    return false;
+}

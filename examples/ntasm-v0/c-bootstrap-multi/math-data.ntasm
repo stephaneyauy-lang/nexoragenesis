@@ -1,0 +1,12 @@
+module math_data
+target x86_64-nexora-uefi
+section .rdata {
+    export data step:u64=2
+}
+section .text {
+    export fn add(in a:u64 @rcx,in b:u64 @rdx)->u64
+    effects {}
+    clobbers {} {
+        return a+b
+    }
+}

@@ -1,0 +1,93 @@
+(* NTASM v0 : syntaxe des tokens, complétée par ntasm-grammar-v0.md.
+   Les alternatives à mot-clé précèdent NAME ; les contraintes contextuelles
+   des terminaisons, quotes et noms font partie du contrat documentaire. *)
+Source ::= Lines 'module' Qualified Term 'target' Dashed Term { Top Lines } EOF ;
+Top ::= Versions | DefaultAbi | Output | Features | Import | Constant
+      | Comptime | Macro | StubTable | Section ;
+Lines ::= { NEWLINE } ;
+Term ::= ( ';' | NEWLINE ) Lines ;
+OptionalTerm ::= [ Term ] ;
+Name ::= NAME ;
+DeclName ::= NAME ;
+Qualified ::= Name { '.' Name } ;
+Dashed ::= Name { '-' Name } ;
+SectionName ::= '.' Name ;
+Versions ::= 'versions' '{' Lines { DeclName INTEGER '.' INTEGER Term } '}' ;
+DefaultAbi ::= 'default_abi' Dashed Term ;
+Output ::= 'output' Dashed Term ;
+Features ::= 'features' Set OptionalTerm ;
+Set ::= '{' Lines [ SetItem Lines { ',' Lines SetItem Lines } [ ',' Lines ] ] '}' ;
+SetItem ::= Qualified Lines [ '(' Lines Qualified Lines ')' Lines ] ;
+Predicates ::= '{' Lines [ Predicate Lines { ',' Lines Predicate Lines } [ ',' Lines ] ] '}' ;
+Predicate ::= Qualified '(' Arguments ')' ;
+Contracts ::= [ 'abi' Dashed Term ] 'effects' Set OptionalTerm
+              'clobbers' Set OptionalTerm [ 'requires' Predicates OptionalTerm ]
+              [ 'ensures' Predicates OptionalTerm ] ;
+Parameters ::= '(' Lines [ Parameter Lines { ',' Lines Parameter Lines } [ ',' Lines ] ] ')' ;
+Parameter ::= ( 'in' | 'out' | 'inout' ) DeclName ':' Type [ '@' Name ] ;
+Function ::= [ 'export' ] 'fn' DeclName Parameters '->' Type OptionalTerm Contracts Lines Block ;
+Import ::= 'import' Qualified 'as' DeclName ':' 'fn' Parameters '->' Type Term Contracts ;
+Constant ::= 'const' DeclName ':' Type '=' Expression Term ;
+Data ::= [ 'export' ] 'data' DeclName ':' Type '=' Expression Term ;
+Section ::= 'section' SectionName '{' Lines { SectionItem Lines } '}' ;
+SectionItem ::= Function | Data | [ 'export' ] ExpansionStatement ;
+Type ::= 'ptr' '<' Name ',' Lines Type '>'
+       | 'array' '<' Type ',' Lines INTEGER '>'
+       | 'expand' Name '(' TypeArguments ')'
+       | '$' Name | Name ;
+TypeArguments ::= [ Expression { ',' Lines Expression } [ ',' Lines ] ] ;
+MacroType ::= 'ast' '.' DeclName | Type ;
+Block ::= '{' Lines { Statement Lines } '}' ;
+Statement ::= Let | Call | Return | If | ExpansionStatement | AlignStack | Instruction ;
+Let ::= 'let' DeclName ':' Type '=' Expression Term ;
+Call ::= 'call' Qualified [ '(' Arguments ')' ] Term ;
+Return ::= 'return' [ Expression ] Term ;
+If ::= 'if' Expression Lines Block Lines [ 'else' Lines Block ] ;
+ExpansionStatement ::= 'expand' DeclName '(' MetaArguments ')' Term ;
+AlignStack ::= 'align_stack' INTEGER Term ;
+Instruction ::= Name ( ':' Term | [ Operand { ',' Operand } ] Term ) ;
+Operand ::= Memory | Expression ;
+Memory ::= '[' [ ( 'fs' | 'gs' ) ':' ] [ AddressTerm { ( '+' | '-' ) AddressTerm } [ '+' | '-' ] ] ']' ':' Type ;
+AddressTerm ::= ( Qualified | INTEGER ) [ '*' INTEGER ] ;
+Expression ::= LogicalOr ;
+LogicalOr ::= LogicalAnd { '||' LogicalAnd } ;
+LogicalAnd ::= Comparison { '&&' Comparison } ;
+Comparison ::= BitOr [ ( '==' | '!=' | '<=' | '>=' | '<' | '>' ) BitOr ] ;
+BitOr ::= BitXor { '|' BitXor } ;
+BitXor ::= BitAnd { '^' BitAnd } ;
+BitAnd ::= Shift { '&' Shift } ;
+Shift ::= Sum { ( '<<' | '>>' ) Sum } ;
+Sum ::= Product { ( '+' | '-' ) Product } ;
+Product ::= Unary { ( '*' | '/' | '%' ) Unary } ;
+Unary ::= ( '+' | '-' | '~' | '!' ) Unary | Primary ;
+Primary ::= INTEGER | STRING | '(' Expression ')' | '$' Name
+          | 'intrinsic' Qualified '(' Arguments ')'
+          | 'expand' Name '(' MetaArguments ')'
+          | Qualified [ '(' Arguments ')' ] ;
+Arguments ::= Lines [ Expression Lines { ',' Lines Expression Lines } [ ',' Lines ] ] ;
+MetaArguments ::= Lines [ MetaValue Lines { ',' Lines MetaValue Lines } [ ',' Lines ] ] ;
+MetaValue ::= Quote | Expression ;
+Quote ::= 'quote' '(' 'expr' ')' '{' Lines Expression Lines '}'
+        | 'quote' '(' 'type' ')' '{' Lines Type Lines '}'
+        | 'quote' '(' 'stmt' ')' '{' Lines Statement Lines '}'
+        | 'quote' '(' 'block' ')' '{' Lines { Statement Lines } '}'
+        | 'quote' '(' 'decl' ')' '{' Lines ( Function | Data | Constant ) Lines '}' ;
+Comptime ::= 'comptime' '(' Lines [ Budget Lines { ',' Lines Budget Lines } [ ',' Lines ] ] ')' Lines MetaBlock ;
+Budget ::= DeclName '=' INTEGER ;
+Macro ::= 'macro' DeclName '(' Lines [ MacroParameter Lines { ',' Lines MacroParameter Lines } [ ',' Lines ] ] ')'
+          '->' ( 'list' '<' MacroType '>' | MacroType ) Lines MetaBlock ;
+MacroParameter ::= DeclName ':' MacroType ;
+MetaBlock ::= '{' Lines { MetaStatement Lines } '}' ;
+MetaStatement ::= 'let' DeclName '=' Expression Term
+                | 'if' Expression Lines MetaBlock Lines [ 'else' Lines MetaBlock ]
+                | 'for' DeclName 'in' Expression Lines MetaBlock
+                | 'return' MetaValue Term | 'emit' MetaValue Term | ExpansionStatement ;
+StubTable ::= 'stub_table' DeclName 'kind' Name '{' Lines { StubEntry Lines } '}' ;
+StubEntry ::= DeclName INTEGER '{' Lines
+              'handler' Qualified Term 'entry_abi' Dashed Term 'exit_abi' Dashed Term
+              'exit' Name Term 'frame' Qualified Term 'bindings' Bindings Term
+              'hardware_error_code' Name Term 'save' Set Term 'clobbers' Set Term
+              'stack_align' INTEGER Term 'swapgs' Name Term 'interrupts' Name Term
+              'section' SectionName Term 'visibility' Name Term 'symbol' Name Term '}' ;
+Bindings ::= '{' Lines [ Binding Lines { ',' Lines Binding Lines } [ ',' Lines ] ] '}' ;
+Binding ::= DeclName ':' Type '@' Name ;

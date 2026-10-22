@@ -1,0 +1,75 @@
+module effects_lifetime_entry;
+
+import effects;
+
+// THE LIFETIME ENTRY.
+//
+// THE THREE VOCABULARIES ARE ASKED FOUR THOUSAND TIMES ABOUT A NAME THAT IS
+// IN NONE OF THEM, and they are asked in ONE runtime context: the old code
+// allocated nineteen handles per iteration -- eleven for the atoms, two for
+// the memory effects, six for the spaces -- and freed none of them, so the
+// loop exhausted the runtime's buffer table and the program died. The
+// question this entry asks is not "what is the name worth" but "what does the
+// asking cost", and the cost is the whole point.
+//
+// THE KNOWN NAMES ARE ASKED ONCE EACH, and the answers must be the
+// documented ones: the first atom, the first memory effect and the first
+// space.
+//
+// THE SOURCE IS BORROWED, READ AND NOT WRITTEN. The C checks its bytes after
+// the call, and a program that wrote to it would be caught there.
+//
+// THE LAYOUT THE C LENDS IS FIXED AND CHECKED HERE BEFORE IT IS USED:
+//
+//   [0..10)  "telepathyz"  in none of the three vocabularies
+//   [10]     ' '
+//   [11..21) "privileged"  the first atom
+//   [21]     ' '
+//   [22..31) "reads_mem"   the first memory effect
+//   [31]     ' '
+//   [32..36) "user"        the first space
+//
+// The unknown name is TEN bytes long, and that is why it is this one and not
+// "telepathy": the spans above are the spans the C checks, and a name of
+// another length would move every one of them.
+//
+// A source that is not this one is refused with 800 rather than measured on
+// ranges that mean nothing.
+
+fn check_layout(source:buf<u8>)->u64 {
+    if len(source)<36 { return 0; }
+    if source[0]!=116 { return 0; }
+    if source[10]!=32 { return 0; }
+    if source[11]!=112 { return 0; }
+    if source[21]!=32 { return 0; }
+    if source[22]!=114 { return 0; }
+    if source[31]!=32 { return 0; }
+    if source[32]!=117 { return 0; }
+    if source[35]!=114 { return 0; }
+    return 1;
+}
+
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    if check_layout(source)==0 { return 800; }
+    // THE KNOWN NAMES, ONCE EACH.
+    if effects.atom_of(source,11,21)!=1 { return 901; }
+    if effects.memory_of(source,22,31)!=1 { return 902; }
+    if effects.space_of(source,32,36)!=1 { return 903; }
+    // THE UNKNOWN NAME, FOUR THOUSAND TIMES, IN ONE CONTEXT. A handle that
+    // was not freed would be a live handle here, and four thousand iterations
+    // of nineteen of them is more than the runtime's table holds.
+    let mut i:u64=0;
+    while i<4000 {
+        if effects.atom_of(source,0,10)!=0 { return 904; }
+        if effects.memory_of(source,0,10)!=0 { return 905; }
+        if effects.space_of(source,0,10)!=0 { return 906; }
+        i=i+1;
+    }
+    // THE SOURCE IS STILL THE SOURCE: the bytes the C lent are the bytes
+    // that are there.
+    if source[0]!=116 { return 907; }
+    if source[35]!=114 { return 907; }
+    out[0]=4000;out[1]=1;out[2]=1;out[3]=1;
+    return 0;
+}

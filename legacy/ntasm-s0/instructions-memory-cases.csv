@@ -1,0 +1,61 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line,golden_hex
+memory,MB0,file,legacy/ntasm-s0/instructions-memory/MB0.ntasm,112,2e062b8bf22953751c4938c4e9302f558cde96183db9de7b466f5c284f49fe3d,NG_S0_T12_OK,488b00
+memory,MB1,file,legacy/ntasm-s0/instructions-memory/MB1.ntasm,112,8727d236b59021fc6ef6e3c823de4d777f873cc717eaef5ce9921cfd86619673,NG_S0_T12_OK,488b01
+memory,MB2,file,legacy/ntasm-s0/instructions-memory/MB2.ntasm,112,9549f18c1fc56b517fc81528d95ced503e06c28472a10f591ad969abddb2b183,NG_S0_T12_OK,488b02
+memory,MB3,file,legacy/ntasm-s0/instructions-memory/MB3.ntasm,112,416ecc17eb9c6406f42db618fb65cfe7d9114c1022f90afbc0fb5e673f6eca36,NG_S0_T12_OK,488b03
+memory,MB4,file,legacy/ntasm-s0/instructions-memory/MB4.ntasm,112,1abc0f0f19da62b7fa9ccb4b6d1145b929bbc4ee91f47ff97a7671a59ce554de,NG_S0_T12_OK,488b0424
+memory,MB5,file,legacy/ntasm-s0/instructions-memory/MB5.ntasm,112,e35f625c144752cfed197269ff9be653d6f0bd27a378f57e0d30ecbbe16f0eb2,NG_S0_T12_OK,488b4500
+memory,MB6,file,legacy/ntasm-s0/instructions-memory/MB6.ntasm,112,ba6cd04f060414590035c17c62a74baa9fb9a35cdde5e3713de0ed4ce29fb70d,NG_S0_T12_OK,488b06
+memory,MB7,file,legacy/ntasm-s0/instructions-memory/MB7.ntasm,112,c7ea89d8bffc7caa8af81688b2b16707e646a5d9c13d5fcb22a4d32b74917809,NG_S0_T12_OK,488b07
+memory,MB8,file,legacy/ntasm-s0/instructions-memory/MB8.ntasm,111,72b594bc2cad7935c75ee47453506e161099701baa6f2280f6a59ece72a5a0ca,NG_S0_T12_OK,498b00
+memory,MB9,file,legacy/ntasm-s0/instructions-memory/MB9.ntasm,111,4c34e494914aa5de7fcfa377613757db437c1358e9b90bd0b48ae5babf87c6ea,NG_S0_T12_OK,498b01
+memory,MB10,file,legacy/ntasm-s0/instructions-memory/MB10.ntasm,112,e7212777fa1288f58a88d4d209ee0a086df56f0be52566c94716a849936dcaaf,NG_S0_T12_OK,498b02
+memory,MB11,file,legacy/ntasm-s0/instructions-memory/MB11.ntasm,112,52ebc94023977a64b4254e0d11ec8e32c4ec4942c39f16d56fdc25eca8a73bb0,NG_S0_T12_OK,498b03
+memory,MB12,file,legacy/ntasm-s0/instructions-memory/MB12.ntasm,112,94376ccf0ee6409a54e64ac1ea31ba657623daf9163e052c216575ac226e93c9,NG_S0_T12_OK,498b0424
+memory,MB13,file,legacy/ntasm-s0/instructions-memory/MB13.ntasm,112,1273308a894af4b1c846f79498f728fc896b85b4fe720ae39d8b12d151035ac7,NG_S0_T12_OK,498b4500
+memory,MB14,file,legacy/ntasm-s0/instructions-memory/MB14.ntasm,112,bb65d4d7af4199635a63a3a4b74e235bb265e74800a525d89d94e29d4415e82a,NG_S0_T12_OK,498b06
+memory,MB15,file,legacy/ntasm-s0/instructions-memory/MB15.ntasm,112,b052281e79cf0c6a7d6dc68d2ea66a988f799693e43d1da5428e6975712c076b,NG_S0_T12_OK,498b07
+memory,ML0,file,legacy/ntasm-s0/instructions-memory/ML0.ntasm,126,c3044b47b4d5340d2cc87d029ffaadf27adb66e263953dc3607d1aff72dabd42,NG_S0_T12_OK,4d8d5c9c20
+memory,ML1,file,legacy/ntasm-s0/instructions-memory/ML1.ntasm,111,64e31e388a0583dd472c19a3449a6f3cb7ca4cbe46802e0ac8532dea7dcddf5c,NG_S0_T12_OK,400fb606
+memory,ML2,file,legacy/ntasm-s0/instructions-memory/ML2.ntasm,111,96e5d34d374230b86b0d4885906bd1cb82140912cf3099bc8ea0ec1e0bf0175f,NG_S0_T12_OK,450fb74d00
+memory,ML3,file,legacy/ntasm-s0/instructions-memory/ML3.ntasm,127,83aff4e5334c9fd2e3c4b7fa6b4e27874849f9964480c92d1108b50700bb1851,NG_S0_T12_OK,478b54cb80
+memory,MS0,file,legacy/ntasm-s0/instructions-memory/MS0.ntasm,116,43c7f53d69b0afa5b316440d32998ad3533b7d468e08acf90feb378c7700f541,NG_S0_T12_OK,40884701
+memory,MS1,file,legacy/ntasm-s0/instructions-memory/MS1.ntasm,112,de08e9ab73bf6a8eeb82d185f195e7048d7b0d2d83c3017f465bf70ea70d4d72,NG_S0_T12_OK,6645894500
+memory,MS2,file,legacy/ntasm-s0/instructions-memory/MS2.ntasm,117,462ffce0066c3bd50999a8edf839c62b5636fea0bb1962b6a722395740374c22,NG_S0_T12_OK,4489542408
+memory,MS3,file,legacy/ntasm-s0/instructions-memory/MS3.ntasm,129,04d9bfb8bfa59a2408c399c610c7d99fa0fa0cf57103ba9d042746122442564c,NG_S0_T12_OK,4f89b47c80000000
+memory,MD0,file,legacy/ntasm-s0/instructions-memory/MD0.ntasm,115,c9c9754e8c26726c1f5afb14e2a576e54bc1d163c6e5733a8756b1e50c6fb519,NG_S0_T12_OK,488d437f
+memory,MD1,file,legacy/ntasm-s0/instructions-memory/MD1.ntasm,115,7bacc0cc3e6ce787f2619d6ae8d68036bcefe87c771a9a1c3e2cc6954cac16a9,NG_S0_T12_OK,488d8380000000
+memory,MD2,file,legacy/ntasm-s0/instructions-memory/MD2.ntasm,115,737302aaab643f59869fe2b7d8710db318d716f3210c7290cfa0ee79b064c771,NG_S0_T12_OK,488d4380
+memory,MD3,file,legacy/ntasm-s0/instructions-memory/MD3.ntasm,115,5018c3298954758316d8163ae3edf4ab24f9c2fc5cefd25fa5cd97f20143b912,NG_S0_T12_OK,488d837fffffff
+memory,MD4,file,legacy/ntasm-s0/instructions-memory/MD4.ntasm,122,f13eb7eecdca7bef2dc04152ae9cd8bdb9529489b697d3be169f932b073f6924,NG_S0_T12_OK,488d83ffffff7f
+memory,MD5,file,legacy/ntasm-s0/instructions-memory/MD5.ntasm,122,cd6ecc928f74e1cecd1e008224d3de85635b74b3f7ce36e96bc2862a8d088827,NG_S0_T12_OK,488d8300000080
+memory,MD6,file,legacy/ntasm-s0/instructions-memory/MD6.ntasm,113,0893e32eb9b2d3d710e581ec727f6fec6f9cee259cf3a7abf76a07a6347267b2,NG_S0_T12_OK,488d03
+memory,MD7,file,legacy/ntasm-s0/instructions-memory/MD7.ntasm,125,ee7b5bc320f18d7232e5f600624702eef19d56b70643a3ab3bb974c9c30e3953,NG_S0_T12_OK,488d43f8
+memory,MI0,file,legacy/ntasm-s0/instructions-memory/MI0.ntasm,119,37894df4394e3b442152064fc924ddeeb46a317bcbf190a7a4bb7cea5d376f90,NG_S0_T12_OK,488d0410
+memory,MI1,file,legacy/ntasm-s0/instructions-memory/MI1.ntasm,119,26aa8a23387129d716da0dbc9a5312b30bc0fb541b4d1a57853a66bc8342656e,NG_S0_T12_OK,488d0450
+memory,MI2,file,legacy/ntasm-s0/instructions-memory/MI2.ntasm,119,bac38803740b122eab2ae15a48bd487d7dd6d6cb9631f15c080a38abe87ba800,NG_S0_T12_OK,488d0490
+memory,MI3,file,legacy/ntasm-s0/instructions-memory/MI3.ntasm,119,79dd619c84d2ca577d9e44feb7e5e8bafd37c0b248f97f02edda76ab55f94c6a,NG_S0_T12_OK,488d04d0
+memory,MR0,file,legacy/ntasm-s0/instructions-memory/MR0.ntasm,112,9d5775b535405bb756543cfa703dff3777ada5de43dfeb3dff84e5d3a5e6cf33,NGS0 E402 L0006 C000E O00000049,
+memory,MR1,file,legacy/ntasm-s0/instructions-memory/MR1.ntasm,122,b705f53ff10357252e25e25fbf0917187d68437bd47a49bc3e02c0a429b16d7b,NGS0 E402 L0006 C0014 O0000004F,
+memory,MR2,file,legacy/ntasm-s0/instructions-memory/MR2.ntasm,122,3ca7419027ecc5e26f09b81575fcd5271ae17540eee59686f7fd0d9f723f47ba,NGS0 E402 L0006 C0014 O0000004F,
+memory,MR3,file,legacy/ntasm-s0/instructions-memory/MR3.ntasm,122,08e8ea3c5ab4dc2ba4b26cdfec2d54c6b98a4139a096dfceef77420b9af8351e,NGS0 E402 L0006 C001A O00000055,
+memory,MR4,file,legacy/ntasm-s0/instructions-memory/MR4.ntasm,123,fb32de69cf5cb0adb36ffe66b758409fac541d564ed7032d2744fe60a85fd7af,NGS0 E402 L0006 C001A O00000055,
+memory,MR5,file,legacy/ntasm-s0/instructions-memory/MR5.ntasm,125,53af75dbbf3bf46ed54248eeb59671cfb9513aa5b31ad7a759a42a76fdf7d442,NGS0 E401 L0006 C0014 O0000004F,
+memory,MR6,file,legacy/ntasm-s0/instructions-memory/MR6.ntasm,125,e52428afb61c1211d201027e2381a257b6e1b53fbdb2d4975aa4e74407b08133,NGS0 E401 L0006 C0014 O0000004F,
+memory,MR7,file,legacy/ntasm-s0/instructions-memory/MR7.ntasm,129,4de612d5f8f8ce72c4293298645f90ada32d7117aec6d1c6f8ea1f74c9adab55,NGS0 E401 L0007 C0014 O0000005C,
+memory,MR8,file,legacy/ntasm-s0/instructions-memory/MR8.ntasm,116,3eda17ddc439dff2bdd27ba241a1e867046c5c0457aed3636f2e57becf3741a9,NGS0 E301 L0006 C0014 O0000004F,
+memory,MR9,file,legacy/ntasm-s0/instructions-memory/MR9.ntasm,137,25601c8046731a4b807bd0d550ad907cb4832ada206801211fbea4b621abccb7,NGS0 E401 L0007 C0014 O00000064,
+memory,MR10,file,legacy/ntasm-s0/instructions-memory/MR10.ntasm,121,76b05b130eebc657cb528e57ba7fcc753d5e1791af5995834c0831f0a26933a4,NGS0 E400 L0006 C000E O00000049,
+memory,MR11,file,legacy/ntasm-s0/instructions-memory/MR11.ntasm,112,14db30f83cb3cd9a86555e82705ccedb20970dea1117dfa7760ecfb62b118d0a,NGS0 E400 L0006 C0008 O00000043,
+memory,MR12,file,legacy/ntasm-s0/instructions-memory/MR12.ntasm,112,c76c12b8bdfb7481526b3c5148fe2b925a10ed0e4d6a1b6ce1153024954a301a,NGS0 E400 L0006 C000F O0000004A,
+memory,MR13,file,legacy/ntasm-s0/instructions-memory/MR13.ntasm,110,0a9525d7a599c908cbafa27fb621a20789cb43f4ec87dbd76551cc06b6d7804b,NGS0 E201 L0006 C000D O00000048,
+memory,MR14,file,legacy/ntasm-s0/instructions-memory/MR14.ntasm,111,d516f810267820545acaa2bc940fa2af08e18acd52e8e4a06def204e6818b5f9,NGS0 E201 L0006 C0011 O0000004C,
+memory,MR15,file,legacy/ntasm-s0/instructions-memory/MR15.ntasm,109,7b13507c7a006e26b7bf8e2f2fd5e34329e09a568f5fb360a40507c5b728fc31,NGS0 E402 L0006 C000E O00000049,
+memory,MR16,file,legacy/ntasm-s0/instructions-memory/MR16.ntasm,118,9f32a0327e5d09a594c958225855d8fc7f56a0c694c081229ccd18631481ab9a,NGS0 E201 L0006 C0013 O0000004E,
+memory,MR17,file,legacy/ntasm-s0/instructions-memory/MR17.ntasm,112,2bc823a834545cc44a471278cd6f6d8bf4fb699cbd51b8321e85f80aabb90772,NGS0 E201 L0006 C000F O0000004A,
+memory,MR18,file,legacy/ntasm-s0/instructions-memory/MR18.ntasm,115,35956129b48360a74c4eff0f974d24a5f78fdb611cac4bfd1c7d6df46de87736,NGS0 E201 L0006 C0014 O0000004F,
+memory,MR19,file,legacy/ntasm-s0/instructions-memory/MR19.ntasm,118,5a7c43525b9136b216c03285c82fed1550ad05fd81d0aa88c77e68845c85a969,NGS0 E301 L0006 C0014 O0000004F,
+memory,MR20,file,legacy/ntasm-s0/instructions-memory/MR20.ntasm,121,9ad41faf5c0fce74889e3b23aae843b63447b37626d7a3695450eb2b91056b07,NGS0 E402 L0006 C001A O00000055,
+memory,MR21,file,legacy/ntasm-s0/instructions-memory/MR21.ntasm,117,ef421758329161e39fc7ba5b98617b308e0e5e87251e8eb23d5bd30f4ccceb43,NGS0 E201 L0006 C0014 O0000004F,
+memory,MR22,file,legacy/ntasm-s0/instructions-memory/MR22.ntasm,117,7724f6c1926a2e9f52ab4a411b1727cb90fe7d21ac6a73727bdce2b7d71e3def,NGS0 E102 L0006 C0015 O00000050,
+memory,MR23,file,legacy/ntasm-s0/instructions-memory/MR23.ntasm,101,c605f2f74e4526171a9fb43f959d185e1bbf7ec39b2a29a524b4943b52ee9192,NGS0 E201 L0006 C0007 O00000042,

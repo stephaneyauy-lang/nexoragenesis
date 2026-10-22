@@ -1,0 +1,191 @@
+module diagnostics_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import validate;
+import diagnostics;
+
+// Gate entry for the diagnostics foundation. out[0] carries the command in
+// and the status out; nothing else in out is written unless the command
+// answers 0. A command is one of:
+//   1 collect forward     2 collect reverse     3 boundary scan
+//   4 construct regions   5 validator slice
+// The result layouts are documented beside each command. Every buffer taken
+// from the runtime is released on every path, including the refusal paths.
+
+fn flag(value:bool)->u64 { if (value==true) { return 1; } return 0; }
+
+fn copy_entries(list:diagnostics.List,out:buf<u64>,base:u64)->u64 {
+    let mut i:u64=0;
+    while i<list.count && i<diagnostics.capacity() {
+        let mut field:u64=0;
+        while field<7 {
+            out[base+i*7+field]=diagnostics.at(list,i,field);field=field+1;
+        }
+        i=i+1;
+    }
+    return 0;
+}
+
+// out[1] count, out[2] dropped, out[3] refused as a duplicate identity,
+// out[4] incoherent pairs, out[5] ordered flag, out[6] whole-source parse
+// code, out[7] first entry code, out[8] resume byte offset, out[9] resume
+// kind, out[10] resume keyword id, out[11] probes, out[12] probes refused,
+// out[13] discoveries stashed, out[14] discoveries found, out[15] capacity,
+// then seven words per entry: code, reason, source, line, column, start, end.
+fn command_collect(source:buf<u8>,out:buf<u64>,reverse:bool)->u64 {
+    let list:diagnostics.List=diagnostics.make();
+    let report:buf<u64>=alloc(runtime(),6);
+    let resume:buf<u64>=alloc(runtime(),5);
+    if (len(report)!=6 || len(resume)!=5) {
+        diagnostics.release(list);rt_free(runtime(),resume);
+        rt_free(runtime(),report);return 800;
+    }
+    let code:u64=diagnostics.collect(source,1,list,reverse,report);
+    if (code==800) {
+        diagnostics.release(list);rt_free(runtime(),resume);
+        rt_free(runtime(),report);return 800;
+    }
+    diagnostics.resume_boundary(source,1,resume);
+    out[0]=0;out[1]=list.count;out[2]=list.dropped;out[3]=list.rejected;
+    out[4]=diagnostics.incoherent(list);
+    out[5]=flag(diagnostics.ordered(list));
+    out[6]=report[4];out[7]=diagnostics.at(list,0,0);
+    out[8]=resume[2];out[9]=resume[0];out[10]=resume[3];
+    out[11]=report[0];out[12]=report[1];out[13]=report[2];out[14]=report[3];
+    out[15]=diagnostics.capacity();
+    copy_entries(list,out,16);
+    diagnostics.release(list);
+    rt_free(runtime(),resume);
+    rt_free(runtime(),report);
+    return 0;
+}
+
+// out[1] rows, then four words per row: kind, resume token index, byte
+// offset, keyword id. The scan chains from one boundary to the next and
+// stops as soon as no further boundary advances.
+fn command_scan(source:buf<u8>,out:buf<u64>)->u64 {
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    out[0]=0;out[1]=0;
+    if (tree.ok==false && tree.token_count>0) {
+        let table:buf<u8>=ntasm_parser.keyword_words();
+        let tokens:buf<u64>=tree.token_words;
+        let count:u64=tree.token_count;
+        let row:buf<u64>=alloc(runtime(),5);
+        if (len(row)==5) {
+            let mut rows:u64=0;
+            let mut index:u64=0;
+            let mut previous:u64=0;
+            let mut started:bool=false;
+            while rows<16 {
+                let kind:u64=diagnostics.resync_boundary(source,tokens,count,
+                                                         index,table,row);
+                if (kind==0) { break; }
+                out[2+rows*4]=kind;out[3+rows*4]=row[1];
+                out[4+rows*4]=row[2];out[5+rows*4]=row[3];
+                rows=rows+1;
+                if (started==true && row[1]<=previous) { break; }
+                started=true;
+                previous=row[1];
+                index=row[1];
+                if (kind==2 || kind==3) { index=row[1]+1; }
+            }
+            out[1]=rows;
+        }
+        rt_free(runtime(),row);
+        rt_free(runtime(),table);
+    }
+    ntasm_ast.release(tree);
+    return 0;
+}
+
+// out[1] regions, out[2] the probe head length in bytes, then four words per
+// region: begin offset, end offset, keyword id, head token index.
+fn command_region(source:buf<u8>,out:buf<u64>)->u64 {
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    out[0]=0;out[1]=0;out[2]=0;
+    if (tree.token_count>0) {
+        let table:buf<u8>=ntasm_parser.keyword_words();
+        let tokens:buf<u64>=tree.token_words;
+        let count:u64=tree.token_count;
+        let eof:u64=diagnostics.eof_at(tokens,count);
+        let mut rows:u64=0;
+        let mut ordinal:u64=0;
+        out[2]=diagnostics.probe_header_length();
+        while rows<16 {
+            let head:u64=diagnostics.construct_at(source,tokens,count,ordinal,
+                                                  table);
+            if (head>=count) { break; }
+            let mut next:u64=diagnostics.construct_at(source,tokens,count,
+                                                      ordinal+1,table);
+            if (next>=count) { next=eof; }
+            if (next<=head) { break; }
+            out[3+rows*4]=tokens[head*9+5];
+            out[4+rows*4]=tokens[next*9+5];
+            out[5+rows*4]=diagnostics.construct_keyword(source,tokens,head,table);
+            out[6+rows*4]=head;
+            rows=rows+1;ordinal=ordinal+1;
+        }
+        out[1]=rows;
+        rt_free(runtime(),table);
+    }
+    ntasm_ast.release(tree);
+    return 0;
+}
+
+// out[1] slice first code, out[2] validate.validate code on a second tree,
+// out[3] count, out[4] dropped, out[5] refused, out[6] incoherent pairs,
+// out[7] ordered flag, out[8..11] slice scratch, out[12..15] reference
+// scratch, out[16] capacity, out[17] passes, then seven words per entry.
+fn command_slice(source:buf<u8>,out:buf<u64>)->u64 {
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    let reference:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let list:diagnostics.List=diagnostics.make();
+    if (len(scratch)!=4) {
+        diagnostics.release(list);rt_free(runtime(),scratch);
+        ntasm_ast.release(reference);ntasm_ast.release(tree);return 800;
+    }
+    if (tree.ok==false) {
+        diagnostics.release(list);rt_free(runtime(),scratch);
+        ntasm_ast.release(reference);ntasm_ast.release(tree);return 800;
+    }
+    let slice_scratch:buf<u64>=alloc(runtime(),4);
+    let ref_scratch:buf<u64>=alloc(runtime(),4);
+    if (len(slice_scratch)!=4 || len(ref_scratch)!=4) {
+        diagnostics.release(list);rt_free(runtime(),ref_scratch);
+        rt_free(runtime(),slice_scratch);rt_free(runtime(),scratch);
+        ntasm_ast.release(reference);ntasm_ast.release(tree);return 800;
+    }
+    let slice_code:u64=diagnostics.slice_validate(source,1,tree,slice_scratch,
+                                                   list);
+    let ref_code:u64=validate.validate(source,reference,ref_scratch);
+    out[0]=0;out[1]=slice_code;out[2]=ref_code;out[3]=list.count;
+    out[4]=list.dropped;out[5]=list.rejected;
+    out[6]=diagnostics.incoherent(list);
+    out[7]=flag(diagnostics.ordered(list));
+    out[8]=slice_scratch[0];out[9]=slice_scratch[1];
+    out[10]=slice_scratch[2];out[11]=slice_scratch[3];
+    out[12]=ref_scratch[0];out[13]=ref_scratch[1];
+    out[14]=ref_scratch[2];out[15]=ref_scratch[3];
+    out[16]=diagnostics.capacity();out[17]=diagnostics.slice_passes();
+    copy_entries(list,out,18);
+    diagnostics.release(list);
+    rt_free(runtime(),ref_scratch);
+    rt_free(runtime(),slice_scratch);
+    rt_free(runtime(),scratch);
+    ntasm_ast.release(reference);
+    ntasm_ast.release(tree);
+    return 0;
+}
+
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if (len(out)<diagnostics.minimum_words()) { return 800; }
+    let command:u64=out[0];
+    if (command==1) { return command_collect(source,out,false); }
+    if (command==2) { return command_collect(source,out,true); }
+    if (command==3) { return command_scan(source,out); }
+    if (command==4) { return command_region(source,out); }
+    if (command==5) { return command_slice(source,out); }
+    return 800;
+}

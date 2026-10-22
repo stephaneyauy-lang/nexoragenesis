@@ -1,0 +1,1614 @@
+; Candidate native UEFI loader and ABI2 selftest. No C or external linker.
+; Production entry h_start. Test transport changes ONLY entry to h_test_entry.
+; NVRUNTIME.EFI exposes NVRH0001; NOVACORE.EFI entry is Nova ABI2/no flat args.
+format pe64
+abi efi_x64
+entry h_start
+section .text rx
+h_test_entry:
+lea rax, [rip + h_state]
+mov r9, 1
+store64 [rax + 96], r9
+jmp h_start
+
+h_start:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+lea rbx, [rip + h_state]
+store64 [rbx], rcx
+store64 [rbx + 8], rdx
+cmp rdx, 0
+je h_start_fail
+load64 r13, [rdx + 96]
+cmp r13, 0
+je h_start_fail
+store64 [rbx + 16], r13
+; Disable the firmware watchdog before any long step: UEFI 2.10 sec 7.5.1
+; SetWatchdogTimer(Timeout=0) stops it. Platform watchdog only; the host
+; RAM/time guards are unchanged.
+load64 rax, [r13 + 256]
+cmp rax, 0
+je h_start_fail
+mov rcx, 0
+mov rdx, 0
+mov r8, 0
+mov r9, 0
+call rax
+cmp rax, 0
+jne h_start_fail
+lea rcx, [rip + h_serial_guid]
+mov rdx, 0
+lea r8, [rbx + 32]
+load64 rax, [r13 + 320]
+call rax
+cmp rax, 0
+jne h_start_fail
+load64 rax, [rbx + 32]
+cmp rax, 0
+je h_start_fail
+load64 rcx, [rbx]
+lea rdx, [rip + h_loaded_guid]
+lea r8, [rsp + 32]
+load64 rax, [r13 + 152]
+call rax
+cmp rax, 0
+jne h_start_fail
+load64 rax, [rsp + 32]
+cmp rax, 0
+je h_start_fail
+load64 rcx, [rax + 24]
+lea rdx, [rip + h_fs_guid]
+lea r8, [rsp + 32]
+load64 rax, [r13 + 152]
+call rax
+cmp rax, 0
+jne h_start_fail
+load64 rcx, [rsp + 32]
+cmp rcx, 0
+je h_start_fail
+lea rdx, [rbx + 24]
+load64 rax, [rcx + 8]
+call rax
+cmp rax, 0
+jne h_start_fail
+load64 rax, [rbx + 24]
+cmp rax, 0
+je h_start_fail
+lea rcx, [rip + h_runtime_path]
+mov rdx, 1048576
+call h_load
+cmp rax, 0
+je h_start_fail
+store64 [rbx + 40], rdx
+mov r15, rax
+load64 rcx, [rbx + 16]
+load64 rdx, [rbx + 24]
+load64 r8, [rbx + 32]
+mov r9, 0
+call r15
+cmp rax, 0
+je h_start_fail
+mov r14, rax
+mov rdx, 0x313030304852564e
+load64 rax, [r14]
+cmp rax, rdx
+jne h_start_fail
+load64 rax, [r14 + 8]
+cmp rax, 1
+jne h_start_fail
+load64 rax, [r14 + 16]
+cmp rax, 64
+jne h_start_fail
+store64 [rbx + 72], r14
+load64 r12, [r14 + 24]
+cmp r12, 0
+je h_start_fail
+store64 [rbx + 80], r12
+load64 rax, [rbx + 96]
+cmp rax, 0
+je h_start_core
+mov rcx, r12
+mov rdx, r14
+call h_selftest
+cmp rax, 0
+jne h_start_testbad
+jmp h_start_cleanup
+h_start_core:
+lea rcx, [rip + h_core_path]
+mov rdx, 67108864
+call h_load
+cmp rax, 0
+je h_start_fail
+store64 [rbx + 56], rdx
+mov rcx, r12
+mov rdx, 0
+mov r8, 0
+call rax
+store64 [rbx + 104], rax
+load64 rdx, [r12 + 16]
+store64 [rbx + 112], rdx
+cmp rax, 0
+jne h_start_corebad
+cmp rdx, 0
+jne h_start_corebad
+jmp h_start_cleanup
+h_start_corebad:
+mov rax, 3
+jmp h_start_setbad
+h_start_testbad:
+store64 [rbx + 104], rax
+load64 rdx, [r12 + 16]
+store64 [rbx + 112], rdx
+mov rax, 2
+jmp h_start_setbad
+h_start_fail:
+mov rax, 1
+h_start_setbad:
+store64 [rbx + 88], rax
+h_start_cleanup:
+load64 r14, [rbx + 72]
+cmp r14, 0
+je h_start_unload
+load64 rcx, [rbx + 80]
+load64 rax, [r14 + 32]
+call rax
+cmp rax, 1
+je h_start_unload
+mov rcx, 4
+call h_bad
+h_start_unload:
+load64 rcx, [rbx + 56]
+cmp rcx, 0
+je h_start_unload_rt
+load64 rax, [rbx + 16]
+load64 rax, [rax + 216]
+call rax
+call h_cleanup_status
+h_start_unload_rt:
+load64 rcx, [rbx + 40]
+cmp rcx, 0
+je h_start_close
+load64 rax, [rbx + 16]
+load64 rax, [rax + 216]
+call rax
+call h_cleanup_status
+h_start_close:
+load64 rcx, [rbx + 24]
+cmp rcx, 0
+je h_start_report
+load64 rax, [rcx + 16]
+call rax
+call h_cleanup_status
+h_start_report:
+load64 rax, [rbx + 88]
+cmp rax, 0
+jne h_start_badlog
+load64 rax, [rbx + 96]
+cmp rax, 0
+je h_start_okcore
+lea rcx, [rip + h_test_ok]
+mov rdx, 23
+call h_log
+load64 rcx, [rbx + 136]
+call h_hex
+jmp h_start_status
+h_start_okcore:
+lea rcx, [rip + h_run_ok]
+mov rdx, 22
+call h_log
+jmp h_start_status
+h_start_badlog:
+lea rcx, [rip + h_run_bad]
+mov rdx, 19
+call h_log
+load64 rcx, [rbx + 88]
+call h_hex
+load64 rcx, [rbx + 104]
+call h_hex
+load64 rcx, [rbx + 112]
+call h_hex
+h_start_status:
+load64 rax, [rbx + 88]
+cmp rax, 0
+je h_start_ret
+mov rax, 0x8000000000000015
+jmp h_start_ret
+h_start_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+h_bad:
+lea rdx, [rip + h_state]
+load64 rax, [rdx + 88]
+cmp rax, 0
+jne h_bad_done
+store64 [rdx + 88], rcx
+h_bad_done:
+ret
+h_cleanup_status:
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jb h_cleanup_ok
+mov rcx, 4
+jmp h_bad
+h_cleanup_ok:
+ret
+
+h_log:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+; Raw serial bytes; any short write is failure, never a success marker.
+mov r12, rcx
+mov r13, rdx
+lea rbx, [rip + h_state]
+load64 rcx, [rbx + 32]
+cmp rcx, 0
+je h_log_bad
+store64 [rsp + 32], r13
+lea rdx, [rsp + 32]
+mov r8, r12
+load64 rax, [rcx + 40]
+call rax
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jae h_log_bad
+load64 rax, [rsp + 32]
+cmp rax, r13
+jne h_log_bad
+jmp h_log_ret
+h_log_bad:
+mov rcx, 5
+call h_bad
+jmp h_log_ret
+h_log_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+h_hex:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 72
+mov r12, rcx
+lea rdi, [rsp + 32]
+lea rsi, [rip + h_digits]
+mov r13, 16
+nv_hhex_loop:
+mov rax, r12
+shr rax, 60
+load8 rax, [rsi + rax * 1]
+store8 [rdi], rax
+add rdi, 1
+shl r12, 4
+sub r13, 1
+jne nv_hhex_loop
+mov rax, 13
+store8 [rdi], rax
+mov rax, 10
+store8 [rdi + 1], rax
+lea rcx, [rsp + 32]
+mov rdx, 18
+call h_log
+jmp h_hex_ret
+h_hex_ret:
+add rsp, 72
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+h_load:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 88
+; RCX=CHAR16 path,RDX=max bytes -> RAX=entry,RDX=loaded child.
+; No StartImage: all loaded images remain owned until explicit UnloadImage.
+mov r12, rcx
+mov r13, rdx
+lea rbx, [rip + h_state]
+mov rax, 0
+store64 [rsp + 48], rax
+store64 [rsp + 56], rax
+store64 [rsp + 72], rax
+mov rdi, 0
+mov rbp, 0
+load64 rcx, [rbx + 24]
+lea rdx, [rsp + 48]
+mov r8, r12
+mov r9, 1
+store64 [rsp + 32], rax
+load64 rax, [rcx + 8]
+call rax
+mov rdx, 0x8000000000000000
+cmp rax, rdx
+jae h_load_done
+load64 rdi, [rsp + 48]
+cmp rdi, 0
+je h_load_done
+mov rcx, rdi
+mov rdx, -1
+load64 rax, [rdi + 56]
+call rax
+cmp rax, 0
+jne h_load_done
+mov rcx, rdi
+lea rdx, [rsp + 64]
+load64 rax, [rdi + 48]
+call rax
+cmp rax, 0
+jne h_load_done
+load64 r14, [rsp + 64]
+cmp r14, 0
+je h_load_done
+cmp r13, r14
+jb h_load_done
+mov rcx, 2
+mov rdx, r14
+lea r8, [rsp + 72]
+load64 rax, [rbx + 16]
+load64 rax, [rax + 64]
+call rax
+cmp rax, 0
+jne h_load_done
+load64 rbp, [rsp + 72]
+cmp rbp, 0
+je h_load_done
+mov rcx, rdi
+mov rdx, 0
+load64 rax, [rdi + 56]
+call rax
+cmp rax, 0
+jne h_load_done
+mov rcx, rdi
+lea rdx, [rsp + 64]
+mov r8, rbp
+load64 rax, [rdi + 32]
+call rax
+cmp rax, 0
+jne h_load_done
+load64 rax, [rsp + 64]
+cmp rax, r14
+jne h_load_done
+mov rcx, rdi
+load64 rax, [rdi + 16]
+mov rdi, 0
+call rax
+cmp rax, 0
+jne h_load_done
+mov rcx, 0
+load64 rdx, [rbx]
+mov r8, 0
+mov r9, rbp
+store64 [rsp + 32], r14
+lea rax, [rsp + 56]
+store64 [rsp + 40], rax
+load64 rax, [rbx + 16]
+load64 rax, [rax + 200]
+call rax
+cmp rax, 0
+jne h_load_done
+load64 rcx, [rsp + 56]
+cmp rcx, 0
+je h_load_done
+lea rdx, [rip + h_loaded_guid]
+lea r8, [rsp + 48]
+load64 rax, [rbx + 16]
+load64 rax, [rax + 152]
+call rax
+cmp rax, 0
+jne h_load_done
+load64 rax, [rsp + 48]
+cmp rax, 0
+je h_load_done
+load64 r12, [rax + 64]
+load64 r13, [rax + 72]
+cmp r12, 0
+je h_load_done
+cmp r13, 64
+jb h_load_done
+cmp r13, 67108865
+jae h_load_done
+load16 rax, [r12]
+cmp rax, 23117
+jne h_load_done
+load32 rax, [r12 + 60]
+cmp rax, 64
+jb h_load_done
+mov rdx, rax
+add rdx, 88
+cmp r13, rdx
+jb h_load_done
+lea r15, [r12 + rax * 1]
+load32 rax, [r15]
+cmp rax, 17744
+jne h_load_done
+load16 rax, [r15 + 4]
+cmp rax, 34404
+jne h_load_done
+load16 rax, [r15 + 24]
+cmp rax, 523
+jne h_load_done
+load32 rax, [r15 + 40]
+cmp rax, 0
+je h_load_done
+cmp r13, rax
+jae h_load_entry
+jmp h_load_done
+h_load_entry:
+cmp rax, r13
+jae h_load_done
+add rax, r12
+mov rsi, rax
+jmp h_load_cleanup
+h_load_done:
+mov rsi, 0
+h_load_cleanup:
+cmp rdi, 0
+je h_load_free
+mov rcx, rdi
+load64 rax, [rdi + 16]
+call rax
+cmp rax, 0
+je h_load_free
+mov rcx, 4
+call h_bad
+mov rsi, 0
+h_load_free:
+cmp rbp, 0
+je h_load_child
+mov rcx, rbp
+load64 rax, [rbx + 16]
+load64 rax, [rax + 72]
+call rax
+cmp rax, 0
+je h_load_child
+mov rcx, 4
+call h_bad
+mov rsi, 0
+h_load_child:
+cmp rsi, 0
+jne h_load_return
+load64 rcx, [rsp + 56]
+cmp rcx, 0
+je h_load_return
+load64 rax, [rbx + 16]
+load64 rax, [rax + 216]
+call rax
+call h_cleanup_status
+mov rax, 0
+store64 [rsp + 56], rax
+h_load_return:
+mov rax, rsi
+load64 rdx, [rsp + 56]
+jmp h_load_ret
+h_load_ret:
+add rsp, 88
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+t_call:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 56
+; RCX ignored;R12 ctx remains private to selftest. RAX=callback offset.
+load64 r11, [r12 + 40]
+add r11, rax
+load64 r11, [r11]
+mov rcx, r12
+call r11
+jmp t_call_ret
+t_call_ret:
+add rsp, 56
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+t_eq:
+lea r10, [rip + h_state]
+load64 r11, [r10 + 136]
+add r11, 1
+store64 [r10 + 136], r11
+cmp rax, rdx
+je t_eq_done
+load64 r11, [r10 + 120]
+cmp r11, 0
+jne t_eq_done
+store64 [r10 + 120], rdi
+t_eq_done:
+ret
+
+h_selftest:
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+sub rsp, 88
+mov r12, rcx
+mov r14, rdx
+lea r15, [rip + t_values]
+load64 r13, [r12 + 40]
+load64 rax, [r12]
+mov rdi, 1
+mov rdx, 2
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 8]
+mov rdi, 2
+mov rdx, 48
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r13]
+mov rdi, 3
+mov rdx, 2
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r13 + 8]
+mov rdi, 4
+mov rdx, 128
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rdx, 0
+mov r8, 0
+mov r9, 0
+mov rax, 16
+call t_call
+store64 [r15 + 0], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_5
+mov rax, 1
+t_nz_5:
+mov rdi, 5
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 0]
+mov rax, 96
+call t_call
+mov rdi, 6
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rdx, 16
+mov r8, 0
+mov r9, 0
+mov rax, 16
+call t_call
+store64 [r15 + 8], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_7
+mov rax, 1
+t_nz_7:
+mov rdi, 7
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 8]
+mov r8, 0
+mov r9, 0x8000000000000010
+mov rax, 80
+call t_call
+store64 [r15 + 16], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_8
+mov rax, 1
+t_nz_8:
+mov rdi, 8
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rbx, [r15 + 16]
+load64 rax, [rbx]
+mov rdi, 9
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [rbx + 8]
+mov rdi, 10
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rsi, 0
+t_fill:
+store8 [rbx + rsi * 1], rsi
+add rsi, 1
+cmp rsi, 16
+jb t_fill
+load64 rdx, [r15 + 8]
+mov r8, 2
+mov r9, 6
+mov rax, 88
+call t_call
+store64 [r15 + 24], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_11
+mov rax, 1
+t_nz_11:
+mov rdi, 11
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 r8, [r15 + 8]
+load64 rdx, [r15 + 24]
+mov r9, 6
+mov rax, 120
+call t_call
+mov rdi, 12
+mov rdx, 6
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [rbx]
+mov rdi, 13
+mov rdx, 0x0504030201000100
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 8]
+mov r8, 0
+mov r9, 6
+mov rax, 88
+call t_call
+store64 [r15 + 32], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_14
+mov rax, 1
+t_nz_14:
+mov rdi, 14
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 r8, [r15 + 24]
+load64 rdx, [r15 + 32]
+mov r9, 6
+mov rax, 120
+call t_call
+mov rdi, 15
+mov rdx, 6
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [rbx]
+mov rdi, 16
+mov rdx, 0x0504050403020100
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 8]
+mov r8, 15
+mov r9, 2
+mov rax, 80
+call t_call
+mov rdi, 17
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 18
+mov rdx, 4
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rdx, [r15 + 8]
+mov r8, 17
+mov r9, 0
+mov rax, 24
+call t_call
+mov rdi, 19
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 20
+mov rdx, 4
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rdx, [r15 + 8]
+mov r8, 17
+mov r9, 0
+mov rax, 88
+call t_call
+mov rdi, 21
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 22
+mov rdx, 4
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+lea rdx, [rip + t_literal]
+mov r8, 6
+mov r9, 0
+mov rax, 104
+call t_call
+store64 [r15 + 40], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_23
+mov rax, 1
+t_nz_23:
+mov rdi, 23
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 40]
+mov r8, 0
+mov r9, 0x8000000000000001
+mov rax, 80
+call t_call
+mov rdi, 24
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 25
+mov rdx, 9
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+mov rcx, r12
+lea rdx, [rip + t_borrowed]
+mov r8, 8
+mov r9, 1
+load64 rax, [r14 + 48]
+call rax
+store64 [r15 + 48], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_26
+mov rax, 1
+t_nz_26:
+mov rdi, 26
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 48]
+mov r8, 8
+mov rax, 24
+call t_call
+mov rdi, 27
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+lea rax, [rip + t_borrowed]
+load64 rax, [rax]
+mov rdi, 28
+mov rdx, 0x7766554433221100
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 48]
+mov r8, 0
+mov r9, 1
+mov rax, 80
+call t_call
+mov rdi, 29
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 30
+mov rdx, 7
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rdx, [r15 + 8]
+mov r8, 16
+mov rax, 24
+call t_call
+mov rdi, 31
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 24]
+mov rax, 96
+call t_call
+mov rdi, 32
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 33
+mov rdx, 7
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+mov rdx, 0
+mov r8, 0
+mov r9, 1
+mov rax, 80
+call t_call
+mov rdi, 34
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 35
+mov rdx, 7
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+mov rdx, 67108865
+mov r8, 0
+mov r9, 0
+mov rax, 16
+call t_call
+mov rdi, 36
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 37
+mov rdx, 4
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+mov rdx, 0
+mov r8, 0
+mov r9, 1
+mov rax, 80
+call t_call
+mov rdi, 38
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rdx, 67108865
+mov r8, 0
+mov r9, 0
+mov rax, 16
+call t_call
+mov rdi, 39
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 40
+mov rdx, 7
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rbx, [r14 + 40]
+load64 rax, [rbx + 24]
+store64 [rsp + 32], rax
+load64 rax, [rbx + 48]
+store64 [rsp + 40], rax
+mov rax, 0xffffffff
+store64 [rbx + 24], rax
+mov rdx, 0
+mov r8, 0
+mov r9, 0
+mov rax, 16
+call t_call
+mov rdi, 41
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 42
+mov rdx, 13
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rax, [rbx + 48]
+load64 rdx, [rsp + 40]
+mov rdi, 43
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [rsp + 32]
+store64 [rbx + 24], rax
+mov rcx, r12
+lea rdx, [rip + t_path]
+mov r8, 11
+mov r9, 0
+load64 rax, [r14 + 48]
+call rax
+store64 [r15 + 56], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_44
+mov rax, 1
+t_nz_44:
+mov rdi, 44
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 56]
+mov r8, 11
+mov rax, 40
+call t_call
+store64 [r15 + 64], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_45
+mov rax, 1
+t_nz_45:
+mov rdi, 45
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+lea rdx, [rip + t_output]
+mov r8, 16
+mov r9, 0
+load64 rax, [r14 + 48]
+call rax
+store64 [r15 + 72], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_46
+mov rax, 1
+t_nz_46:
+mov rdi, 46
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 64]
+load64 r8, [r15 + 72]
+mov r9, 16
+mov rax, 56
+call t_call
+mov rdi, 47
+mov rdx, 16
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 64]
+mov rax, 64
+call t_call
+mov rdi, 48
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 56]
+mov r8, 11
+mov rax, 40
+call t_call
+mov rdi, 49
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 50
+mov rdx, 8
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rdx, [r15 + 56]
+mov r8, 11
+mov rax, 32
+call t_call
+store64 [r15 + 64], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_51
+mov rax, 1
+t_nz_51:
+mov rdi, 51
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rdx, 16
+mov r8, 0
+mov r9, 0
+mov rax, 16
+call t_call
+store64 [r15 + 80], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_52
+mov rax, 1
+t_nz_52:
+mov rdi, 52
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 64]
+load64 r8, [r15 + 80]
+mov r9, 16
+mov rax, 48
+call t_call
+mov rdi, 53
+mov rdx, 16
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 80]
+mov r8, 0
+mov r9, 16
+mov rax, 80
+call t_call
+store64 [r15 + 88], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_54
+mov rax, 1
+t_nz_54:
+mov rdi, 54
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r15 + 88]
+load64 rax, [rax]
+mov rdi, 55
+mov rdx, 0x3736353433323130
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r15 + 88]
+load64 rax, [rax + 8]
+mov rdi, 56
+mov rdx, 0x6665646362613938
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 64]
+load64 r8, [r15 + 40]
+mov r9, 6
+mov rax, 48
+call t_call
+mov rdi, 57
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 58
+mov rdx, 9
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rdx, [r15 + 64]
+mov rax, 64
+call t_call
+mov rdi, 59
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 64]
+mov rax, 64
+call t_call
+mov rdi, 60
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 61
+mov rdx, 7
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rdx, [r15 + 56]
+mov r8, 4097
+mov rax, 32
+call t_call
+mov rdi, 62
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 63
+mov rdx, 10
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+mov rcx, r12
+lea rdx, [rip + t_diag]
+mov r8, 16
+mov r9, 0
+load64 rax, [r14 + 48]
+call rax
+store64 [r15 + 96], rax
+cmp rax, 0
+mov rax, 0
+je t_nz_64
+mov rax, 1
+t_nz_64:
+mov rdi, 64
+mov rdx, 1
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 96]
+mov r8, 16
+mov rax, 72
+call t_call
+mov rdi, 65
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 66
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+load64 rdx, [r15 + 0]
+mov r8, 0
+mov rax, 24
+call t_call
+mov rdi, 67
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 24]
+mov r8, 6
+mov rax, 24
+call t_call
+mov rdi, 68
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 32]
+mov r8, 6
+mov rax, 24
+call t_call
+mov rdi, 69
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 40]
+mov r8, 6
+mov rax, 24
+call t_call
+mov rdi, 70
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 56]
+mov r8, 11
+mov rax, 24
+call t_call
+mov rdi, 71
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 72]
+mov r8, 16
+mov rax, 24
+call t_call
+mov rdi, 72
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 80]
+mov r8, 16
+mov rax, 24
+call t_call
+mov rdi, 73
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rdx, [r15 + 96]
+mov r8, 16
+mov rax, 24
+call t_call
+mov rdi, 74
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rsi, 0
+t_table_fill:
+mov rcx, r12
+mov rdx, 0
+mov r8, 0
+mov r9, 0
+load64 rax, [r14 + 48]
+call rax
+cmp rax, 0
+je t_table_fail
+add rsi, 1
+cmp rsi, 65536
+jb t_table_fill
+mov rax, rsi
+mov rdi, 75
+mov rdx, 65536
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+mov rdx, 0
+mov r8, 0
+mov r9, 0
+load64 rax, [r14 + 48]
+call rax
+mov rdi, 76
+mov rdx, 0
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+load64 rax, [r12 + 16]
+mov rdi, 77
+mov rdx, 13
+call t_eq
+lea r10, [rip + h_state]
+load64 rax, [r10 + 120]
+cmp rax, 0
+jne h_selftest_fail
+mov rcx, r12
+load64 rax, [r14 + 56]
+call rax
+mov rax, 0
+jmp h_selftest_ret
+t_table_fail:
+mov rax, 900
+jmp h_selftest_ret
+h_selftest_fail:
+lea rax, [rip + h_state]
+load64 rax, [rax + 120]
+jmp h_selftest_ret
+h_selftest_ret:
+add rsp, 88
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+ret
+
+section .rdata r
+h_anchor:
+qword addr(h_start)
+h_loaded_guid:
+dword 0x5b1b31a1
+word 0x9562, 0x11d2
+byte 0x8e, 0x3f, 0, 0xa0, 0xc9, 0x69, 0x72, 0x3b
+h_fs_guid:
+dword 0x964e5b22
+word 0x6459, 0x11d2
+byte 0x8e, 0x39, 0, 0xa0, 0xc9, 0x69, 0x72, 0x3b
+h_serial_guid:
+dword 0xbb25cf6f
+word 0xf1d4, 0x11d2
+byte 0x9a, 0x0c, 0, 0x90, 0x27, 0x3f, 0xc1, 0xfd
+h_runtime_path:
+utf16z "NVRUNTIME.EFI"
+h_core_path:
+utf16z "NOVACORE.EFI"
+h_digits:
+ascii "0123456789abcdef"
+h_test_ok:
+ascii "NG_NV2_NATIVE_TEST_OK\r\n"
+h_run_ok:
+ascii "NG_NV2_NATIVE_RUN_OK\r\n"
+h_run_bad:
+ascii "NG_NV2_NATIVE_BAD\r\n"
+t_literal:
+ascii "abcdef"
+t_path:
+ascii "NVROUND.BIN"
+t_output:
+ascii "0123456789abcdef"
+t_diag:
+ascii "NG_NV2_DIAG_OK\r\n"
+section .data rw
+h_state:
+zero 160
+t_values:
+zero 128
+t_borrowed:
+qword 0x7766554433221100
+

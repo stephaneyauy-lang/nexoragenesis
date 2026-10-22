@@ -1,0 +1,15 @@
+module clobber.fsbase
+target x86_64-nexora-uefi
+section .text {
+fn leaf()->u64
+effects {}
+clobbers {fsbase} {
+return 42
+}
+export fn main()->u64
+effects {}
+clobbers {rax,fsbase} {
+let answer:u64 = leaf();
+return answer
+}
+}

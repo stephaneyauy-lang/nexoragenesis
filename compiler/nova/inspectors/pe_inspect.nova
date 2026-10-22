@@ -1,0 +1,321 @@
+module ntasm_pe_inspect;
+// Read-only validator and transactional summary for the deterministic PE32+
+// UEFI images emitted by ntasm_pe.emit. The image is never mutated and the
+// caller's output buffer is written only after every check has passed, so a
+// rejected image leaves all summary words untouched.
+//
+// Summary word order (summary_words() == 16), matching the writer profile:
+//   0 machine   1 subsystem  2 image base  3 entry RVA
+//   4 SizeOfImage   5 SizeOfHeaders
+//   6 .text virtual   7 .rdata virtual   8 .data virtual   9 .reloc virtual
+//  10 .text raw     11 .rdata raw      12 .data raw      13 .reloc raw
+//  14 base relocation directory RVA     15 base relocation directory size
+//
+// Stable error codes. 820 is the only caller-side fault; 821..844 are
+// malformed-image rejections reported in check order.
+//   820 ERR_SHORT_OUTPUT       fewer than summary_words() output words
+//   821 ERR_TRUNCATED_DOS      input shorter than the 64-byte DOS header
+//   822 ERR_NOT_DOS            missing MZ magic
+//   823 ERR_BAD_LFANEW         e_lfanew below the DOS header
+//   824 ERR_TRUNCATED_HEADERS  header table is not inside the file
+//   825 ERR_BAD_PE_SIGNATURE   missing PE signature
+//   826 ERR_BAD_MACHINE        machine is not AMD64
+//   827 ERR_BAD_SECTION_COUNT  section count is not four
+//   828 ERR_BAD_OPTIONAL_SIZE  optional header size is not 240
+//   829 ERR_BAD_CHARACTERISTICS COFF or Dll characteristics mismatch
+//   830 ERR_BAD_MAGIC          optional header is not PE32+
+//   831 ERR_BAD_SUBSYSTEM      subsystem is not an EFI application
+//   832 ERR_BAD_IMAGE_BASE     image base mismatch
+//   833 ERR_BAD_ALIGNMENT      section or file alignment mismatch
+//   834 ERR_BAD_SECTION_NAME   canonical ordered section names missing
+//   835 ERR_BAD_SECTION_FLAGS  section characteristics mismatch
+//   836 ERR_BAD_VIRTUAL_SPAN   virtual span shape is wrong, or the section
+//                              does not continue the previous one in memory
+//   837 ERR_BAD_RAW_LAYOUT     raw size or raw pointer alignment is wrong, or
+//                              the section does not continue the previous one
+//                              in the file
+//   838 ERR_RAW_OUT_OF_FILE    raw span leaves the file or the header area
+//   839 ERR_SPAN_OVERLAP       raw or virtual spans overlap or are unordered
+//   840 ERR_BAD_IMAGE_SIZE     image/header/code/data size fields disagree
+//   841 ERR_BAD_ENTRY          entry RVA is outside .text
+//   842 ERR_BAD_RELOC_DIR      base relocation directory is inconsistent
+//   843 ERR_BAD_RESERVED       reserved, zero or writer-fixed field differs
+//   844 ERR_FILE_LENGTH        file length differs from the last raw span
+// REACHABILITY OF THE CONTINUITY CLAUSES (the two `next_rva` / `next_raw`
+// dead code, and they are not reachable either, and those are different
+// statements. ntasm_pe.emit cannot produce an image they refuse: pe.nova:96-98
+// derives every rva as align(previous_rva+previous_size,4096) and pe.nova:119-120
+// derives every raw pointer the same way with 512, and the two chains threaded
+// below run over exactly those expressions from exactly those two seeds. The
+// chains are equal by construction, and align(x,a) >= x, so a gap cannot be
+// introduced without first being written into the writer. A sweep of 3822
+// writer input combinations yielded 1112 emitted images, every one accepted by
+// this validator and by the loader alike; the sweep only confirms the algebra,
+// the algebra is the reason.
+//
+// The clauses are shown to be able to fire by recompiling pe.nova in memory
+// with one expression replaced by a broken one and running this validator over
+// the mutant writer's real output, which is
+// compiler/c/nova/tests_ntasm_pe_inspect.c. It measures three
+// defect classes -- a page of virtual padding, a file gap, a dropped 512-byte
+// alignment -- and attributes them: the first two to the continuity clauses,
+// the third to the raw size and alignment test on `rawsize`. Those cases are a
+// REACHABILITY PROBE. The images they inspect do not exist. A red there means
+// this validator lost the ability to see a defect class, and it is not
+// evidence about any defect ntasm_pe.emit can actually commit.
+import ntasm_pe;
+
+// COFF header 24 bytes, PE32+ optional header 240 bytes and four 40-byte
+// section headers. Every header read below stays inside this checked span.
+fn head()->u64 { return 424; }
+export fn summary_words()->u64 { return 16; }
+fn r16(image:buf<u8>,at:u64)->u64 { return ntasm_pe.read16(image,at); }
+fn r32(image:buf<u8>,at:u64)->u64 { return ntasm_pe.read32(image,at); }
+fn r64(image:buf<u8>,at:u64)->u64 { return ntasm_pe.read64(image,at); }
+fn al(value:u64,amount:u64)->u64 { return ntasm_pe.align(value,amount); }
+fn inside(at:u64,size:u64,bound:u64)->bool { return at<=bound && size<=bound-at; }
+fn zeros(image:buf<u8>,at:u64,size:u64)->bool {
+    let mut i:u64=0;while i<(size){if image[at+i]!=0{return false;}i=i+1;}return true;
+}
+// The eight name bytes read little endian, so a missing NUL pad also fails.
+fn name_word(index:u64)->u64 {
+    if index==0{return 0x000000747865742e;}
+    if index==1{return 0x0061746164722e;}
+    if index==2{return 0x000000617461642e;}
+    return 0x00636f6c65722e;
+}
+fn section_flags(index:u64)->u64 {
+    if index==0{return 0x60000020;}
+    if index==1{return 0x40000040;}
+    if index==2{return 0xc0000040;}
+    return 0x42000040;
+}
+// A relocation page must fall inside the page-aligned image of some section.
+// This is the page-level test and it is WEAKER than the loader's, which is why
+// site_mapped exists beside it. It is kept because it also rejects a page that
+// belongs to no section at all, and site_mapped cannot be asked that question
+// for a page that carries no entries.
+fn page_mapped(image:buf<u8>,table:u64,page:u64)->bool {
+    let mut i:u64=0;
+    while i<4 {
+        let base:u64=table+i*40;
+        let vsize:u64=r32(image,base+8);
+        let rva:u64=r32(image,base+12);
+        if page>=rva && page+4096<=rva+al(vsize,4096){return true;}
+        i=i+1;
+    }
+    return false;
+}
+
+// A relocation SITE, not a page, has to fit the section's EXACT virtual span.
+// The loader places an 8-byte DIR64 site with `within(rva - s->va, 8, s->vs)`
+// and the same test against the raw size (pe.c:29), so a section whose
+// VirtualSize stops short of its own last mapped page satisfies a page-only
+// test and is still refused by the loader. That is measured, not reasoned: 42
+// images in which this validator returned 0 and nt_pe_inspect refused with
+// "invalid DIR64 relocation site", every one of them a section whose
+// VirtualSize had been cut to 1, 2 or 4 underneath its own relocation site --
+// small enough that eight bytes no longer fit, large enough that
+// align(vsize,512) is still the section's raw size and align(va+vsize,4096) is
+// still the next section's rva, so every other clause here passed.
+fn site_mapped(image:buf<u8>,table:u64,site:u64)->bool {
+    let mut i:u64=0;
+    while i<4 {
+        let base:u64=table+i*40;
+        let vsize:u64=r32(image,base+8);
+        let rva:u64=r32(image,base+12);
+        let rawsize:u64=r32(image,base+16);
+        if site>=rva && inside(site-rva,8,vsize) && inside(site-rva,8,rawsize) {return true;}
+        i=i+1;
+    }
+    return false;
+}
+
+// ---- the codes, named ------------------------------------------------------
+// One zero-argument function per code, and every `return NNN;` below is a CALL
+// to one of them rather than the literal. That is the form ir_image.nova uses
+// for its own codes (the E_INPUT() beside its E_DOMAIN(), E_COUNT(), E_SIZE()
+// siblings) and the form machine_ir.nova uses for the 930..948 block, so this
+// module joins an existing convention instead of opening a second one.
+//
+// Why here and not in the C enum alone: the enum at
+// tests/c/nova/tests_ntasm_pe_inspect.c:28-51 already carries
+// these twenty-five names, so a reader of the harness saw ERR_BAD_RELOC_DIR
+// where a reader of the module saw 842. Two vocabularies for one table, and
+// only the C one was spelled out. No name below is invented: each is the name
+// this module's OWN header comment already published in the 820..844 table
+// above, so the definitions here and that comment are two spellings of one
+// list, and a disagreement between them is a defect in either.
+export fn E_SHORT_OUTPUT()->u64 { return 820; }
+export fn E_TRUNCATED_DOS()->u64 { return 821; }
+export fn E_NOT_DOS()->u64 { return 822; }
+export fn E_BAD_LFANEW()->u64 { return 823; }
+export fn E_TRUNCATED_HEADERS()->u64 { return 824; }
+export fn E_BAD_PE_SIGNATURE()->u64 { return 825; }
+export fn E_BAD_MACHINE()->u64 { return 826; }
+export fn E_BAD_SECTION_COUNT()->u64 { return 827; }
+export fn E_BAD_OPTIONAL_SIZE()->u64 { return 828; }
+export fn E_BAD_CHARACTERISTICS()->u64 { return 829; }
+export fn E_BAD_MAGIC()->u64 { return 830; }
+export fn E_BAD_SUBSYSTEM()->u64 { return 831; }
+export fn E_BAD_IMAGE_BASE()->u64 { return 832; }
+export fn E_BAD_ALIGNMENT()->u64 { return 833; }
+export fn E_BAD_SECTION_NAME()->u64 { return 834; }
+export fn E_BAD_SECTION_FLAGS()->u64 { return 835; }
+export fn E_BAD_VIRTUAL_SPAN()->u64 { return 836; }
+export fn E_BAD_RAW_LAYOUT()->u64 { return 837; }
+export fn E_RAW_OUT_OF_FILE()->u64 { return 838; }
+export fn E_SPAN_OVERLAP()->u64 { return 839; }
+export fn E_BAD_IMAGE_SIZE()->u64 { return 840; }
+export fn E_BAD_ENTRY()->u64 { return 841; }
+export fn E_BAD_RELOC_DIR()->u64 { return 842; }
+export fn E_BAD_RESERVED()->u64 { return 843; }
+export fn E_FILE_LENGTH()->u64 { return 844; }
+export fn inspect(image:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<(16) { return E_SHORT_OUTPUT(); }
+    if len(image)<(64) { return E_TRUNCATED_DOS(); }
+    if image[0]!=u8(77) || image[1]!=u8(90) { return E_NOT_DOS(); }
+    let lfanew:u64=r32(image,60);
+    if lfanew<64 { return E_BAD_LFANEW(); }
+    if !inside(lfanew,head(),len(image)) { return E_TRUNCATED_HEADERS(); }
+    let coff:u64=lfanew;
+    let opt:u64=lfanew+24;
+    let table:u64=lfanew+264;
+    let headers_size:u64=r32(image,opt+60);
+    if r32(image,coff)!=0x4550 { return E_BAD_PE_SIGNATURE(); }
+    if r16(image,coff+4)!=0x8664 { return E_BAD_MACHINE(); }
+    if r16(image,coff+6)!=4 { return E_BAD_SECTION_COUNT(); }
+    if r16(image,coff+20)!=240 { return E_BAD_OPTIONAL_SIZE(); }
+    if r16(image,coff+22)!=0x2022 || r16(image,opt+70)!=0x160 { return E_BAD_CHARACTERISTICS(); }
+    if r16(image,opt)!=0x20b { return E_BAD_MAGIC(); }
+    if r16(image,opt+68)!=10 { return E_BAD_SUBSYSTEM(); }
+    if r64(image,opt+24)!=0x140000000 { return E_BAD_IMAGE_BASE(); }
+    if r32(image,opt+32)!=4096 || r32(image,opt+36)!=512 { return E_BAD_ALIGNMENT(); }
+    let mut text_v:u64=0;let mut text_r:u64=0;let mut text_s:u64=0;
+    let mut rdata_v:u64=0;let mut rdata_s:u64=0;
+    let mut data_v:u64=0;let mut data_s:u64=0;
+    let mut reloc_v:u64=0;let mut reloc_r:u64=0;let mut reloc_s:u64=0;let mut reloc_p:u64=0;
+    // SizeOfHeaders is settled before anything is derived from it, and only
+    // in the two clauses that constrain the field's own shape. pe.c asks the
+    // same two questions before the walk (pe.c:60), and it has to: the walk
+    // seeds its raw chain from this field, so a value checked afterwards
+    // would already have decided where .text must start. That is the wrong
+    // question asked first, and it reports a corrupt header size as 837.
+    //
+    // The third clause, headers_size>len(image), is deliberately not here. It
+    // is a statement about the file length rather than about this field, and
+    // asking it early relabels every truncated image as 840 instead of 838.
+    // It is also unreachable where it used to sit: the walk requires
+    // raw0==headers_size and raw0<=len(image), so it cannot hold by then.
+    if headers_size<lfanew+head() || headers_size%512!=0 { return E_BAD_IMAGE_SIZE(); }
+    // A hole between two sections is not an overlap, and the checks below
+    // were asking the weaker question. The loader in pe.c asks the stronger
+    // one: each section continues the previous one exactly, in virtual space
+    // and in the file, with nothing in between (pe.c:78 next_raw, pe.c:88-92
+    // next_raw and next_virtual). A writer that laid sections out with a gap
+    // would pass every check in this function and still be unloadable, so the
+    // chain is threaded here and both ends of it are compared.
+    let mut next_rva:u64=4096;
+    let mut next_raw:u64=headers_size;
+    let mut i:u64=0;
+    while i<4 {
+        let base:u64=table+i*40;
+        if r64(image,base)!=name_word(i) { return E_BAD_SECTION_NAME(); }
+        if r32(image,base+36)!=section_flags(i) { return E_BAD_SECTION_FLAGS(); }
+        let vsize:u64=r32(image,base+8);
+        let rva:u64=r32(image,base+12);
+        let rawsize:u64=r32(image,base+16);
+        let raw:u64=r32(image,base+20);
+        if vsize==0 || rva%4096!=0 || vsize>rawsize { return E_BAD_VIRTUAL_SPAN(); }
+        if rawsize!=al(vsize,512) || raw%512!=0 { return E_BAD_RAW_LAYOUT(); }
+        if raw<headers_size { return E_RAW_OUT_OF_FILE(); }
+        if !inside(raw,rawsize,len(image)) { return E_RAW_OUT_OF_FILE(); }
+        let mut j:u64=0;
+        while j<i {
+            let prior:u64=table+j*40;
+            if raw<r32(image,prior+20)+r32(image,prior+16) { return E_SPAN_OVERLAP(); }
+            if rva<r32(image,prior+12)+r32(image,prior+8) { return E_SPAN_OVERLAP(); }
+            j=j+1;
+        }
+        // Continuity is asked after the overlap walk, not before: a section
+        // that both overlaps its predecessor and leaves a hole is an overlap,
+        // and 839 is the code the writer profile already promises for that.
+        // Asking the chain first would relabel those as plain bad spans.
+        if rva!=next_rva { return E_BAD_VIRTUAL_SPAN(); }
+        if raw!=next_raw { return E_BAD_RAW_LAYOUT(); }
+        next_rva=al(rva+vsize,4096);
+        next_raw=raw+rawsize;
+        if i==0 { text_v=vsize;text_r=rva;text_s=rawsize; }
+        if i==1 { rdata_v=vsize;rdata_s=rawsize; }
+        if i==2 { data_v=vsize;data_s=rawsize; }
+        if i==3 { reloc_v=vsize;reloc_r=rva;reloc_s=rawsize;reloc_p=raw; }
+        i=i+1;
+    }
+
+    if r32(image,opt+56)!=al(reloc_r+reloc_v,4096) { return E_BAD_IMAGE_SIZE(); }
+    if r32(image,opt+4)!=text_s { return E_BAD_IMAGE_SIZE(); }
+    if r32(image,opt+8)!=rdata_s+data_s+reloc_s { return E_BAD_IMAGE_SIZE(); }
+    let entry:u64=r32(image,opt+16);
+    if entry<text_r || entry-text_r>=text_v { return E_BAD_ENTRY(); }
+    let dir:u64=opt+112+40;
+    let dir_rva:u64=r32(image,dir);
+    let dir_size:u64=r32(image,dir+4);
+    if dir_rva!=reloc_r || dir_size!=reloc_v || dir_size<12 || dir_size%4!=0 { return E_BAD_RELOC_DIR(); }
+    let mut at:u64=reloc_p;let mut used:u64=0;let mut previous:u64=0;
+    while used<dir_size {
+        if dir_size-used<8 { return E_BAD_RELOC_DIR(); }
+        let page:u64=r32(image,at);
+        let block:u64=r32(image,at+4);
+        if block<8 || block%4!=0 || block>dir_size-used { return E_BAD_RELOC_DIR(); }
+        if used!=0 && page<=previous { return E_BAD_RELOC_DIR(); }
+        if !page_mapped(image,table,page) { return E_BAD_RELOC_DIR(); }
+        // block == 8+4k encodes an even or an odd real entry count; the writer
+        // pads an odd count with two zero bytes, and a real DIR64 slot is
+        // never zero because its type nibble is 10.
+        let pairs:u64=(block-8)/4;
+        if pairs==0 { return E_BAD_RELOC_DIR(); }
+        let mut count:u64=pairs+pairs;
+        if r16(image,at+8+(count-1)*2)==0 { count=count-1; }
+        if count==0 { return E_BAD_RELOC_DIR(); }
+        if count==0 { return E_BAD_RELOC_DIR(); }
+        let mut j:u64=0;let mut last:u64=0;
+        while j<count {
+            let slot:u64=r16(image,at+8+j*2);
+            if (slot>>12)!=10 { return E_BAD_RELOC_DIR(); }
+            let offset:u64=slot&4095;
+            if offset%2!=0 { return E_BAD_RELOC_DIR(); }
+            if j!=0 && offset<=last { return E_BAD_RELOC_DIR(); }
+            if !site_mapped(image,table,page+offset) { return E_BAD_RELOC_DIR(); }
+            last=offset;j=j+1;
+        }
+        previous=page;used=used+block;at=at+block;
+    }
+    if used!=dir_size { return E_BAD_RELOC_DIR(); }
+    if !zeros(image,2,58) || !zeros(image,64,lfanew-64) { return E_BAD_RESERVED(); }
+    if r32(image,coff+8)!=0 || r32(image,coff+12)!=0 || r32(image,coff+16)!=0 { return E_BAD_RESERVED(); }
+    if r32(image,opt+20)!=text_r { return E_BAD_RESERVED(); }
+    if !zeros(image,opt+2,2) || !zeros(image,opt+12,4) { return E_BAD_RESERVED(); }
+    if r16(image,opt+40)!=6 || r16(image,opt+48)!=6 { return E_BAD_RESERVED(); }
+    if !zeros(image,opt+42,6) || !zeros(image,opt+50,2) { return E_BAD_RESERVED(); }
+    if !zeros(image,opt+52,4) || !zeros(image,opt+64,4) || !zeros(image,opt+104,4) { return E_BAD_RESERVED(); }
+    if r64(image,opt+72)!=0x100000 || r64(image,opt+80)!=0x1000 { return E_BAD_RESERVED(); }
+    if r64(image,opt+88)!=0x100000 || r64(image,opt+96)!=0x1000 { return E_BAD_RESERVED(); }
+    if r32(image,opt+108)!=16 { return E_BAD_RESERVED(); }
+    let mut j:u64=0;
+    while j<16 {
+        if j!=5 { if !zeros(image,opt+112+j*8,8) { return E_BAD_RESERVED(); } }
+        j=j+1;
+    }
+    i=0;
+    while i<4 {
+        if !zeros(image,table+i*40+24,12) { return E_BAD_RESERVED(); }
+        i=i+1;
+    }
+    if reloc_p+reloc_s!=len(image) { return E_FILE_LENGTH(); }
+    out[0]=0x8664;out[1]=10;out[2]=0x140000000;out[3]=entry;
+    out[4]=r32(image,opt+56);out[5]=headers_size;
+    out[6]=text_v;out[7]=rdata_v;out[8]=data_v;out[9]=reloc_v;
+    out[10]=text_s;out[11]=rdata_s;out[12]=data_s;out[13]=reloc_s;
+    out[14]=dir_rva;out[15]=dir_size;
+    return 0;
+}

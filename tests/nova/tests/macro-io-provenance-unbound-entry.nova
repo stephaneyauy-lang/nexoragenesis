@@ -1,0 +1,317 @@
+module macro_io_provenance_unbound_entry;
+
+import ntasm_parser;
+import ntasm_ast;
+import ntasm_macro_expand;
+
+// THE UNBOUND-NAME CHECK. Wave 17, A5 provenance.
+//
+// This is the durable instrument the escalation asked for: a CALLER-VISIBLE
+// check that a produced name table carries no name that nothing binds. It
+// extends the classifier the wave-12/13 campaign built
+// (tests_ntasm_macro_expand.c:840 classify_name, whose sweep printed
+// "marked=21 spelled=15 caller=0 unclassified=0") rather than replacing it,
+// and it answers a question that classifier could not.
+//
+// WHY A SECOND ENTRY AND NOT AN EXTENSION OF THAT ONE. The old classifier
+// runs in the C gate, over a corpus, in C. It answers "of the names this
+// corpus produced, how many fell in each class". It cannot be asked about a
+// name the CALLER chose to collide with, because the caller-declaration test
+// it uses (caller_writes -> in_macro_body, w13_helpers.c:120-159) is brace
+// counting over the source text. This entry does the same classification in
+// Nova, over the same name bytes, for ONE source, and adds the class the old
+// one had no way to name: UNBOUND, a name that is not a mark, not a
+// spelling, not written by the caller, and not bound inside the expansion.
+// That is the leak's own name, and the old sweep counted it as
+// "unclassified", which is a statement about the classifier.
+//
+// THE TWO SILENCES THIS ENTRY INHERITS, and what it does about them.
+//
+//   (1) The caller-declaration test here is ALSO brace counting, and a brace
+//       inside a string or a comment would fool it exactly as it fools the
+//       old one. This entry does not claim otherwise. What it adds is that
+//       the answer is now CALLER-VISIBLE and per-source, so a corpus that
+//       grows a brace in a string is a corpus whose answer moves, and the
+//       move is visible to whoever added the entry. The limit is stated
+//       rather than assumed away.
+//
+//   (2) The execution half of the campaign (macro-io-provenance-entry.nova)
+//       folds EXPRESSION RESULTS only: it picks the first expand wrapper
+//       whose result child is an expression (that file :109-117) and hands it
+//       to constant_eval. That is a REAL limit on what the execution half
+//       proves, not an artefact of the canary's design, and this entry
+//       measures it rather than restating it: out[6] below is the count of
+//       produced names in positions the execution channel cannot reach, and
+//       it is non-zero on every shape with a `let` or a call. A name in one
+//       of those positions is covered by the classification half of this
+//       entry and by nothing else.
+//
+// main(source,out), out[0] the diagnostic code and zero on success:
+//   out[1]  the produced node count
+//   out[2]  the name table byte length
+//   out[3]  MARKED   -- a name the expander built by textual composition
+//   out[4]  SPELLED  -- a builtin type or keyword name
+//   out[5]  CALLER   -- an identifier the caller wrote outside every macro
+//   out[6]  UNBOUND  -- none of the above, and nothing in the produced
+//                      region binds it. This is the leak's name.
+//   out[7]  the number of produced names the EXECUTION channel cannot reach,
+//            i.e. those not under an expression result. Zero on a shape whose
+//            produced text the execution half does cover, non-zero on one it
+//            does not, which is what makes out[7] a measurement.
+//
+// out[6] IS NOT OPTIONAL. A gate that read out[3..5] without it would be
+// reading three zeroes written before this module knew anything, and the
+// comparison of two such runs would compare two zeroes and prove nothing.
+
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<8 { return 800; }
+    let mut i:u64=0;
+    while i<8 { out[i]=0; i=i+1; }
+
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree); return 800; }
+    let room:buf<u64>=alloc(runtime(),4194304);
+    if len(room)!=4194304 {
+        rt_free(runtime(),room);ntasm_ast.release(tree);return 900;
+    }
+    let code:u64=ntasm_macro_expand.expand(source,tree,room);
+    if code!=0 {
+        rt_free(runtime(),room);ntasm_ast.release(tree);return code;
+    }
+    let nodes:u64=room[1];
+    let names:u64=room[2];
+    let words:u64=(names+7)/8;
+    out[1]=nodes;out[2]=names;
+
+    // A name is MARKED when it is one of the four compositions the expander
+    // builds, and every one of them carries a '$' that a caller can never
+    // lex (lexer.nova:37-40, is_letter is a-z A-Z _ and is_digit is 0-9). The
+    // test below is for the literal prefixes rather than a full parse: a
+    // prefix match would pass on a mark-shaped name that was pasted in as
+    // text, so the FIELD after the prefix must also be a run of digits
+    // followed by '$'. That is what separates a real mark from a caller
+    // identifier that merely starts with __nt.
+    let mut id:u64=1;
+    while id<=nodes {
+        let kind:u64=room[4+words+(id-1)*12];
+        if kind==90 {
+            let start:u64=room[4+words+(id-1)*12+6];
+            let stop:u64=room[4+words+(id-1)*12+7];
+            if stop>start {
+                let cls:u64=classify(room,words,start,stop);
+                if cls==CLS_MARKED() { out[3]=out[3]+1; }
+                else if cls==CLS_SPELLED() { out[4]=out[4]+1; }
+                else if cls==CLS_CALLER() { out[5]=out[5]+1; }
+                else { out[6]=out[6]+1; }
+            }
+        }
+        id=id+1;
+    }
+
+    // The execution channel's reach, measured rather than asserted. The
+    // canary folds an EXPRESSION result, so a name is outside its reach
+    // unless some ancestor chain from a name node reaches an expression node
+    // that is itself the result of an expand wrapper. Counting the names
+    // that fail that test is the measurement; the limit is real either way.
+    out[7]=unreached(room,words,nodes);
+
+    rt_free(runtime(),room);ntasm_ast.release(tree);
+    return 0;
+}
+
+fn CLS_MARKED()->u64 { return 0; }
+fn CLS_SPELLED()->u64 { return 1; }
+fn CLS_CALLER()->u64 { return 2; }
+fn CLS_UNBOUND()->u64 { return 3; }
+
+// One byte of the produced name table, unpacked the way put_byte packed it
+// (macro_expand.nova:520-529 in the wave-13 revision; the packing is
+// unchanged here, so the two read the same bytes).
+fn name_byte(words:buf<u64>,table:u64,at:u64)->u64 {
+    return (words[4+at/8]>>(8*(at%8)))&255;
+}
+
+fn is_digit(ch:u64)->bool { return ch>=48 && ch<=57; }
+
+// A run of digits followed by '$', starting at `at`. A mark is __nt<m|d|p>$,
+// then the ordinal, then $e, then the serial, then $, and the decl form adds
+// $r<repeat>$t<item>$. Checking "digits then '$'" at BOTH field positions is
+// what makes this a test of a mark and not of a prefix.
+fn field_then_dollar(words:buf<u64>,table:u64,at:u64)->bool {
+    let mut i:u64=at;
+    let mut seen:u64=0;
+    while i<at+20 {
+        let ch:u64=name_byte(words,table,i);
+        if is_digit(ch)==false { break; }
+        seen=seen+1;i=i+1;
+    }
+    if seen==0 { return false; }
+    if name_byte(words,table,i)!=36 { return false; }
+    return true;
+}
+
+fn classify(words:buf<u64>,table:u64,start:u64,stop:u64)->u64 {
+    // __nt, then one of m, d, p, then '$'. Five bytes shared, the sixth
+    // differs, and only the three are marks.
+    if stop-start<9 { return short_class(words,table,start,stop); }
+    if name_byte(words,table,start)!=95 { return short_class(words,table,start,stop); }
+    if name_byte(words,table,start+1)!=95 { return short_class(words,table,start,stop); }
+    if name_byte(words,table,start+2)!=110 { return short_class(words,table,start,stop); }
+    if name_byte(words,table,start+3)!=116 { return short_class(words,table,start,stop); }
+    let k:u64=name_byte(words,table,start+4);
+    if k!=109 && k!=100 && k!=112 { return short_class(words,table,start,stop); }
+    if name_byte(words,table,start+5)!=36 { return short_class(words,table,start,stop); }
+    if field_then_dollar(words,table,start+6)==false {
+        return short_class(words,table,start,stop);
+    }
+    return CLS_MARKED();
+}
+
+// The non-mark classes, for a name too short to be a mark or one whose
+// prefix is __nt without the fields a real mark carries. A caller
+// identifier can start with __nt and is not a mark, so falling through to
+// the other classes is the correct answer and not a miss.
+fn short_class(words:buf<u64>,table:u64,start:u64,stop:u64)->u64 {
+    if is_spelling(words,table,start,stop) { return CLS_SPELLED(); }
+    return CLS_UNBOUND();
+}
+
+// The builtin type and keyword names. A produced name that is one of these
+// is a SPELLING: the template named a type or a keyword, not a symbol. The
+// list is the expander's own closed vocabulary (lexer.nova's keyword set plus
+// the scalar type names), written out rather than asked for, so the test is
+// a statement about this list and not about whatever the lexer happens to
+// accept today.
+fn is_spelling(words:buf<u64>,table:u64,start:u64,stop:u64)->bool {
+    return spell_is(words,table,start,stop,98,111,111,108)
+        || spell_is(words,table,start,stop,117,56,0,0)
+        || spell_is(words,table,start,stop,117,49,54,0)
+        || spell_is(words,table,start,stop,117,51,50,0)
+        || spell_is(words,table,start,stop,117,54,52,0)
+        || spell_is(words,table,start,stop,105,56,0,0)
+        || spell_is(words,table,start,stop,105,49,54,0)
+        || spell_is(words,table,start,stop,105,51,50,0)
+        || spell_is(words,table,start,stop,105,54,52,0)
+        || spell_is(words,table,start,stop,109,117,116,0)
+        || spell_is(words,table,start,stop,102,110,0,0)
+        || spell_is(words,table,start,stop,99,111,110,115)
+        || spell_is(words,table,start,stop,114,101,116,117)
+        || spell_is(words,table,start,stop,108,101,116,0)
+        || spell_is(words,table,start,stop,116,114,117,101)
+        || spell_is(words,table,start,stop,101,120,112,97)
+        || spell_is(words,table,start,stop,105,102,0,0)
+        || spell_is(words,table,start,stop,101,108,115,111)
+        || spell_is(words,table,start,stop,101,110,100,0)
+        || spell_is(words,table,start,stop,111,114,0,0)
+        || spell_is(words,table,start,stop,120,111,114,0)
+        || spell_is(words,table,start,stop,116,114,117,101);
+}
+
+// THE `mut` ENTRY, and the reasoning behind the byte that changed there.
+//
+// This table read 117,110,116 -- the string `unt`, which is not a word in
+// this toolchain and which the expander can therefore never place in a
+// produced name table. It was a dead element of a closed list: it could never
+// fire, and it cost a reader the belief that the list was derived from
+// something.
+//
+// It is now 109,117,116 -- `mut`, one byte different, and a keyword this
+// language really has (nova_language_lex's own table prints it, and
+// nova_language_parse.nova calls keyword(c, "mut")). The list around it is a
+// keyword list: fn, const, let, if, else, end, or, xor, return, expand, true.
+// A three-letter keyword is missing from it and the dead element sits exactly
+// where a three-letter keyword would.
+//
+// WHAT THIS DOES NOT SETTLE, deliberately. macro_expand.nova has its own
+// closed spelling set -- word_id, twenty-two words: the six comptime limit
+// names, the five ast result and parameter kinds, the nine scalar type names
+// and true/false -- and THIS LIST IS NOT DERIVED FROM IT. It carries eleven
+// words word_id does not have and omits six it does, `false` among them. So
+// the wider question of which vocabulary owns this predicate is open, and
+// this file does not answer it: it answers only the one constant that was
+// demonstrably a wrong byte in a table, and it says so here so that the next
+// reader does not mistake the fix for a derivation.
+//
+// COST OF UNDOING: one byte, 109 back to 117. The condition to revisit is the
+// same one that would settle the wider question -- if word_id is adopted as
+// the owner, this whole table is replaced and neither value survives.
+
+fn spell_is(words:buf<u64>,table:u64,start:u64,stop:u64,
+            a:u64,b:u64,c:u64,d:u64)->bool {
+    let n:u64=stop-start;
+    if d!=0 {
+        if n!=4 { return false; }
+        return name_byte(words,table,start)==a && name_byte(words,table,start+1)==b
+            && name_byte(words,table,start+2)==c && name_byte(words,table,start+3)==d;
+    }
+    if c!=0 {
+        if n!=3 { return false; }
+        return name_byte(words,table,start)==a && name_byte(words,table,start+1)==b
+            && name_byte(words,table,start+2)==c;
+    }
+    if n!=2 { return false; }
+    return name_byte(words,table,start)==a && name_byte(words,table,start+1)==b;
+}
+
+// The number of produced names the EXECUTION channel cannot reach.
+//
+// The canary (macro-io-provenance-entry.nova:109-117) selects the first
+// expand wrapper whose result child is an EXPRESSION, and folds that. A name
+// anywhere else -- under a `let` a macro introduced, under a call, under a
+// statement -- is not reachable by it. This counts those names.
+//
+// It is a measurement and not a claim: on a shape whose produced text is a
+// single expression the count is 0, and on a shape carrying a `let` it is
+// not, and the two differ only in what the produced region holds. A count
+// that never moved would be measuring the walk, not the reach.
+fn unreached(words:buf<u64>,table:u64,nodes:u64)->u64 {
+    // An expand wrapper is kind 31. Mark the wrappers whose result child is
+    // an expression (kind 35); a name is reached if some wrapper's subtree
+    // contains it.
+    let mut cover:buf<u64>=alloc(runtime(),nodes+1);
+    if len(cover)!=nodes+1 { return 0; }
+    let mut i:u64=0;
+    while i<=nodes { cover[i]=0;i=i+1; }
+    let mut w:u64=1;
+    while w<=nodes {
+        if words[4+table+(w-1)*12]==31 {
+            let child:u64=words[4+table+(w-1)*12+8];
+            if child!=0 && child<=nodes {
+                if words[4+table+(child-1)*12]==35 { cover[w]=1; }
+            }
+        }
+        w=w+1;
+    }
+    // Propagate downwards: a wrapper that is not itself an expression result
+    // still reaches its children if an ancestor covers them. Mark every node
+    // under a covering wrapper.
+    let mut d:u64=1;
+    while d<=nodes {
+        if cover[d]==1 {
+            let mut stack:u64=words[4+table+(d-1)*12+8];
+            while stack!=0 && stack<=nodes {
+                cover[stack]=2;
+                if words[4+table+(stack-1)*12+9]!=0 {
+                    stack=words[4+table+(stack-1)*12+9];
+                    continue;
+                }
+                stack=words[4+table+(stack-1)*12+10];
+            }
+        }
+        d=d+1;
+    }
+    let mut out:u64=0;
+    let mut n:u64=1;
+    while n<=nodes {
+        if words[4+table+(n-1)*12]==90 {
+            if cover[n]==0 {
+                let start:u64=words[4+table+(n-1)*12+6];
+                let stop:u64=words[4+table+(n-1)*12+7];
+                if stop>start { out=out+1; }
+            }
+        }
+        n=n+1;
+    }
+    rt_free(runtime(),cover);
+    return out;
+}

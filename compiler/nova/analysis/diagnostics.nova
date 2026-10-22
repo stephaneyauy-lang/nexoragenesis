@@ -1,0 +1,651 @@
+module diagnostics;
+
+import ntasm_ast;
+import ntasm_lexer;
+import ntasm_parser;
+import semantics;
+import targets;
+import versions;
+import features;
+import callable_names;
+import symbol_names;
+import types;
+import constant_types;
+
+// FOUNDATION PLUS ONE SLICE, NOT FULL RECOVERY. This module owns the
+// diagnostic list and the resynchronisation policy. parser.nova still stops
+// at its first error and still records exactly one diagnostic, and no
+// production pipeline calls this module yet. What is proven here is the
+// substrate the parser owner needs: an append-only bounded list, a declared
+// boundary scan over the real token stream, a multi-construct collector, and
+// one vertical slice of the validator pass chain. The hook points
+// parser.nova and validate.nova must grow are listed at the bottom.
+
+// ---- declared limits --------------------------------------------------
+// The list holds at most capacity() diagnostics. One more is refused, never
+// stored and never merged: the count stays at the capacity and dropped counts
+// the refusal. probe_capacity() is how many discoveries one collect run can
+// hold for replay and is strictly greater than capacity(), so the capacity
+// refusal is exercised on a real file and not only through a direct call.
+// resync_budget() bounds one resynchronisation scan in tokens. slice_passes()
+// is how many leading passes of validate.validate this module re-runs.
+export fn capacity()->u64 { return 32; }
+export fn entry_words()->u64 { return 8; }
+export fn probe_capacity()->u64 { return 64; }
+export fn resync_budget()->u64 { return 4096; }
+export fn slice_passes()->u64 { return 8; }
+export fn minimum_words()->u64 { return 18+7*capacity(); }
+
+// ---- bounded diagnostic list -------------------------------------------
+// Eight words per entry: code, reason, source, line, column, start, end and
+// the insertion sequence number. Append only: push never overwrites a stored
+// entry, never grows the buffer and never reorders. finalize is the single
+// reorder pass and the only function that rewrites an entry already stored.
+export struct List {
+    ok:bool,count:u64,dropped:u64,rejected:u64,entries:buf<u64>,cap:u64
+}
+
+export fn make()->List {
+    let cap:u64=capacity();
+    let words:buf<u64>=alloc(runtime(),cap*entry_words());
+    let mut i:u64=0;
+    while i<cap*entry_words() { words[i]=0;i=i+1; }
+    return List{ok:true,count:0,dropped:0,rejected:0,entries:words,cap:cap};
+}
+
+// Releases the entry buffer. The list is dead afterwards.
+export fn release(list:List)->u64 {
+    let words:buf<u64>=list.entries;
+    return rt_free(runtime(),words);
+}
+
+// Field of one stored entry, or 0 for an index past the count.
+export fn at(list:List,index:u64,field:u64)->u64 {
+    if (index>=list.count || field>=entry_words()) { return 0; }
+    let words:buf<u64>=list.entries;
+    return words[index*entry_words()+field];
+}
+
+// True when a diagnostic with this code, reason, source and span is already
+// stored. Two diagnostics naming the same construct twice is the incoherence
+// this list refuses to produce, so identity is the whole key and not the span
+// alone.
+fn present(list:List,code:u64,reason:u64,source:u64,start:u64,end:u64)->bool {
+    let words:buf<u64>=list.entries;
+    let stride:u64=entry_words();
+    let mut i:u64=0;
+    while i<list.count {
+        let base:u64=i*stride;
+        if (words[base]==code && words[base+1]==reason && words[base+2]==source &&
+            words[base+5]==start && words[base+6]==end) { return true; }
+        i=i+1;
+    }
+    return false;
+}
+
+// Append one diagnostic. Returns 1 when stored and 0 when refused, for one
+// of two declared reasons: the capacity bound is reached (counted in
+// dropped) or the same code, reason, source and span is already stored
+// (counted in rejected). Neither refusal disturbs a stored entry.
+export fn push(list:List,code:u64,reason:u64,source:u64,line:u64,column:u64,
+               start:u64,end:u64)->u64 {
+    if (list.count>=list.cap) { list.dropped=list.dropped+1;return 0; }
+    if (present(list,code,reason,source,start,end)==true) {
+        list.rejected=list.rejected+1;return 0;
+    }
+    let words:buf<u64>=list.entries;
+    let stride:u64=entry_words();
+    let base:u64=list.count*stride;
+    words[base]=code;words[base+1]=reason;words[base+2]=source;words[base+3]=line;
+    words[base+4]=column;words[base+5]=start;words[base+6]=end;
+    words[base+7]=list.count;
+    list.count=list.count+1;
+    return 1;
+}
+
+fn swap(words:buf<u64>,a:u64,b:u64)->u64 {
+    let stride:u64=entry_words();
+    let mut i:u64=0;
+    while i<stride {
+        let keep:u64=words[a+i];words[a+i]=words[b+i];words[b+i]=keep;i=i+1;
+    }
+    return 0;
+}
+
+// Total order of the stored entries: source, start, end, code, reason. push
+// refuses a duplicate identity, so no two entries share all five fields and
+// the order is total. finalize is therefore a function of the stored set
+// alone and never of the order the entries were appended in.
+fn before(words:buf<u64>,a:u64,b:u64)->bool {
+    let stride:u64=entry_words();
+    if (words[a+2]!=words[b+2]) { return words[a+2]<words[b+2]; }
+    if (words[a+5]!=words[b+5]) { return words[a+5]<words[b+5]; }
+    if (words[a+6]!=words[b+6]) { return words[a+6]<words[b+6]; }
+    if (words[a]!=words[b]) { return words[a]<words[b]; }
+    if (words[a+1]!=words[b+1]) { return words[a+1]<words[b+1]; }
+    return false;
+}
+
+// Reorder the stored entries into the total order and renumber the sequence
+// field. Insertion sort over at most capacity() entries, so the quadratic
+// term is bounded by a constant this module declares. Returns the count.
+export fn finalize(list:List)->u64 {
+    let words:buf<u64>=list.entries;
+    let stride:u64=entry_words();
+    let mut i:u64=1;
+    while i<list.count {
+        let mut j:u64=i;
+        while j>0 {
+            if (before(words,j*stride,(j-1)*stride)==false) { break; }
+            swap(words,j*stride,(j-1)*stride);j=j-1;
+        }
+        i=i+1;
+    }
+    let mut k:u64=0;
+    while k<list.count { words[k*stride+7]=k;k=k+1; }
+    return list.count;
+}
+
+// Number of incoherent pairs: entries sharing a code, a reason, a source and
+// a span. Re-derived from the stored words and not from the bookkeeping of
+// push, so a broken refusal shows up here. A correct list answers 0.
+export fn incoherent(list:List)->u64 {
+    let words:buf<u64>=list.entries;
+    let stride:u64=entry_words();
+    let mut pairs:u64=0;
+    let mut i:u64=0;
+    while i<list.count {
+        let mut j:u64=i+1;
+        while j<list.count {
+            let a:u64=i*stride;let b:u64=j*stride;
+            if (words[a]==words[b] && words[a+1]==words[b+1] &&
+                words[a+2]==words[b+2] && words[a+5]==words[b+5] &&
+                words[a+6]==words[b+6]) { pairs=pairs+1; }
+            j=j+1;
+        }
+        i=i+1;
+    }
+    return pairs;
+}
+
+// True when the stored entries are strictly increasing in the total order,
+// that is when every entry precedes the one after it.
+export fn ordered(list:List)->bool {
+    let words:buf<u64>=list.entries;
+    let stride:u64=entry_words();
+    let mut i:u64=1;
+    while i<list.count {
+        if (before(words,(i-1)*stride,i*stride)==false) { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// ---- position mapping -------------------------------------------------
+// The lexer counts a line break as LF only and columns from one, so counting
+// LF up to an offset reproduces the position it recorded.
+fn line_col_of(source:buf<u8>,offset:u64,out:buf<u64>)->u64 {
+    let size:u64=len(source);
+    let mut at:u64=0;
+    let mut stop:u64=offset;
+    if (stop>size) { stop=size; }
+    let mut line:u64=1;
+    let mut base:u64=0;
+    while at<stop {
+        if (source[at]==10) { line=line+1;base=at+1; }
+        at=at+1;
+    }
+    out[0]=line;out[1]=stop-base+1;
+    return 0;
+}
+
+// Byte offset of a one-based line and column, or 0 when source has no such
+// position. A pipeline pass reports a line and a column and never an offset,
+// so this is the only way to give such a diagnostic a real span.
+fn offset_of(source:buf<u8>,line:u64,column:u64)->u64 {
+    let size:u64=len(source);
+    if (line==0 || column==0) { return 0; }
+    let mut at:u64=0;
+    let mut current:u64=1;
+    let mut base:u64=0;
+    while at<size && current<line {
+        if (source[at]==10) { current=current+1;base=at+1; }
+        at=at+1;
+    }
+    if (current!=line) { return 0; }
+    if (base+column>size) { return 0; }
+    return base+column-1;
+}
+
+// ---- declared recovery boundaries --------------------------------------
+// Keyword id of the NAME at a token index in the parser's append-only
+// keyword table, or 0. The table is only read: its order is the contract
+// every pass names identifiers by.
+fn name_id(source:buf<u8>,tokens:buf<u64>,index:u64,table:buf<u8>)->u64 {
+    if (index*9>=len(tokens)) { return 0; }
+    if (tokens[index*9]!=257) { return 0; }
+    let size:u64=len(table);
+    let length:u64=tokens[index*9+8];
+    let start:u64=tokens[index*9+5];
+    if (start+length>len(source)) { return 0; }
+    let mut at:u64=0;
+    let mut id:u64=1;
+    while at<size {
+        let mut word:u64=at;
+        while (word<size && table[word]!=0) { word=word+1; }
+        if (word-at==length) {
+            let mut i:u64=0;
+            let mut equal:bool=true;
+            while i<length {
+                if (source[start+i]!=table[at+i]) { equal=false; }
+                i=i+1;
+            }
+            if (equal==true) { return id; }
+        }
+        at=word+1;id=id+1;
+    }
+    return 0;
+}
+
+// The construct heads source_tree dispatches on, by keyword id: module 1,
+// target 2, versions 3, default_abi 10, output 11, features 12, import 13,
+// fn 15, const 16, data 17, comptime 18, stub_table 19, section 23 and
+// macro 37. fn and data also head a member of a section body, which is why a
+// construct head additionally requires depth zero.
+fn is_top(id:u64)->bool {
+    if (id==1 || id==2 || id==3 || id==10 || id==11 || id==12 || id==13) {
+        return true;
+    }
+    if (id==15 || id==16 || id==17 || id==18 || id==19 || id==23 || id==37) {
+        return true;
+    }
+    return false;
+}
+
+fn top_id(source:buf<u8>,tokens:buf<u64>,index:u64,table:buf<u8>)->u64 {
+    let id:u64=name_id(source,tokens,index,table);
+    if (is_top(id)==true) { return id; }
+    return 0;
+}
+
+// Token index of the nth zero based depth-zero construct head, or count when
+// there is no such head. Depth counts '{' (123) and '}' (125) from the start
+// of the stream, so a head reached at depth zero starts a real top-level
+// construct and is never a member of a section body. The first construct of
+// a source sits at token index zero, so the absence marker is count and not
+// zero.
+export fn construct_at(source:buf<u8>,tokens:buf<u64>,count:u64,ordinal:u64,
+                       table:buf<u8>)->u64 {
+    let mut limit:u64=count;
+    if (limit*9>len(tokens)) { limit=len(tokens)/9; }
+    let mut depth:u64=0;
+    let mut seen:u64=0;
+    let mut i:u64=0;
+    while i<limit {
+        if (depth==0) {
+            let id:u64=top_id(source,tokens,i,table);
+            if (id!=0) {
+                if (seen==ordinal) { return i; }
+                seen=seen+1;
+            }
+        }
+        let kind:u64=tokens[i*9];
+        if (kind==123) { depth=depth+1; }
+        if (kind==125) { if (depth>0) { depth=depth-1; } }
+        i=i+1;
+    }
+    return count;
+}
+
+// Token index of the EOF token, or 0 when the stream does not end with one.
+export fn eof_at(tokens:buf<u64>,count:u64)->u64 {
+    if (count==0 || count*9>len(tokens)) { return 0; }
+    let mut last:u64=count-1;
+    if (tokens[last*9]!=256) { return 0; }
+    return last;
+}
+
+// First recovery boundary at or after a token index, over the real token
+// stream of a lexable source.
+//   kind 1 a statement terminator ';': the resume index and the byte offset
+//        are just after it, with the newlines that follow already consumed,
+//        so the caller restarts on a fresh statement.
+//   kind 2 a declared top-level keyword head: the keyword token is reported
+//        and NOT consumed, so the caller parses the next declaration from its
+//        own head and the keyword is never lost.
+//   kind 3 the EOF token, reported at its own offset.
+//   kind 0 no boundary within resync_budget() tokens; out is left zero.
+// Writes out[0]=kind, out[1]=resume token index, out[2]=byte offset,
+// out[3]=keyword id and out[4]=tokens skipped, and returns the kind.
+export fn resync_boundary(source:buf<u8>,tokens:buf<u64>,count:u64,index:u64,
+                          table:buf<u8>,out:buf<u64>)->u64 {
+    if (len(out)<5) { return 0; }
+    out[0]=0;out[1]=0;out[2]=0;out[3]=0;out[4]=0;
+    let mut limit:u64=count;
+    if (limit*9>len(tokens)) { limit=len(tokens)/9; }
+    if (index>=limit) { return 0; }
+    let mut i:u64=index;
+    let mut skipped:u64=0;
+    while i<limit && skipped<=resync_budget() {
+        let kind:u64=tokens[i*9];
+        if (kind==256) {
+            out[0]=3;out[1]=i;out[2]=tokens[i*9+5];out[4]=skipped;
+            return 3;
+        }
+        if (kind==59) {
+            let mut resume:u64=i+1;
+            while (resume<limit && tokens[resume*9]==260) { resume=resume+1; }
+            out[0]=1;out[1]=resume;out[2]=tokens[i*9+6];out[4]=skipped;
+            return 1;
+        }
+        let id:u64=top_id(source,tokens,i,table);
+        if (id!=0) {
+            out[0]=2;out[1]=i;out[2]=tokens[i*9+5];out[3]=id;out[4]=skipped;
+            return 2;
+        }
+        i=i+1;skipped=skipped+1;
+    }
+    return 0;
+}
+
+// The boundary a recovering parser must resume at after the first error of a
+// whole-source parse: the first boundary strictly after the offending token.
+// Writes the five words of resync_boundary. Returns the kind, 0 when the
+// source parsed or carries no usable token stream.
+export fn resume_boundary(source:buf<u8>,source_index:u64,out:buf<u64>)->u64 {
+    if (len(out)<5) { return 0; }
+    out[0]=0;out[1]=0;out[2]=0;out[3]=0;out[4]=0;
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,source_index);
+    let mut kind:u64=0;
+    if (tree.ok==false && tree.token_count>0) {
+        let table:buf<u8>=ntasm_parser.keyword_words();
+        let tokens:buf<u64>=tree.token_words;
+        let count:u64=tree.token_count;
+        let mut i:u64=0;
+        while i<count { if (tokens[i*9+5]>=tree.end) { break; } i=i+1; }
+        kind=resync_boundary(source,tokens,count,i,table,out);
+        rt_free(runtime(),table);
+    }
+    ntasm_ast.release(tree);
+    return kind;
+}
+
+// ---- multi-construct collection ----------------------------------------
+// The synthetic head every isolated construct probe is parsed behind.
+// source_tree requires a module head and a target line before anything else,
+// so one construct on its own is not a module.
+fn probe_header()->buf<u8> { return "module m\ntarget x86_64-nexora-none\n"; }
+
+// Byte length of that head, reported so a caller translating a probe
+// diagnostic back to a real offset uses the same head this module used.
+export fn probe_header_length()->u64 { let head:buf<u8>=probe_header();return len(head); }
+
+// Keyword id of a depth-zero construct head, or 0.
+export fn construct_keyword(source:buf<u8>,tokens:buf<u64>,index:u64,
+                            table:buf<u8>)->u64 {
+    return top_id(source,tokens,index,table);
+}
+
+// One discovered diagnostic held for replay: code, reason, source, line,
+// column, start, end, seven words. Stashing first and replaying second is
+// what lets the same collection be replayed in either order and still
+// finalize to the same sequence.
+fn stash(store:buf<u64>,slot:u64,source:buf<u8>,rev:buf<u64>,code:u64,
+         reason:u64,source_index:u64,start:u64,span:u64)->u64 {
+    line_col_of(source,start,rev);
+    let at:u64=slot*7;
+    store[at]=code;store[at+1]=reason;store[at+2]=source_index;store[at+3]=rev[0];
+    store[at+4]=rev[1];store[at+5]=start;store[at+6]=start+span;
+    return 0;
+}
+
+fn replay(list:List,store:buf<u64>,slot:u64)->u64 {
+    let at:u64=slot*7;
+    push(list,store[at],store[at+1],store[at+2],store[at+3],store[at+4],
+         store[at+5],store[at+6]);
+    return 0;
+}
+
+// Parse one top-level construct on its own behind the synthetic head and
+// record the parser's own diagnostic for it at its real offset. The region
+// runs from a depth-zero construct head to the next one, so it is brace
+// balanced by construction and needs no trailing repair. A diagnostic is
+// recorded only when it points strictly inside the region: an error sitting
+// on a region edge is the signature of the truncation, not of the source.
+//   1 the construct carries a diagnostic and it was stashed
+//   3 the construct carries a diagnostic but the stash is full
+//   0 the construct parsed clean
+//   2 the probe was refused: empty region, or a diagnostic on a region edge
+fn probe(source:buf<u8>,source_index:u64,tokens:buf<u64>,count:u64,head:u64,
+         next:u64,header:buf<u8>,rev:buf<u64>,store:buf<u64>,slot:u64)->u64 {
+    if (head>=count || next<=head || next>count) { return 2; }
+    if (len(rev)<2) { return 2; }
+    let begin:u64=tokens[head*9+5];
+    let finish:u64=tokens[next*9+5];
+    if (begin>=finish || finish>len(source)) { return 2; }
+    let head_len:u64=len(header);
+    let region:u64=finish-begin;
+    let synth:buf<u8>=alloc(runtime(),head_len+region);
+    if (len(synth)!=head_len+region) { rt_free(runtime(),synth);return 2; }
+    let mut i:u64=0;
+    while i<head_len { synth[i]=u8(header[i]);i=i+1; }
+    i=0;
+    while i<region { synth[head_len+i]=u8(source[begin+i]);i=i+1; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(synth,source_index);
+    let mut verdict:u64=0;
+    if (tree.ok==false) {
+        if (tree.token_count==0) { verdict=2; }
+        else {
+            let found:u64=tree.start;
+            let stop:u64=tree.end;
+            if (found<=head_len || found>=head_len+region) { verdict=2; }
+            else if (stop>head_len+region) { verdict=2; }
+            else if (slot>=probe_capacity()) { verdict=3; }
+            else {
+                stash(store,slot,source,rev,tree.code,tree.reason,source_index,
+                      begin+(found-head_len),stop-found);
+                verdict=1;
+            }
+        }
+    }
+    ntasm_ast.release(tree);
+    rt_free(runtime(),synth);
+    return verdict;
+}
+
+// Collect every diagnostic of a source: the parser's own first answer plus
+// one per top-level construct that fails on its own. reverse replays the
+// discoveries from the last to the first; finalize then proves the stored
+// order does not depend on discovery order. Writes six report words:
+// probes performed, probes refused, discoveries stashed, discoveries found,
+// the whole-source parse code and the stored count. Returns 800 without a
+// report when the caller buffers are too short.
+export fn collect(source:buf<u8>,source_index:u64,list:List,reverse:bool,
+                  report:buf<u64>)->u64 {
+    if (len(report)<6) { return 800; }
+    let mut i:u64=0;
+    while i<6 { report[i]=0;i=i+1; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,source_index);
+    if (tree.ok==true) { ntasm_ast.release(tree);return 0; }
+    // Round zero: the parser's own single answer, admitted unconditionally so
+    // that a reader taking one diagnostic still sees exactly what the
+    // fail-fast parser alone reported.
+    push(list,tree.code,tree.reason,tree.source,tree.line,tree.column,
+         tree.start,tree.end);
+    // A lexical refusal leaves no token stream: there is nothing to
+    // resynchronise on, and inventing a second diagnostic would be a phantom.
+    if (tree.token_count==0) {
+        report[4]=tree.code;report[5]=list.count;
+        ntasm_ast.release(tree);return 0;
+    }
+    let tokens:buf<u64>=tree.token_words;
+    let count:u64=tree.token_count;
+    let table:buf<u8>=ntasm_parser.keyword_words();
+    let header:buf<u8>=probe_header();
+    let rev:buf<u64>=alloc(runtime(),2);
+    let store:buf<u64>=alloc(runtime(),probe_capacity()*7);
+    let mut refused:u64=800;
+    if (len(rev)!=2 || len(store)!=probe_capacity()*7) {
+        refused=0;
+        rt_free(runtime(),store);rt_free(runtime(),rev);rt_free(runtime(),table);
+        ntasm_ast.release(tree);return 800;
+    }
+    let eof:u64=eof_at(tokens,count);
+    let mut probes:u64=0;
+    let mut skipped:u64=0;
+    let mut stashed:u64=0;
+    let mut found:u64=0;
+    let mut ordinal:u64=0;
+    while true {
+        let head:u64=construct_at(source,tokens,count,ordinal,table);
+        if (head>=count) { break; }
+        let mut next:u64=construct_at(source,tokens,count,ordinal+1,table);
+        if (next>=count) { next=eof; }
+        if (next<=head) { break; }
+        let verdict:u64=probe(source,source_index,tokens,count,head,next,
+                              header,rev,store,stashed);
+        probes=probes+1;
+        if (verdict==1) { stashed=stashed+1;found=found+1; }
+        if (verdict==3) { found=found+1; }
+        if (verdict==2) { skipped=skipped+1; }
+        ordinal=ordinal+1;
+    }
+    if (reverse==true) {
+        let mut j:u64=stashed;
+        while j>0 { j=j-1;replay(list,store,j); }
+    } else {
+        let mut j:u64=0;
+        while j<stashed { replay(list,store,j);j=j+1; }
+    }
+    finalize(list);
+    report[0]=probes;report[1]=skipped;report[2]=stashed;report[3]=found;
+    report[4]=tree.code;report[5]=list.count;
+    rt_free(runtime(),store);
+    rt_free(runtime(),rev);
+    rt_free(runtime(),table);
+    ntasm_ast.release(tree);
+    return 0;
+}
+
+// ---- one vertical slice of the validator pass chain --------------------
+fn clear(words:buf<u64>)->u64 {
+    words[0]=0;words[1]=0;words[2]=0;words[3]=0;return 0;
+}
+
+// Record one failing pass. A pass reports a line and a column and never a
+// byte offset, so the span is the single byte at that position: the tightest
+// span the pass actually claims, and one that two passes on the same
+// construct collide on, which push then refuses.
+fn note(list:List,source:buf<u8>,source_index:u64,code:u64,scratch:buf<u64>)->u64 {
+    let start:u64=offset_of(source,scratch[0],scratch[1]);
+    let mut stop:u64=start+1;
+    if (stop>len(source)) { stop=start; }
+    push(list,code,0,source_index,scratch[0],scratch[1],start,stop);
+    return 0;
+}
+
+// Run the first slice_passes() passes of validate.validate in validate's own
+// order and record every one of them that fails, so two independent failures
+// are both reported. The returned code and the four scratch words are those
+// of the FIRST failing pass in pipeline order, which is exactly what
+// validate.validate returns for the same tree: the single-code contract is
+// preserved and no existing caller changes. Returns 0 and writes nothing to
+// out when no pass of the slice fails, because the slice is a prefix of the
+// pipeline and not a replacement for it. Returns 800 for an unusable tree or
+// a short buffer, with no write. The scratch buffers are always released.
+export fn slice_validate(source:buf<u8>,source_index:u64,
+                         tree:ntasm_ast.Tree,out:buf<u64>,list:List)->u64 {
+    if (tree.ok==false) { return 800; }
+    if (len(out)<4) { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let saved:buf<u64>=alloc(runtime(),4);
+    if (len(scratch)!=4 || len(saved)!=4) {
+        rt_free(runtime(),saved);rt_free(runtime(),scratch);return 800;
+    }
+    let mut first:u64=0;
+    let mut recording:bool=true;
+
+    clear(scratch);let c1:u64=semantics.index(source,tree,scratch);
+    if (c1!=0) { if (first==0) { first=c1;copy4(saved,scratch); }
+        if (recording==true) { note(list,source,source_index,c1,scratch); } }
+    if (c1==800) { recording=false; }
+
+    clear(scratch);let c2:u64=targets.check(source,tree,scratch);
+    if (c2!=0) { if (first==0) { first=c2;copy4(saved,scratch); }
+        if (recording==true) { note(list,source,source_index,c2,scratch); } }
+    if (c2==800) { recording=false; }
+
+    clear(scratch);let c3:u64=versions.check(source,tree,scratch);
+    if (c3!=0) { if (first==0) { first=c3;copy4(saved,scratch); }
+        if (recording==true) { note(list,source,source_index,c3,scratch); } }
+    if (c3==800) { recording=false; }
+
+    clear(scratch);let c4:u64=features.check(source,tree,scratch);
+    if (c4!=0) { if (first==0) { first=c4;copy4(saved,scratch); }
+        if (recording==true) { note(list,source,source_index,c4,scratch); } }
+    if (c4==800) { recording=false; }
+
+    clear(scratch);let c5:u64=callable_names.check(source,tree,scratch);
+    if (c5!=0) { if (first==0) { first=c5;copy4(saved,scratch); }
+        if (recording==true) { note(list,source,source_index,c5,scratch); } }
+    if (c5==800) { recording=false; }
+
+    clear(scratch);let c6:u64=symbol_names.check(source,tree,scratch);
+    if (c6!=0) { if (first==0) { first=c6;copy4(saved,scratch); }
+        if (recording==true) { note(list,source,source_index,c6,scratch); } }
+    if (c6==800) { recording=false; }
+
+    clear(scratch);let c7:u64=types.check(source,tree,scratch);
+    if (c7!=0) { if (first==0) { first=c7;copy4(saved,scratch); }
+        if (recording==true) { note(list,source,source_index,c7,scratch); } }
+    if (c7==800) { recording=false; }
+
+    clear(scratch);let c8:u64=constant_types.check(source,tree,scratch);
+    if (c8!=0) { if (first==0) { first=c8;copy4(saved,scratch); }
+        if (recording==true) { note(list,source,source_index,c8,scratch); } }
+    if (c8==800) { recording=false; }
+
+    if (first!=0) {
+        out[0]=saved[0];out[1]=saved[1];out[2]=saved[2];out[3]=saved[3];
+    }
+    finalize(list);
+    rt_free(runtime(),saved);
+    rt_free(runtime(),scratch);
+    return first;
+}
+
+fn copy4(dst:buf<u64>,src:buf<u64>)->u64 {
+    dst[0]=src[0];dst[1]=src[1];dst[2]=src[2];dst[3]=src[3];return 0;
+}
+
+// ---- hook points the owners must add ----------------------------------
+// parser.nova, three lines of shape, none of them behaviour changing for a
+// valid source:
+//   1. Parser gains a diagnostics handle beside p.code: on error(), instead
+//      of returning early when p.code!=0, call diagnostics.push with the
+//      diagnostic it just built, and keep p.code as the first nonzero code.
+//   2. Parser gains the resync set and drops the p.code==0 gate on the four
+//      declaration loops (source_tree, block, meta_block, section_decl): on a
+//      failed statement or declaration call diagnostics.resync_boundary over
+//      p.tokens and set p.cursor to the returned resume index, clearing
+//      p.split_gt, then continue the loop. Today diagnostics.resync_boundary
+//      supplies that decision from diagnostics.nova and this module's collect
+//      re-derives the same boundaries by probing each construct; the probe
+//      goes away when the loop is resynchronised in place.
+//   3. ntasm_ast.Tree gains the list: three fields diag_words, diag_count and
+//      diag_dropped, filled from the Parser handle, and release frees them
+//      next to token_words and node_words. The flat eight-word entry layout
+//      is the contract, so no field order is imposed on the struct.
+// validate.nova, one change:
+//   replace the chain of "if code==0" blocks by a loop over a declared pass
+//   table, recording every failure into a list and returning the first
+//   nonzero code with that pass's scratch words. diagnostics.slice_validate
+//   is that loop for the first eight passes and proves the code and scratch
+//   contract is preserved; the remaining twenty-five passes are the same
+//   change repeated.
+//
+// Not attempted here, and still missing: expression level recovery inside a
+// statement, recovery inside a parenthesised list, set literal or macro
+// parameter list, a diagnostic for the second and later errors of one
+// statement, and any report of the first error of a construct that swallowed
+// its successor because a brace was left open.

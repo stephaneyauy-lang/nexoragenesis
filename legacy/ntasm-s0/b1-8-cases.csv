@@ -1,0 +1,31 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+positive,B18-C00,file,legacy/ntasm-s0/b1-8/B18-C00-minimal-text-header.ntasm,53,54e767e5d6a26fb11626d5130aa2e7ca6b91a3f4b18fb16d73f460a29b82c47f,NG_S0_T08_OK
+positive,B18-C01,file,legacy/ntasm-s0/b1-8/B18-C01-tabs-comments-state.ntasm,102,57665bf6c615d35066aea6799e5dff457e2462605f35c8ccc7c04e0aa23975e8,NG_S0_T08_OK
+header,B18-R00,file,legacy/ntasm-s0/b1-8/B18-R00-missing-text-header.ntasm,36,177c0dbbfb869c4e65662b9c53b98ff479cfb1c5090204eb41eb4df54343e572,NGS0 E200 L0004 C0001 O00000024
+header,B18-R01,file,legacy/ntasm-s0/b1-8/B18-R01-wrong-first-token.ntasm,54,805fa1b1aeaf082bed1d553d6d482fc43b9c1cd9f4a952ebea84631513fad54c,NGS0 E200 L0004 C0001 O00000024
+header,B18-R02,file,legacy/ntasm-s0/b1-8/B18-R02-wrong-section-name.ntasm,53,524b44c776f7ef7bba2ea5309e03132d4f1d7ee9d4a171c0f255155c9b9d6a8f,NGS0 E200 L0004 C0009 O0000002C
+header,B18-R03,file,legacy/ntasm-s0/b1-8/B18-R03-wrong-rights.ntasm,53,b8ad4ef1abcc490bad41e6b5991cb83a835f07ed5041f636ef73170cef71a51a,NGS0 E200 L0004 C000F O00000032
+header,B18-R04,file,legacy/ntasm-s0/b1-8/B18-R04-missing-section-name.ntasm,44,8c8b5d57e7f1f372d739c0490f67366cae06ed405815fdf31e380024ad4c159c,NGS0 E201 L0004 C0008 O0000002B
+header,B18-R05,file,legacy/ntasm-s0/b1-8/B18-R05-missing-rights.ntasm,50,f0adce6f4f06f2a160ff157581cc649683da5ff7569d54cf3dbe82538f985fab,NGS0 E201 L0004 C000E O00000031
+header,B18-R06,file,legacy/ntasm-s0/b1-8/B18-R06-extra-header-token.ntasm,59,55512867b2d80ef8d292d0f5e210f5a06e71e32af5e6c16d4bd1988e9605206e,NGS0 E201 L0004 C0012 O00000035
+header,B18-R07,file,legacy/ntasm-s0/b1-8/B18-R07-missing-ws-after-section.ntasm,52,5147e3a404933271bad9d514e2cc8547d56d46009ee3c004522093dcdc55ba8b,NGS0 E201 L0004 C0008 O0000002B
+header,B18-R08,file,legacy/ntasm-s0/b1-8/B18-R08-missing-ws-after-name.ntasm,52,4d84772785fb8a1091f41cf17f7388566cef9c0c2e167ce1ccd00fa91677df4f,NGS0 E200 L0004 C0009 O0000002C
+header,B18-R09,file,legacy/ntasm-s0/b1-8/B18-R09-header-punctuation.ntasm,54,5531405ab1c6d10a7c65c8ef0bdf8c51ea4b19517200beedef8eba149fffac2c,NGS0 E201 L0004 C000E O00000031
+state,B18-R10,file,legacy/ntasm-s0/b1-8/B18-R10-duplicate-text.ntasm,70,8ef86406990eee4c1f8c79b9175b7b46a6520c5d52c39a6816684c2d23b9724d,NGS0 E200 L0005 C0001 O00000035
+state,B18-R11,file,legacy/ntasm-s0/b1-8/B18-R11-rdata-too-early.ntasm,70,2b71ae1961040ef762803288f916e48232380184f45b1e01bdbfcafceaec53c2,NGS0 E200 L0005 C0001 O00000035
+state,B18-R12,file,legacy/ntasm-s0/b1-8/B18-R12-reloc-source.ntasm,70,6341a1ce5218e1d95a4661784ef747273fcc0e9e325f19dab2a9162ba4759d22,NGS0 E200 L0005 C0001 O00000035
+state,B18-R13,file,legacy/ntasm-s0/b1-8/B18-R13-preamble-in-text.ntasm,65,c8ee3c31a7135c94ab64a93dd13cb6cbb887fb4a9fea97c4aa773169a6977569,NGS0 E200 L0005 C0001 O00000035
+lexical,B18-R14,file,legacy/ntasm-s0/b1-8/B18-R14-header-16-tokens.ntasm,79,7679242c938edd5b76d70679cada2587f8c63341ce9217af82ccbf01d9d5384e,NGS0 E201 L0004 C0012 O00000035
+lexical,B18-R15,file,legacy/ntasm-s0/b1-8/B18-R15-header-17-tokens.ntasm,81,06d94e7366f109854d67c2c5a5c3c870d628e232d0a6bf70db7502ab5a676b5a,NGS0 E101 L0004 C002C O0000004F
+lexical,B18-R16,file,legacy/ntasm-s0/b1-8/B18-R16-header-ident-31.ntasm,77,8b21709d25bfab982477f41191bdb4783d326a369451c51e45270e996968afa2,NGS0 E200 L0004 C0001 O00000024
+lexical,B18-R17,file,legacy/ntasm-s0/b1-8/B18-R17-header-ident-32.ntasm,78,70a83658f73da33fbe86565e327f1375ccd6918fe8fbd8f1d788a59a59531310,NGS0 E101 L0004 C0020 O00000043
+data,B18-R18,file,legacy/ntasm-s0/b1-8/B18-R18-byte-in-text.ntasm,60,cb1d9ac95a9a3722a12d8ebdab0254e69e7bf32ac22ec824ccc8c3aacf4725e1,NGS0 E202 L0005 C0001 O00000035
+data,B18-R19,file,legacy/ntasm-s0/b1-8/B18-R19-word-in-text.ntasm,60,ae7b02d7b665068b8d6268af5045d3dfd2de22ca44d52f27220e2a92bfca95fa,NGS0 E202 L0005 C0001 O00000035
+data,B18-R20,file,legacy/ntasm-s0/b1-8/B18-R20-dword-in-text.ntasm,61,011a03206c69c2746dd97f6daccca06fc2138b29ea83dc9a1f0c2f2b6781fec5,NGS0 E202 L0005 C0001 O00000035
+data,B18-R21,file,legacy/ntasm-s0/b1-8/B18-R21-qword-in-text.ntasm,61,8ce1dc190460622980d269a8b64425d54531fb1b063840b4fa6703ab9464dae6,NGS0 E202 L0005 C0001 O00000035
+data,B18-R22,file,legacy/ntasm-s0/b1-8/B18-R22-ascii-in-text.ntasm,63,60c4a46b4dbc47bb0d8ddec2d26519e96ada4f37efc56b7d2d3bd3db37267cb3,NGS0 E202 L0005 C0001 O00000035
+data,B18-R23,file,legacy/ntasm-s0/b1-8/B18-R23-utf16z-in-text.ntasm,64,6364ad4f788eae615b061947c640b05cf98f5249423c2ffeb5a42edbfa7a6416,NGS0 E202 L0005 C0001 O00000035
+data,B18-R24,file,legacy/ntasm-s0/b1-8/B18-R24-zero-in-text.ntasm,60,04b08f19975a8fbdbccafd02dc74454f23a77b9129899e4c63dd7abe4433ec30,NGS0 E202 L0005 C0001 O00000035
+unsupported,B18-R25,file,legacy/ntasm-s0/b1-8/B18-R25-label-not-yet-supported.ntasm,60,7aba6c39374dd13e47c8aef5d90a7385a397ce3ad5fa3e4185b6c7ab55c20b7f,NGS0 E400 L0005 C0001 O00000035
+unsupported,B18-R26,file,legacy/ntasm-s0/b1-8/B18-R26-align-not-yet-supported.ntasm,62,aad22d734d71953baba024133b739413746629205f4c6f36f9f1758c03effb6b,NGS0 E400 L0005 C0001 O00000035
+unsupported,B18-R27,file,legacy/ntasm-s0/b1-8/B18-R27-mnemonic-not-yet-supported.ntasm,57,d60323062eaf3f59d35c9fc44babe6e0bfe9da56f6da566d5e89bd4728130606,NGS0 E400 L0005 C0001 O00000035

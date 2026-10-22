@@ -1,0 +1,110 @@
+module nova_machine_abi2_entry;
+import nova_language_parse;
+import nova_machine_abi2;
+import machine_pipeline;
+import machine_ir;
+import ntasm_ast;
+import ntasm_parser;
+import ntir;
+// Independent re-read of the real declaration text: every emitted record's
+// claimed NTIR identity/origin must reproduce its normative coordinates.
+fn provenance(text:buf<u8>,size:u64,words:buf<u64>,report:buf<u64>)->u64 {
+    let exact:buf<u8>=alloc(runtime(),size);let mut i:u64=0;
+    while i<size { exact[i]=text[i];i=i+1; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(exact,1);
+    let capacity:u64=ntir.HEADER_WORDS()+tree.node_count*ntir.NODE_WORDS();
+    let image:buf<u64>=alloc(runtime(),capacity);
+    let mut code:u64=800;let mut checked:u64=0;let mut failures:u64=0;
+    if tree.ok { code=ntir.build(exact,tree,image,capacity); }
+    if code==0 {
+        let mut r:u64=1;
+        while r<=words[3] {
+            let p:u64=machine_ir.HEADER_WORDS()+(r-1)*machine_ir.NODE_WORDS();
+            let mut origin:u64=words[p+1];if origin==0 { origin=words[p+18]; }
+            let mut good:bool=origin>0 && origin<=tree.node_count;
+            if good {
+                let q:u64=ntir.HEADER_WORDS()+(origin-1)*ntir.NODE_WORDS();
+                good=words[p+2]==image[q+2] && words[p+3]==image[q+3];
+            }
+            if good==false {
+                failures=failures+1;
+                if code==0 { report[0]=words[p+2];report[1]=words[p+3];report[2]=971;report[3]=r;code=971; }
+            }
+            checked=checked+1;r=r+1;
+        }
+    }
+    report[11]=checked;report[12]=failures;
+    rt_free(runtime(),image);ntasm_ast.release(tree);rt_free(runtime(),tree);rt_free(runtime(),exact);
+    return code;
+}export fn main(source:buf<u8>,mode:u64,index:u64,words:buf<u64>,capacity:u64,
+               out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<14 || len(length)<1 { return 800; }
+    length[0]=0;
+    let nodes:buf<u64>=alloc(runtime(),65536);
+    let scopes:buf<u64>=alloc(runtime(),4096);
+    let binds:buf<u64>=alloc(runtime(),8192);
+    let fields:buf<u64>=alloc(runtime(),8192);
+    let text:buf<u8>=alloc(runtime(),65536);
+    let text_length:buf<u64>=alloc(runtime(),1);
+    let mut code:u64=nova_language_parse.parse(source,nodes,scopes,binds,fields,report);
+    let mut passes:u64=0;let mut checked:u64=0;let mut provenance_failures:u64=0;
+    report[8]=1;report[13]=0;
+    if code==0 {
+        let mut count:u64=report[5];let mut bound:u64=capacity;
+        if mode==4 {
+            if index==0 { count=0;report[13]=1; }
+            if index==1 { count=len(nodes)/16+1;report[13]=1; }
+            if index==2 { bound=10;report[13]=1; }
+            if index==10 { bound=capacity+1;report[13]=1; }
+            if index==12 { bound=1024;report[13]=1; }
+            let mut i:u64=1;let mut changed:bool=false;let mut foreign:u64=0;let mut last_name:u64=0;
+            while i<=count && i<=len(nodes)/16 {
+                let at:u64=(i-1)*16;let kind:u64=nodes[at];
+                if kind==6 && foreign==0 { foreign=nodes[at+15]; }
+                if kind==14 { last_name=i; }
+                if changed==false {
+                    if index==3 && kind==14 { nodes[at+15]=count+1;changed=true; }
+                    if index==4 && kind==17 { nodes[at+15]=count+1;changed=true; }
+                    if index==5 && kind==9 { nodes[at+14]=10;changed=true; }
+                    if index==7 && kind==9 { nodes[at+4]=i;changed=true; }
+                    if index==8 && kind==15 { nodes[at+13]=4;changed=true; }
+                    if index==9 && kind==11 { nodes[at+2]=0;changed=true; }
+                }
+                i=i+1;
+            }
+            if index==6 && foreign!=0 && last_name!=0 { nodes[(last_name-1)*16+15]=foreign;changed=true; }
+            if changed { report[13]=1; }
+        }
+        report[8]=2;
+        let mut repeats:u64=1;
+        if mode==3 { repeats=index;if repeats==0 || repeats>128 { code=972; } }
+        if mode==4 { text_length[0]=777; }
+        while passes<repeats && code==0 {
+            if mode==4 && index==11 {
+                let short:buf<u8>=alloc(runtime(),1);
+                code=nova_machine_abi2.lower_abi2(source,nodes,count,short,text_length,words,bound,report);
+                rt_free(runtime(),short);report[13]=1;
+            } else { code=nova_machine_abi2.lower_abi2(source,nodes,count,text,text_length,words,bound,report); }
+            passes=passes+1;
+        }
+        if code==0 && mode!=4 {
+            code=provenance(text,text_length[0],words,report);checked=report[11];provenance_failures=report[12];
+        }
+        if code==0 && mode==2 {
+            if text_length[0]>len(out) { code=972; }
+            else {
+                let mut i:u64=0;while i<text_length[0] { out[i]=text[i];i=i+1; }
+                length[0]=text_length[0];report[10]=machine_ir.FLAG_EXPORT();
+            }
+        }
+        if code==0 && (mode==1 || mode==3) {
+            code=machine_pipeline.build_pe_from_image(words,words[3],text,out,length,report);
+        }
+    }
+    if mode==4 { report[11]=text_length[0]; }
+    rt_free(runtime(),text_length);rt_free(runtime(),text);rt_free(runtime(),fields);
+    rt_free(runtime(),binds);rt_free(runtime(),scopes);rt_free(runtime(),nodes);
+    if mode!=4 { report[11]=checked;report[12]=provenance_failures; }
+    if mode==3 { report[12]=passes; }
+    return code;
+}

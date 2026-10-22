@@ -1,0 +1,11 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+line-priority,LINE-reg,file,legacy/ntasm-s0/line-priority/LINE-reg.ntasm,137,9a18ee25d96b00ab5159642891d59445b27c96db84c24a57ee162b00e4df519b,NGS0 E400 L0007 C0005 O00000044
+line-priority,LINE-extra,file,legacy/ntasm-s0/line-priority/LINE-extra.ntasm,132,67e072877744d104720d7464579149d3b047e89145938789bea327b16600d4f5,NGS0 E201 L0007 C0005 O00000044
+line-priority,LINE-range,file,legacy/ntasm-s0/line-priority/LINE-range.ntasm,140,64244b780f5ada4db3d4881230529c4ccb6e8095f5994a8c37cd4e9b37626b49,NGS0 E401 L0007 C000A O00000049
+line-priority,LINE-opcode,file,legacy/ntasm-s0/line-priority/LINE-opcode.ntasm,132,dc670e12710ff137e37f370d3225f0ad4172c2e03585fec18f8a7a846b99f89f,NGS0 E400 L0007 C0001 O00000040
+line-priority,LINE-reg-unclosed,file,legacy/ntasm-s0/line-priority/LINE-reg-unclosed.ntasm,136,5a73b1184b1aed44766cf14cda155b68bcded55b6f12e6bc258b4d525e66219a,NGS0 E400 L0007 C0005 O00000044
+line-priority,DATA-extra,file,legacy/ntasm-s0/line-priority/DATA-extra.ntasm,139,62034b54ee2897dced7536722bca399482639254ee588841cf9ffc2610fd0b47,NGS0 E201 L0009 C000C O0000006E
+line-priority,DATA-range,file,legacy/ntasm-s0/line-priority/DATA-range.ntasm,138,65e239ac027be429781cd1fc0c5eb933af2f18f31cfde519044de7b5a8ee67fc,NGS0 E401 L0009 C0006 O00000068
+line-priority,DATA-lex,file,legacy/ntasm-s0/line-priority/DATA-lex.ntasm,134,ee3760a7f9ebe833fe961d8e31377b79a8410c0d6df491ecf63f026830f1f37c,NGS0 E102 L0009 C000A O0000006C
+line-priority,DATA-unclosed,file,legacy/ntasm-s0/line-priority/DATA-unclosed.ntasm,133,b499b75408a555a1aa3d38c03a7be67964ea191094e0e7259122d6a70a957786,NGS0 E102 L0009 C0009 O0000006B
+line-priority,DATA-double,file,legacy/ntasm-s0/line-priority/DATA-double.ntasm,139,cbaa9823a20d02e914658c8d953c1607610e75d6db136a000925be1e41797d5d,NGS0 E102 L0009 C0009 O0000006B

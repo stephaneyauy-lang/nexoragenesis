@@ -1,0 +1,1221 @@
+module ntir;
+
+// NTIR, « Nexora Typed Instruction IR » — the first typed intermediate
+// representation in this tree. spec/ntasm/ntasm.md §14 declares it and §17 item 6
+// asks for a versioned schema before implementation; the schema is below, in
+// code, and the gate confronts it against the tree it describes.
+//
+// WHAT THIS IS NOT. It is not a Machine IR: no instruction is selected, no
+// encoding constraint is resolved, no block offset exists here. Those belong
+// to the Machine IR, which is a later wave. It is also not a renamed AST. The
+// AST record (ast.nova) is kind, span, position, three links and one aux word,
+// and the AST node carries NO type at all: a parameter is a direction word, a
+// name, a type node and an optional register name, and nothing in the tree
+// says how wide any of them is. Five of the sixteen words of an NTIR node are
+// facts the AST does not hold anywhere, and they are computed here, not
+// copied:
+//
+//   type_width     bits, 0 untyped, 80 for a memory descriptor
+//   type_signed    0 unsigned, 1 signed, 2 no signedness
+//   memory_space   the pointer_spaces bit, 0 when the node names no space
+//   reg_class      0 none, 1..16 the register_widths physical family,
+//                  17 memory, 18 immediate, 19 relocatable, 20 control
+//                  register, 21 label
+//   child_count    the length of the owned child chain
+//
+// Six of the fifty-three kinds below do not exist in the AST, because the AST
+// conflates them: kind 28 is both an abi clause and a call statement, and kind
+// 32 is both an instruction and a label. Splitting a conflated kind is a
+// change the AST cannot express, so it is not a rename either.
+//
+// ---------------------------------------------------------------------------
+// THE NODE KIND TABLE IS A NEW NUMBERING, AND IT IS NOT THE PARSER'S.
+//
+// The parser numbers AST node kinds 1 to 96 (ast.nova) and roughly thirty
+// modules index those numbers directly, so shifting or reusing one would
+// silently change every verdict in the suite. NTIR kinds therefore start at
+// 1024, a band no parser kind and no published Nova diagnostic code can
+// reach: the highest AST kind is 96 and the highest published Nova code is
+// 844. KIND_BASE is exported and the gate reads it back, so moving the base is
+// a red and not a silent redefinition of every node in the tree.
+// ---------------------------------------------------------------------------
+//
+// THE IMAGE. One flat buffer of u64, header first, then one sixteen-word
+// record per node, node ids one-based.
+//
+//   header, HEADER_WORDS words
+//     0 magic           NTIR_MAGIC, the format tag
+//     1 major           FORMAT_MAJOR
+//     2 minor           FORMAT_MINOR
+//     3 node_count
+//     4 root            one-based id of the unit node, 0 when there is none
+//     5 stride          NODE_WORDS
+//     6 ast_node_count  the AST this image was lowered from
+//     7 typed_count     nodes carrying at least one typed word
+//
+//   node, NODE_WORDS words, at HEADER_WORDS + (id-1)*NODE_WORDS
+//     0 kind            an NTIR kind, 1024 and up
+//     1 source          copied from the AST
+//     2 line            copied from the AST
+//     3 column          copied from the AST
+//     4 start           copied from the AST
+//     5 end             copied from the AST
+//     6 ast_kind        the AST kind this node was lowered from
+//     7 ast_id          the AST node id
+//     8 first_child     copied
+//     9 last_child      copied
+//     10 next_sibling   copied
+//     11 child_count    computed: the length of the owned child chain
+//     12 type_width     computed
+//     13 type_signed    computed
+//     14 memory_space   computed
+//     15 reg_class      computed
+//
+// NODE IDS ARE AST IDS. This is a deliberate narrowing, not a convenience: it
+// makes "a node was dropped, duplicated or reordered" a checkable property of
+// two flat arrays rather than a claim about a traversal, and the gate makes it
+// one. It does not weaken the IR: the ids coincide and the CONTENT does not,
+// which is the whole difference between a relabelled AST and a typed one.
+//
+// DETERMINISM. serialize emits one fixed-field-order line per node in
+// ascending id order, decimal only, no hash, no address, no timestamp, no
+// path, no locale. The same AST gives byte-identical text on every run and
+// after every rebuild of this module, which is what lets the gate golden it.
+
+import ntasm_ast;
+import register_widths;
+
+// ---- format constants -----------------------------------------------------
+fn NTIR_MAGIC()->u64 { return 0x4E544952; }
+export fn FORMAT_MAJOR()->u64 { return 0; }
+export fn FORMAT_MINOR()->u64 { return 1; }
+export fn KIND_BASE()->u64 { return 1024; }
+export fn HEADER_WORDS()->u64 { return 8; }
+export fn NODE_WORDS()->u64 { return 16; }
+
+// ---- AST node words, read directly ---------------------------------------
+//
+// The words are read out of tree.node_words and not through ntasm_ast.node_at.
+// That is load bearing and the reason is written down in stub_table.nova:9-13:
+// a record returned by value across a module boundary is a runtime allocation
+// this bootstrap never reclaims, so a pass that reads every node through
+// node_at exhausts the buffer table on a large tree. This pass walks every
+// node of every tree it is given, so direct word reads are the only form it
+// can use.
+fn akind(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12]; }
+fn atoken_begin(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+1]; }
+fn asource(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+3]; }
+fn aline(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+4]; }
+fn acolumn(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+5]; }
+fn astart(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+6]; }
+fn aend(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+7]; }
+fn afirst(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+8]; }
+fn alast(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+9]; }
+fn anext(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+10]; }
+fn aaux(tree:ntasm_ast.Tree,id:u64)->u64 { let n:buf<u64>=tree.node_words;return n[(id-1)*12+11]; }
+fn token_kind(tree:ntasm_ast.Tree,index:u64)->u64 { let t:buf<u64>=tree.token_words;return t[index*9]; }
+fn tok_int()->u64 { return 258; }
+fn tok_string()->u64 { return 259; }
+
+// ---- NTIR node words ------------------------------------------------------
+fn base_of(id:u64)->u64 { return HEADER_WORDS()+(id-1)*NODE_WORDS(); }
+fn w_kind(words:buf<u64>,id:u64)->u64 { return words[base_of(id)]; }
+fn w_line(words:buf<u64>,id:u64)->u64 { return words[base_of(id)+2]; }
+fn w_column(words:buf<u64>,id:u64)->u64 { return words[base_of(id)+3]; }
+fn w_ast_id(words:buf<u64>,id:u64)->u64 { return words[base_of(id)+7]; }
+fn w_first(words:buf<u64>,id:u64)->u64 { return words[base_of(id)+8]; }
+fn w_next(words:buf<u64>,id:u64)->u64 { return words[base_of(id)+10]; }
+
+// ---- typed vocabulary -----------------------------------------------------
+export fn CLASS_NONE()->u64 { return 0; }
+export fn CLASS_MEMORY()->u64 { return 17; }
+export fn CLASS_IMMEDIATE()->u64 { return 18; }
+export fn CLASS_RELOCATABLE()->u64 { return 19; }
+export fn CLASS_CONTROL()->u64 { return 20; }
+export fn CLASS_LABEL()->u64 { return 21; }
+export fn CLASS_LIMIT()->u64 { return 21; }
+export fn FAMILY_LIMIT()->u64 { return 16; }
+export fn WIDTH_MEMORY()->u64 { return 80; }
+export fn WIDTH_POINTER()->u64 { return 64; }
+export fn SIGNED_UNSIGNED()->u64 { return 0; }
+export fn SIGNED_SIGNED()->u64 { return 1; }
+export fn SIGNED_NONE()->u64 { return 2; }
+
+// A width this module will accept in a typed word. 0 is untyped, which is a
+// real answer and not an absence: a block carries no width and says so.
+fn width_known(width:u64)->bool {
+    if width==0 { return true; }
+    if width==1 { return true; }
+    if width==8 { return true; }
+    if width==16 { return true; }
+    if width==32 { return true; }
+    if width==64 { return true; }
+    return width==80;
+}
+
+// The six pointer spaces of spec/ntasm/ntasm.md §7, in the bit order
+// pointer_spaces.nova:4 fixes. The gate confronts every space word against
+// pointer_spaces.check at run time and not against this table.
+fn space_of(source:buf<u8>,start:u64,end:u64)->u64 {
+    let user:buf<u8>="user";if same(source,start,end,user) { return 1; }
+    let kernel:buf<u8>="kernel";if same(source,start,end,kernel) { return 2; }
+    let physical:buf<u8>="physical";if same(source,start,end,physical) { return 4; }
+    let mmio:buf<u8>="mmio";if same(source,start,end,mmio) { return 8; }
+    let device:buf<u8>="device";if same(source,start,end,device) { return 16; }
+    let firmware:buf<u8>="firmware";if same(source,start,end,firmware) { return 32; } return 0;
+}
+export fn space_known(space:u64)->bool {
+    if space==1 { return true; } if space==2 { return true; }
+    if space==4 { return true; } if space==8 { return true; }
+    if space==16 { return true; } return space==32;
+}
+
+// Byte-wise comparison of a source range against a literal, with bounds. Every
+// name test in this module shares it.
+fn same(source:buf<u8>,a_start:u64,a_end:u64,text:buf<u8>)->bool {
+    if a_start>a_end || a_end>len(source) { return false; }
+    if (a_end-a_start)!=len(text) { return false; }
+    let mut i:u64=0;
+    while i<len(text) { if source[a_start+i]!=text[i] { return false; } i=i+1; }
+    return true;
+}
+fn name_node(tree:ntasm_ast.Tree,id:u64)->bool {
+    if id==0 || id>tree.node_count { return false; }
+    return akind(tree,id)==90;
+}
+fn spannable(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->bool {
+    if id==0 || id>tree.node_count { return false; }
+    return astart(tree,id)<=aend(tree,id) && aend(tree,id)<=len(source);
+}
+
+// The length of the child chain starting at first, or 0 when the chain leaves
+// the tree. A chain longer than the tree returns 0, so a malformed tree
+// produces an answer a caller can refuse rather than a count it would believe.
+fn chain(tree:ntasm_ast.Tree,first:u64)->u64 {
+    if first==0 { return 0; }
+    let mut id:u64=first;
+    let mut count:u64=0;
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        count=count+1;
+        if count>tree.node_count { return 0; }
+        id=anext(tree,id);
+    }
+    return count;
+}
+
+// The child of parent at a one-based ordinal, or 0. Out of range is 0, so a
+// caller that asked for a child the parent does not have learns it did not.
+fn child(tree:ntasm_ast.Tree,parent:u64,ordinal:u64)->u64 {
+    if parent==0 || parent>tree.node_count || ordinal==0 { return 0; }
+    let mut id:u64=afirst(tree,parent);
+    let mut index:u64=1;
+    while id!=0 && index<ordinal {
+        if id>tree.node_count { return 0; }
+        id=anext(tree,id);
+        index=index+1;
+    }
+    if id>tree.node_count { return 0; }
+    return id;
+}
+fn first_child_of_kind(tree:ntasm_ast.Tree,parent:u64,kind:u64)->u64 {
+    if parent==0 || parent>tree.node_count { return 0; }
+    let mut id:u64=afirst(tree,parent);
+    while id!=0 {
+        if id>tree.node_count { return 0; }
+        if akind(tree,id)==kind { return id; }
+        id=anext(tree,id);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// The scalar type catalogue, read off the source text of the name node.
+// types.nova:8 owns this vocabulary and the gate re-measures every width
+// against nt_frontend_type_name of the C oracle (frontend.c:777,
+// frontend.h:64-76), so the two cannot drift apart unnoticed. Width 0 is the
+// answer for `never`, which is a real type and not a missing one, and that is
+// why the answer carries a second bit: `known` is false for a name outside the
+// catalogue and true for `never`.
+// ---------------------------------------------------------------------------
+struct Scalar { width:u64, signed:u64, known:bool }
+// `text` IS CONSUMED. It is a literal buffer the caller created for this one
+// test, and it is released HERE -- on a match and on a refusal alike -- because
+// a scalar test runs once per type node, and one buffer left behind per test is
+// one handle out of the table for the rest of the translation. The measured
+// profile of the 52-source closure put ~7240 live buffers on each of these
+// sites and 6935 live Scalar records, against a table of 65536 handles. Only an
+// OWNED buffer may be passed here; a borrowed one is not this function's to
+// release, and no caller in this module does that.
+fn scalar_test(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    let hit:bool=same(source,start,end,text);
+    rt_free(runtime(),text);
+    return hit;
+}
+fn scalar_of(source:buf<u8>,start:u64,end:u64)->Scalar {
+    let a:buf<u8>="u8";if scalar_test(source,start,end,a) { return Scalar{width:8,signed:0,known:true}; }
+    let b:buf<u8>="u16";if scalar_test(source,start,end,b) { return Scalar{width:16,signed:0,known:true}; }
+    let c:buf<u8>="u32";if scalar_test(source,start,end,c) { return Scalar{width:32,signed:0,known:true}; }
+    let d:buf<u8>="u64";if scalar_test(source,start,end,d) { return Scalar{width:64,signed:0,known:true}; }
+    let e:buf<u8>="i8";if scalar_test(source,start,end,e) { return Scalar{width:8,signed:1,known:true}; }
+    let f:buf<u8>="i16";if scalar_test(source,start,end,f) { return Scalar{width:16,signed:1,known:true}; }
+    let g:buf<u8>="i32";if scalar_test(source,start,end,g) { return Scalar{width:32,signed:1,known:true}; }
+    let h:buf<u8>="i64";if scalar_test(source,start,end,h) { return Scalar{width:64,signed:1,known:true}; }
+    let i:buf<u8>="bool";if scalar_test(source,start,end,i) { return Scalar{width:1,signed:0,known:true}; }
+    let j:buf<u8>="never";if scalar_test(source,start,end,j) { return Scalar{width:0,signed:2,known:true}; }
+    return Scalar{width:0,signed:2,known:false};
+}
+
+// ---------------------------------------------------------------------------
+// THE KIND TABLE. Fifty-three entries, in the order the gate reads them back.
+// Entry i names the NTIR kind, the AST kind it is lowered from, and the aux
+// value the parser must carry for the mapping to apply. The AST kind is 0 on
+// the two entries that need a predicate, because AST kind 28 lowers to two
+// NTIR kinds and AST kind 32 lowers to two, and the predicate is in the code
+// that consumes the table.
+// ---------------------------------------------------------------------------
+fn ANY_AUX()->u64 { return 18446744073709551615; }
+fn k_unit()->u64 { return 1024; }
+fn k_module()->u64 { return 1025; }
+fn k_target()->u64 { return 1026; }
+fn k_versions()->u64 { return 1027; }
+fn k_version_entry()->u64 { return 1028; }
+fn k_default_abi()->u64 { return 1029; }
+fn k_output()->u64 { return 1030; }
+fn k_features()->u64 { return 1031; }
+fn k_import()->u64 { return 1032; }
+fn k_const()->u64 { return 1033; }
+fn k_comptime()->u64 { return 1034; }
+fn k_comptime_item()->u64 { return 1035; }
+fn k_macro()->u64 { return 1036; }
+fn k_macro_param()->u64 { return 1037; }
+fn k_stub_table()->u64 { return 1038; }
+fn k_stub_entry()->u64 { return 1039; }
+fn k_section()->u64 { return 1040; }
+fn k_function()->u64 { return 1041; }
+fn k_parameter()->u64 { return 1042; }
+fn k_effects()->u64 { return 1043; }
+fn k_clobbers()->u64 { return 1044; }
+fn k_requires()->u64 { return 1045; }
+fn k_ensures()->u64 { return 1046; }
+fn k_data()->u64 { return 1047; }
+fn k_block()->u64 { return 1048; }
+fn k_let()->u64 { return 1049; }
+fn k_abi_clause()->u64 { return 1050; }
+fn k_call()->u64 { return 1051; }
+fn k_return()->u64 { return 1052; }
+fn k_if()->u64 { return 1053; }
+fn k_expand()->u64 { return 1054; }
+fn k_instruction()->u64 { return 1055; }
+fn k_label()->u64 { return 1056; }
+fn k_predicate()->u64 { return 1057; }
+fn k_memory_operand()->u64 { return 1058; }
+fn k_expr()->u64 { return 1059; }
+fn k_type()->u64 { return 1060; }
+fn k_meta_block()->u64 { return 1061; }
+fn k_meta_let()->u64 { return 1062; }
+fn k_meta_if()->u64 { return 1063; }
+fn k_meta_for()->u64 { return 1064; }
+fn k_meta_return()->u64 { return 1065; }
+fn k_meta_emit()->u64 { return 1066; }
+fn k_quote()->u64 { return 1067; }
+fn k_binding_set()->u64 { return 1068; }
+fn k_align_stack()->u64 { return 1069; }
+fn k_name()->u64 { return 1070; }
+fn k_qualified()->u64 { return 1071; }
+fn k_dashed()->u64 { return 1072; }
+fn k_section_name()->u64 { return 1073; }
+fn k_literal()->u64 { return 1074; }
+fn k_stub_field()->u64 { return 1075; }
+fn k_binding()->u64 { return 1076; }
+export fn KIND_COUNT()->u64 { return 53; }
+
+// The i-th kind, one-based. No allocation: the gate reads this back once per
+// entry and the verifier calls it once per node, so an allocating form would
+// leak a buffer per call.
+export fn kind_at(index:u64)->u64 { return KIND_BASE()+index-1; }
+// The AST kind entry `index` is lowered from, or 0 for an entry whose mapping
+// needs a predicate. The gate derives every node's expected kind from this
+// column plus the predicate, so a kind added here without a lowering and a
+// kind lowered without an entry here are both reds.
+//
+// THERE ARE NO ZERO ROWS, and this paragraph used to say there were four.
+// Executed, not read: rows 27, 28, 32 and 33 answer 28, 28, 32 and 32, and
+// over index 1..53 no row answers 0. The claim that those four were zero was
+// never measured, and the arms below have never said it. What IS true is the
+// reason the claim was invented: AST kind 28 lowers to two NTIR kinds (abi
+// clause and call) and AST kind 32 to two (instruction and label), and this
+// column alone does not say which row is which. It does not need to: the
+// column carries the SHARED AST kind on both rows of a pair, and
+// kind_aux_at, three lines below, is what tells the two members apart. A
+// split is expressed by the aux column, not by a zero in this one.
+//
+// The requires and ensurES entries at 22 and 23 ARE ordinary one-to-one rows,
+// and that part was never in doubt: an earlier version of this file put a
+// zero there, the gate caught it on the first fixture with a requires clause,
+// and a requires clause lowered to no kind at all and refused the whole image
+// with 813. That failure is real and it is why the 0 in the first arm of this
+// function is confined to the out-of-range case.
+export fn kind_ast_at(index:u64)->u64 {
+    if index<1 || index>KIND_COUNT() { return 0; }
+    if index>=1 && index<=25 { return index; }
+    if index==26 { return 27; }
+    if index==27 || index==28 { return 28; }
+    if index>=29 && index<=31 { return index; }
+    if index==32 || index==33 { return 32; }
+    if index>=34 && index<=46 { return index-1; }
+    if index>=47 { return index+43; }
+    return 0;
+}
+// The aux value the parser must carry for entry `index`, or ANY_AUX when the
+// mapping ignores aux. AST kind 32 is the only one the parser varies: aux 0 is
+// an instruction and aux 1 is a label (parser.nova:400-406).
+export fn kind_aux_at(index:u64)->u64 {
+    if index<1 || index>KIND_COUNT() { return 0; }
+    // AST 28: index 27 is the abi clause and index 28 the call statement, and
+    // the column carries WHICH, so a reader of the table alone can tell the two
+    // rows apart: 1 is the abi clause because is_abi_clause is the predicate
+    // that selects it, 0 is everything else.
+    if index==27 { return 1; }
+    if index==28 { return 0; }
+    // AST 32: 0 is the instruction, 1 is the label.
+    if index==32 { return 0; }
+    if index==33 { return 1; }
+    return ANY_AUX();
+}
+fn is_abi_clause(tree:ntasm_ast.Tree,id:u64)->bool {
+    if akind(tree,id)!=28 { return false; }
+    if chain(tree,afirst(tree,id))!=1 { return false; }
+    return akind(tree,afirst(tree,id))==92;
+}
+// A kind is in the table when some entry names it, and the two split entries
+// are reachable through the predicate rather than through the AST column.
+fn kind_present(kind:u64)->bool {
+    if kind==k_abi_clause() { return true; }
+    if kind==k_label() { return true; }
+    if kind<KIND_BASE() { return false; }
+    if kind>=KIND_BASE()+KIND_COUNT() { return false; }
+    return true;
+}
+// The kind one AST node lowers to, or 0 when the AST kind is outside the table.
+fn kind_of(tree:ntasm_ast.Tree,id:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let ast:u64=akind(tree,id);
+    if ast==28 {
+        if is_abi_clause(tree,id)==true { return k_abi_clause(); }
+        return k_call();
+    }
+    if ast==32 {
+        if aaux(tree,id)==1 { return k_label(); }
+        return k_instruction();
+    }
+    // The table entry an AST kind maps to, which is NOT the AST kind and not a
+    // fixed shift either: the table holds FOUR entries for TWO AST kinds (28
+    // and 32), so the offset moves once between 31 and 33 and again between 45
+    // and 90. Every row below is the published table read back, one arm per
+    // AST kind, because a formula that happens to be right in the middle band
+    // and wrong at its two ends is exactly what a derivation gets wrong. The
+    // bounds are the parser's own: 1 to 25, 27 to 31, 32, 33 to 45 and 90 to
+    // 96, with 26 the only hole. That is 25 + 5 + 1 + 13 + 7 = 51 AST kinds.
+    //
+    // THE 32 IS NAMED BECAUSE IT IS A REAL AST KIND, and this sentence used to
+    // omit it. Every other statement about it here is true: the arm above
+    // lowers it, the table below carries rows for it, and the parser emits it
+    // for both an instruction and a label. What was missing was 32 from THIS
+    // list, which made the sentence disagree with the arms of the same
+    // function -- the counts were 50 stated against 51 emitted, and the
+    // difference was exactly the one kind named. The arms were not wrong and
+    // have not been touched; only this sentence was.
+    //
+    // The ZERO rows are NOT at 27/28 and 32/33. Executed, this column answers
+    // 28, 28, 32 and 32 on those four rows and 0 on NO row over 1..53; the
+    // four rows for the two split AST kinds each carry their kind, and it is
+    // kind_aux_at, not a zero here, that tells the two members of a pair
+    // apart. The earlier version's 22/23 was real and cost a whole image,
+    // but the 27/28 and 32/33 claim was never measured, and the split is
+    // carried by the aux column.
+    if ast>=1 && ast<=25 { return KIND_BASE()+ast-1; }
+    if ast==24 { return KIND_BASE()+23; }
+    if ast==25 { return KIND_BASE()+24; }
+    if ast==27 { return KIND_BASE()+25; }
+    if ast==29 { return KIND_BASE()+28; }
+    if ast==30 { return KIND_BASE()+29; }
+    if ast==31 { return KIND_BASE()+30; }
+    if ast>=33 && ast<=45 { return KIND_BASE()+ast; }
+    if ast>=90 && ast<=96 { return KIND_BASE()+ast-44; }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// TYPING. Each of the five typed words is computed here and nowhere else.
+//
+// register_widths.family and register_widths.width are CALLED, not
+// reimplemented, so the register class and the register width of this IR come
+// from the same module the parameter-binding passes read and cannot disagree
+// with them by construction. register_widths.family answers 0 for a spelling
+// it does not know, and this pass treats that 0 as a refusal rather than as a
+// class, because a register it cannot name is a register it cannot type.
+//
+// TYPED_DEPTH bounds the type recursion. A ptr<..> holds an element type and
+// an array holds an element type, so the walk is recursive; the bound is a
+// compiler bound like macro_expand's walk_depth_cap, and a type nested deeper
+// is refused rather than followed.
+// ---------------------------------------------------------------------------
+fn TYPED_DEPTH_CAP()->u64 { return 64; }
+
+// 817 is this module's own refusal and it has one meaning across all of its
+// call sites: this pass could not type the node it was handed. Every site that
+// returns it lives in a `type_*` function (type_form, type_node, type_memory,
+// type_operand, type_literal, type_parameter, type_register_list and the four
+// that call them), so the number names the TYPE PASS refusing, not "something
+// went wrong". That is the same form ir_image.nova gives its own codes -- a
+// zero-argument function returning the code, called by name at the site -- and
+// it is the reason the 44 sites below read E_TYPE_REFUSED() rather than 817.
+export fn E_TYPE_REFUSED()->u64 { return 817; }
+fn class_of_register(source:buf<u8>,tree:ntasm_ast.Tree,id:u64)->u64 {
+    if name_node(tree,id)==false { return CLASS_NONE(); }
+    if spannable(source,tree,id)==false { return CLASS_NONE(); }
+    return register_widths.family(source,astart(tree,id),aend(tree,id));
+}
+
+// A type node is kind 36 and its aux says which of the six forms it is
+// (types.nova:27-29 is the authority). A bare name is a scalar; a pointer names
+// a space and an element type and is 64 bits wide on this target; an array is
+// a length and an element type and carries the ELEMENT width, never a folded
+// total, because a folded total would be a value this pass cannot prove from
+// the tree; the three macro forms are not machine types and are therefore
+// untyped, which is a real answer.
+fn type_form(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>,depth:u64)->u64 {
+    if depth>TYPED_DEPTH_CAP() { return E_TYPE_REFUSED(); }
+    if id==0 || id>tree.node_count { return E_TYPE_REFUSED(); }
+    if akind(tree,id)!=36 { return E_TYPE_REFUSED(); }
+    let aux:u64=aaux(tree,id);
+    let at:u64=base_of(id);
+    if aux==0 {
+        let name_id:u64=afirst(tree,id);
+        if name_node(tree,name_id)==false || name_id!=alast(tree,id) { return E_TYPE_REFUSED(); }
+        if spannable(source,tree,name_id)==false { return E_TYPE_REFUSED(); }
+        let s:Scalar=scalar_of(source,astart(tree,name_id),aend(tree,name_id));
+        // The record is OWNED: a value returned from a function is a runtime
+        // allocation, not a view of the tree. The three fields are read once
+        // into locals and the record is released before BOTH exits below, so a
+        // type pass leaves no Scalar behind for the rest of the translation.
+        let scalar_known:bool=s.known;
+        let scalar_width:u64=s.width;
+        let scalar_sign:u64=s.signed;
+        rt_free(runtime(),s);
+        if scalar_known==false { return E_TYPE_REFUSED(); }
+        words[at+12]=scalar_width;
+        words[at+13]=scalar_sign;
+        return 0;
+    }
+    if aux==1 {
+        let space_id:u64=child(tree,id,1);
+        let element_id:u64=child(tree,id,2);
+        if name_node(tree,space_id)==false { return E_TYPE_REFUSED(); }
+        if spannable(source,tree,space_id)==false { return E_TYPE_REFUSED(); }
+        let space:u64=space_of(source,astart(tree,space_id),aend(tree,space_id));
+        if space_known(space)==false { return E_TYPE_REFUSED(); }
+        if element_id==0 { return E_TYPE_REFUSED(); }
+        if type_form(source,tree,element_id,words,depth+1)!=0 { return E_TYPE_REFUSED(); }
+        words[at+12]=WIDTH_POINTER();
+        words[at+13]=SIGNED_UNSIGNED();
+        words[at+14]=space;
+        return 0;
+    }
+    if aux==2 {
+        let element_id:u64=child(tree,id,1);
+        let length_id:u64=child(tree,id,2);
+        if element_id==0 { return E_TYPE_REFUSED(); }
+        if length_id>tree.node_count || akind(tree,length_id)!=94 { return E_TYPE_REFUSED(); }
+        // A length literal carries its value in the aux word the parser stored
+        // from the token (parser.nova:183-186), so a zero length is a zero
+        // aux. This is the shape types.nova:76-80 refuses at 351.
+        if aaux(tree,length_id)==0 { return E_TYPE_REFUSED(); }
+        return type_form(source,tree,element_id,words,depth+1);
+    }
+    // aux 3 expand<..>, 4 the $T splice and 5 an ast.* spelling are macro type
+    // forms. They are not machine types: width 0 and no signedness, and the
+    // fact that they are macros is in their kind, not in a type word.
+    words[at+12]=0;
+    words[at+13]=SIGNED_NONE();
+    return 0;
+}
+
+// A parameter is a direction word, a name, a type and an optional register
+// name (parser.nova:336-340), so its type is the second child and its register
+// the third. The width comes from the type, the class from the register, and a
+// register whose width disagrees with the declared type is refused the way
+// register_widths.check refuses it, at 318.
+fn type_parameter(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    let type_id:u64=child(tree,id,2);
+    let reg_id:u64=child(tree,id,3);
+    if type_id!=0 { if type_form(source,tree,type_id,words,1)!=0 { return E_TYPE_REFUSED(); } }
+    if reg_id==0 || reg_id>tree.node_count { return 0; }
+    if name_node(tree,reg_id)==false { return E_TYPE_REFUSED(); }
+    let family:u64=class_of_register(source,tree,reg_id);
+    if family==0 { return E_TYPE_REFUSED(); }
+    let at:u64=base_of(id);
+    words[at+15]=family;
+    if type_id==0 { return 0; }
+    let declared:u64=words[base_of(type_id)+12];
+    if declared==0 { return 0; }
+    // THE DOMAIN OF THE RULE, READ FROM THE RULE. register_widths.check asks
+    // this same question at stage 20 and applies the comparison only when the
+    // TYPE SPELL is one of the eight integer scalars: its own type_width
+    // answers 0 for bool, never and the composite forms precisely so that
+    // they stay OUT of the rule (register_widths.nova:38-42 and :251-263).
+    // This pass compared the register against the width word type_form had
+    // already written, and that word is 1 for bool -- so `in ready:bool @al`
+    // compared 1 against 8 and was refused 819. Two copies of one rule,
+    // disagreeing on exactly the cases the first copy excludes.
+    //
+    // NARROWING THIS LOSES NO REFUSAL, and that is measured rather than
+    // argued. Every genuine scalar mismatch is refused at 318 by stage 20,
+    // before this stage is reached and with a real position: u64@al, u16@ecx,
+    // u8@rdx and i64@r8b answer 318 at 4,16 / 4,16 / 4,15 / 4,16. This
+    // branch is therefore reachable only where the two copies disagree, which
+    // is why every row it ever took was a wrong refusal of a right image.
+    if aaux(tree,type_id)!=0 { return 0; }
+    let type_name:u64=afirst(tree,type_id);
+    if name_node(tree,type_name)==false { return 0; }
+    let spelled:Scalar=scalar_of(source,astart(tree,type_name),aend(tree,type_name));
+    // Same ownership as type_form: the two fields this rule reads are copied
+    // out, then the owned record is released BEFORE the normal and refusal
+    // exits, so this rule adds no Scalar to the table either.
+    let spelled_known:bool=spelled.known;
+    let spelled_width:u64=spelled.width;
+    rt_free(runtime(),spelled);
+    if spelled_known==false || spelled_width==0 || spelled_width==1 { return 0; }
+    if register_widths.width(source,astart(tree,reg_id),aend(tree,reg_id))!=declared { return 819; }
+    return 0;
+}
+
+// A function and an import both close with a return type: the first direct
+// child of kind 36 (parser.nova:411-416 and :440-446). A parameter never holds
+// a kind 36 child directly, so the first one IS the return type.
+fn type_signature(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    let type_id:u64=first_child_of_kind(tree,id,36);
+    if type_id==0 { return 0; }
+    if type_form(source,tree,type_id,words,1)!=0 { return E_TYPE_REFUSED(); }
+    return 0;
+}
+
+// A data declaration is a name, a type and an initializer (parser.nova:419-426)
+// and a const declaration has the same shape (parser.nova:448-454), so both
+// take their width from the second child.
+fn type_initializer(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    let type_id:u64=child(tree,id,2);
+    if type_id==0 { return E_TYPE_REFUSED(); }
+    return type_form(source,tree,type_id,words,1);
+}
+
+// A memory operand is kind 34 and its last child is the element type
+// (parser.nova:277-278). Its width is the 80-bit descriptor the C encoder
+// publishes (x64.h:27) and its class is memory; the space of a pointer element
+// propagates to the operand, so the space an access touches is on the access
+// and not only on the type it was written with.
+fn type_memory(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    if id==0 || id>tree.node_count { return E_TYPE_REFUSED(); }
+    if akind(tree,id)!=34 { return E_TYPE_REFUSED(); }
+    let at:u64=base_of(id);
+    let element_id:u64=alast(tree,id);
+    if element_id!=0 && element_id!=id {
+        if type_form(source,tree,element_id,words,1)!=0 { return E_TYPE_REFUSED(); }
+        let space:u64=words[base_of(element_id)+14];
+        if space!=0 { words[at+14]=space; }
+    }
+    words[at+12]=WIDTH_MEMORY();
+    words[at+13]=SIGNED_NONE();
+    words[at+15]=CLASS_MEMORY();
+    return 0;
+}
+
+// A literal is kind 94 and its token kind is the operand class: an integer is
+// an immediate, a string is neither and is left untyped. The VALUE of an
+// integer token is not read here: a width this module cannot derive from a
+// declared type is not a width it may invent.
+fn type_literal(tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    if id==0 || id>tree.node_count { return E_TYPE_REFUSED(); }
+    if akind(tree,id)!=94 { return E_TYPE_REFUSED(); }
+    let at:u64=base_of(id);
+    let kind:u64=token_kind(tree,atoken_begin(tree,id));
+    words[at+13]=SIGNED_NONE();
+    if kind==tok_int() { words[at+15]=CLASS_IMMEDIATE(); return 0; }
+    if kind==tok_string() { return 0; }
+    return E_TYPE_REFUSED();
+}
+
+// A bare name in operand position is a register and nothing else, so it is
+// typed from register_widths and nothing else. A name this pass cannot type
+// stays untyped and its parent refuses, which is the rule that keeps an
+// untyped operand out of an image that claims to be typed.
+fn type_operand_name(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    if akind(tree,id)!=90 { return 0; }
+    if spannable(source,tree,id)==false { return 0; }
+    let at:u64=base_of(id);
+    let family:u64=class_of_register(source,tree,id);
+    if family==0 { return 0; }
+    let width:u64=register_widths.width(source,astart(tree,id),aend(tree,id));
+    if width==0 { return E_TYPE_REFUSED(); }
+    words[at+12]=width;
+    words[at+13]=SIGNED_UNSIGNED();
+    words[at+15]=family;
+    return 0;
+}
+
+// A clobbers set and a binding set list register names, and those names are
+// the only names in the tree guaranteed to be registers, so they are typed
+// here.
+//
+// THE QUESTION IS ASKED OF clobber_bit, NOT OF family, AND THAT IS THE WHOLE
+// OF THIS CHANGE. The two are not the same question and the tree already says
+// so. `family` answers a REGISTER question and is closed over the sixteen
+// GPRs on purpose (register_widths.nova:127-142): every value it returns has
+// an operand width and a slot in the encoder, and rflags has neither, so it
+// answers 0 for rflags BY DESIGN and that 0 is not a gap to be filled. Asking
+// it a clobber question is what produced the refusal: `clobbers {rax,rflags}`
+// is a legal set -- `clobber_bit` answers 131072 for rflags, the bit
+// codegen.c:1277 reads to pick the frame -- and this pass refused it because
+// it asked the wrong catalogue.
+//
+// `clobber_bit` is the table for this question, and its rule is already
+// written down as the rule of a clobbers set (register_widths.nova:207-217):
+// a family is a clobber when, and only when, naming it sets a bit in the mask
+// the caller has to honour. So the refusal is now stated over that table,
+// which is the shape clobbers.check already refuses at 330.
+//
+// WHAT THIS DOES NOT DO. It does not make `family` answer for rflags, and it
+// does not invent a class for it. `type_operand_name` still leaves rflags
+// untyped -- width 0, class CLASS_NONE -- because there is no width and no
+// family to write, and a node that cannot justify a typed word must arrive
+// untyped (see the sweep note in type_node). The register is not lost: it is
+// in the name's own span, and the two modules that need it read it from
+// there through `clobber_bit`, which is what that function is for.
+//
+// THE CONTAINMENT, and it is a containment rather than a hope. For every
+// spelling `family` accepts, `clobber_bit` is `1<<(family-1)` and non-zero,
+// because its last two lines are exactly that. So this change can only ever
+// differ from the old check on a spelling `family` DECLINES, and of those
+// `clobber_bit` answers non-zero for exactly one, rflags. gsbase and fsbase
+// are oracle families this product does not honour and answer 0 here as
+// before; rip is family 16 and no spelling answers 1<<16, also as before; an
+// unknown spelling answers 0 for both. Nothing is widened.
+fn type_register_list(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    let mut entry:u64=afirst(tree,id);
+    while entry!=0 {
+        if entry>tree.node_count { return E_TYPE_REFUSED(); }
+        let name_id:u64=afirst(tree,entry);
+        if name_id!=0 && name_id<=tree.node_count && akind(tree,name_id)==90 {
+            if type_operand_name(source,tree,name_id,words)!=0 { return E_TYPE_REFUSED(); }
+            if register_widths.clobber_bit(source,astart(tree,name_id),aend(tree,name_id))==0 { return E_TYPE_REFUSED(); }
+        }
+        entry=anext(tree,entry);
+    }
+    return 0;
+}
+
+// One operand of anything that can hold one. A qualified name is a register
+// only when it is a single segment naming a known register; otherwise it is a
+// symbol, and this pass does not resolve symbols, so a symbol is not typed.
+fn type_operand(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>,depth:u64)->u64 {
+    if depth>TYPED_DEPTH_CAP() { return E_TYPE_REFUSED(); }
+    if id==0 || id>tree.node_count { return E_TYPE_REFUSED(); }
+    let ast:u64=akind(tree,id);
+    if ast==34 { return type_memory(source,tree,id,words); }
+    if ast==94 { return type_literal(tree,id,words); }
+    if ast==90 { return type_operand_name(source,tree,id,words); }
+    if ast==35 {
+        let mut child_id:u64=afirst(tree,id);
+        while child_id!=0 {
+            if child_id>tree.node_count { return E_TYPE_REFUSED(); }
+            if type_operand(source,tree,child_id,words,depth+1)!=0 { return E_TYPE_REFUSED(); }
+            child_id=anext(tree,child_id);
+        }
+        return 0;
+    }
+    if ast==91 {
+        if afirst(tree,id)==alast(tree,id) { return type_operand_name(source,tree,afirst(tree,id),words); }
+        return 0;
+    }
+    return 0;
+}
+
+// An instruction is kind 32 with aux 0 and owns the mnemonic name followed by
+// its operands (parser.nova:400-407). Each operand is typed in its own right.
+// The class of the INSTRUCTION itself is the control register class: an
+// instruction has no width, and its only machine identity is that it drives
+// the instruction stream.
+fn type_instruction(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    let at:u64=base_of(id);
+    words[at+13]=SIGNED_NONE();
+    words[at+15]=CLASS_CONTROL();
+    let mut child_id:u64=afirst(tree,id);
+    while child_id!=0 {
+        if child_id>tree.node_count { return E_TYPE_REFUSED(); }
+        if type_operand(source,tree,child_id,words,1)!=0 { return E_TYPE_REFUSED(); }
+        child_id=anext(tree,child_id);
+    }
+    return 0;
+}
+
+// Dispatch on the NTIR kind. A node starts untyped, every arm either fills the
+// words it can justify or refuses, and a node that keeps the default has
+// genuinely nothing to say — which child_count then makes visible rather than
+// silent.
+fn type_node(source:buf<u8>,tree:ntasm_ast.Tree,id:u64,words:buf<u64>)->u64 {
+    if id==0 || id>tree.node_count { return E_TYPE_REFUSED(); }
+    let kind:u64=kind_of(tree,id);
+    let at:u64=base_of(id);
+    words[at+12]=0;
+    words[at+13]=SIGNED_NONE();
+    words[at+14]=0;
+    words[at+15]=CLASS_NONE();
+    if kind==k_type() { return type_form(source,tree,id,words,1); }
+    if kind==k_parameter() { return type_parameter(source,tree,id,words); }
+    if kind==k_function() || kind==k_import() { return type_signature(source,tree,id,words); }
+    if kind==k_data() || kind==k_const() { return type_initializer(source,tree,id,words); }
+    if kind==k_instruction() { return type_instruction(source,tree,id,words); }
+    if kind==k_label() { words[at+15]=CLASS_LABEL(); return 0; }
+    // A NAME IS TYPED BY ITS OWN ARM, NOT ONLY BY ITS PARENT'S VISIT. The
+    // sweep above runs ids ascending and the parser allocates a parent before
+    // its children, so a parent's visit always happens FIRST: type_instruction
+    // reaches a register operand through type_operand -> type_operand_name and
+    // writes words 12 and 15 for that CHILD. The child's own visit then runs,
+    // and the zeroing at the top of this function cleared exactly the two
+    // words the parent had just written. Every register named in an
+    // instruction therefore reached the image with width 0 and class 0, and
+    // the verifier accepted that, because an untyped name is a shape it
+    // permits.
+    //
+    // The alternative was to stop zeroing, and it was rejected deliberately:
+    // the zeroing is what makes a node's typed words a property of THAT node
+    // and not an accident of which parent happened to visit it. Dropping it
+    // would make every node inherit whatever the last writer left, so the same
+    // source would type differently depending on the order two unrelated
+    // parents happened to appear in. A node that cannot justify a typed word
+    // must arrive untyped. So the zeroing stays and the arm is added, which
+    // also means a name in a position no parent types (a bare symbol name in
+    // operand position, a qualified callee) is now typed by the same rule the
+    // parent would have used, rather than by luck of visit order.
+    if kind==k_name() { return type_operand_name(source,tree,id,words); }
+    if kind==k_memory_operand() { return type_memory(source,tree,id,words); }
+    if kind==k_literal() { return type_literal(tree,id,words); }
+    if kind==k_clobbers() { return type_register_list(source,tree,id,words); }
+    if kind==k_binding_set() {
+        // A binding entry is a SYMBOL NAME, a type and a register name
+        // (parser.nova:581-585), so its FIRST child is not a register and must
+        // not be typed as one. An earlier version ran the clobbers rule over
+        // this set and refused every non-empty binding, because a symbol name
+        // is not in the register catalogue. The register is the THIRD child.
+        let mut entry:u64=afirst(tree,id);
+        while entry!=0 {
+            if entry>tree.node_count { return E_TYPE_REFUSED(); }
+            if akind(tree,entry)!=96 { return E_TYPE_REFUSED(); }
+            let type_id:u64=child(tree,entry,2);
+            let reg_id:u64=child(tree,entry,3);
+            if type_id==0 { return E_TYPE_REFUSED(); }
+            if type_form(source,tree,type_id,words,1)!=0 { return E_TYPE_REFUSED(); }
+            if reg_id!=0 {
+                if type_operand_name(source,tree,reg_id,words)!=0 { return E_TYPE_REFUSED(); }
+                if words[base_of(reg_id)+15]==CLASS_NONE() { return E_TYPE_REFUSED(); }
+            }
+            entry=anext(tree,entry);
+        }
+        return 0;
+    }
+    if kind==k_call() {
+        let mut child_id:u64=afirst(tree,id);
+        while child_id!=0 {
+            if child_id>tree.node_count { return E_TYPE_REFUSED(); }
+            if type_operand(source,tree,child_id,words,1)!=0 { return E_TYPE_REFUSED(); }
+            child_id=anext(tree,child_id);
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// THE LOWERING. One NTIR node per AST node, ids identical, children copied.
+// The order is a single ascending sweep over the AST ids, so the NTIR order is
+// the AST order by construction and a reordering becomes a property of the
+// image rather than of the traversal that produced it.
+// ---------------------------------------------------------------------------
+export fn build(source:buf<u8>,tree:ntasm_ast.Tree,words:buf<u64>,capacity:u64)->u64 {
+    if tree.ok==false || tree.node_count==0 { return 800; }
+    let needed:u64=HEADER_WORDS()+tree.node_count*NODE_WORDS();
+    if capacity<needed || len(words)<needed { return 800; }
+    let mut id:u64=1;
+    let mut code:u64=0;
+    let mut typed:u64=0;
+    while id<=tree.node_count && code==0 {
+        let kind:u64=kind_of(tree,id);
+        if kind_present(kind)==false { code=813; }
+        else {
+            let at:u64=base_of(id);
+            words[at]=kind;
+            words[at+1]=asource(tree,id);
+            words[at+2]=aline(tree,id);
+            words[at+3]=acolumn(tree,id);
+            words[at+4]=astart(tree,id);
+            words[at+5]=aend(tree,id);
+            words[at+6]=akind(tree,id);
+            words[at+7]=id;
+            words[at+8]=afirst(tree,id);
+            words[at+9]=alast(tree,id);
+            words[at+10]=anext(tree,id);
+            let count:u64=chain(tree,afirst(tree,id));
+            if afirst(tree,id)==0 {
+                if count!=0 { code=818; } else { words[at+11]=0; }
+            } else if count==0 { code=818; } else { words[at+11]=count; }
+            if code==0 { code=type_node(source,tree,id,words); }
+            if code==0 && (words[at+12]!=0 || words[at+14]!=0 || words[at+15]!=CLASS_NONE()) {
+                typed=typed+1;
+            }
+        }
+        id=id+1;
+    }
+    if code!=0 { return code; }
+    words[0]=NTIR_MAGIC();
+    words[1]=FORMAT_MAJOR();
+    words[2]=FORMAT_MINOR();
+    words[3]=tree.node_count;
+    words[4]=1;
+    words[5]=NODE_WORDS();
+    words[6]=tree.node_count;
+    words[7]=typed;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// THE VERIFIER. It runs on the image and knows nothing about the AST it came
+// from, which is the point: a verifier that re-reads the tree proves the TREE
+// is well formed, not that the IMAGE is. Every refusal writes the line, the
+// column and the node id, so a caller gets a position and not a bare number.
+//
+// THE REFUSALS ARE A SUPERSET, NEVER NARROWER. A narrower verifier would
+// accept an image some other pass refuses, and would be inventing a proof the
+// machine does not support. So the typing families this module can reproduce
+// refuse exactly where their owners refuse — an unknown scalar type name, an
+// unknown pointer space, a zero array length, a register that contradicts its
+// declared width, a register name outside the catalogue — and build refuses
+// them BEFORE the image exists, so an image that exists is already past them.
+// What the verifier adds on top is structural: a kind outside the table, a link
+// outside the image, a first/last pair that disagrees, a node reached twice, a
+// cycle, a node the root never reaches, a typed word outside its vocabulary,
+// and a typed word its own kind does not admit.
+//
+// The eight codes are read by the gate, which also confronts them with the C
+// oracle on the same fixture. They are in the structural band because that is
+// what they are: a refusal to READ an image, never a source diagnostic.
+// ---------------------------------------------------------------------------
+// A kind that carries a width, and a kind that must therefore not claim one.
+// Without this the verifier would accept a block that declares 32 bits, which
+// is an image asserting a type its own kind cannot derive. The set is read
+// from the typing dispatch above, not from a wish: every arm that fills word
+// 12 is in it and no other arm is.
+fn width_admissible(kind:u64)->bool {
+    if kind==k_type() { return true; }
+    if kind==k_parameter() { return true; }
+    if kind==k_function() || kind==k_import() { return true; }
+    if kind==k_data() || kind==k_const() { return true; }
+    if kind==k_memory_operand() { return true; }
+    if kind==k_literal() { return true; }
+    return kind==k_name();
+}
+fn typed_admissible(kind:u64,width:u64,signed:u64,space:u64,class:u64)->bool {
+    if width_known(width)==false { return false; }
+    if width!=0 && width_admissible(kind)==false { return false; }
+    if signed!=0 && signed!=1 && signed!=2 { return false; }
+    if space!=0 && space_known(space)==false { return false; }
+    if class>CLASS_LIMIT() { return false; }
+    if kind==k_type() { return class==CLASS_NONE(); }
+    if kind==k_parameter() { return class<=FAMILY_LIMIT(); }
+    if kind==k_function() || kind==k_import() { return class==CLASS_NONE(); }
+    if kind==k_data() || kind==k_const() { return class==CLASS_NONE(); }
+    if kind==k_memory_operand() { return class==CLASS_MEMORY() && width==WIDTH_MEMORY(); }
+    if kind==k_instruction() { return class==CLASS_CONTROL(); }
+    if kind==k_label() { return class==CLASS_LABEL(); }
+    if kind==k_literal() { return class==CLASS_IMMEDIATE() || class==CLASS_NONE(); }
+    if kind==k_name() { return class<=FAMILY_LIMIT(); }
+    return class==CLASS_NONE();
+}
+fn own_next(words:buf<u64>,count:u64,id:u64)->u64 {
+    if id<1 || id>count { return 0; }
+    let next:u64=w_next(words,id);
+    if next>count { return 0; }
+    return next;
+}
+
+export fn verify(words:buf<u64>,count:u64,out:buf<u64>)->u64 {
+    if len(out)<4 || count==0 { return 800; }
+    if len(words)<HEADER_WORDS()+count*NODE_WORDS() { return 800; }
+    if words[0]!=NTIR_MAGIC() { return 808; }
+    if words[1]!=FORMAT_MAJOR() || words[2]!=FORMAT_MINOR() { return 808; }
+    if words[3]!=count || words[5]!=NODE_WORDS() { return 814; }
+    if words[4]<1 || words[4]>count { return 814; }
+    // Word 6 is the AST this image was lowered from and word 7 the number of
+    // nodes carrying a typed word. Word 7 is not decoration: serialize prints
+    // it as `typed=` on the FIRST line of every golden, so an image that
+    // claims a typed count no node supports produces a golden that is wrong
+    // about the image, and a reader that believed it would be wrong about the
+    // program. Word 6 is the same claim about the tree: the ids ARE the AST
+    // ids, so the count must be the count, and a mismatch means the image
+    // describes a lowering that did not happen. Both are 814, the code this
+    // verifier already uses for a header field that does not agree with the
+    // image beside it, which is exactly what these are.
+    if words[6]!=count { return 814; }
+    if words[7]>count { return 814; }
+    let mut code:u64=0;
+    let mut node:u64=1;
+    while node<=count && code==0 {
+        let at:u64=base_of(node);
+        let kind:u64=words[at];
+        let first:u64=words[at+8];
+        let last:u64=words[at+9];
+        if kind_present(kind)==false { code=813; }
+        else if w_ast_id(words,node)!=node { code=814; }
+        else if first>count || last>count || words[at+10]>count { code=814; }
+        else if (first==0)!=(last==0) { code=818; }
+        else if typed_admissible(kind,words[at+12],words[at+13],words[at+14],words[at+15])==false { code=819; }
+        else if first!=0 {
+            // The last child must end the chain and the chain must hold
+            // exactly child_count nodes. The step bound closes a cycle inside
+            // the chain before the walk can run forever.
+            if own_next(words,count,last)!=0 { code=815; }
+            else {
+                let mut id:u64=first;
+                let mut seen:u64=0;
+                while id!=0 && code==0 {
+                    seen=seen+1;
+                    if id>count { code=814; }
+                    else if seen>count { code=816; }
+                    else { id=own_next(words,count,id); }
+                }
+                if code==0 && seen!=words[at+11] { code=815; }
+            }
+        } else if words[at+11]!=0 { code=815; }
+        if code!=0 { out[0]=w_line(words,node); out[1]=w_column(words,node); out[2]=code; out[3]=node; }
+        node=node+1;
+    }
+    if code!=0 { return code; }
+    // Reachability. A depth-first walk from the root with a visited mark: a
+    // node marked twice is a node two parents claim, and a node still unmarked
+    // when the walk ends is a node the root does not reach. A cycle arrives as
+    // the second visit, because the depth bound closes it first.
+    let mark:buf<u64>=alloc(runtime(),count);
+    let stack:buf<u64>=alloc(runtime(),(count+1)*2);
+    let mut i:u64=0;
+    while i<count { mark[i]=0; i=i+1; }
+    let mut size:u64=1;
+    stack[0]=words[4];
+    stack[1]=1;
+    while size>0 && code==0 {
+        let id:u64=stack[(size-1)*2];
+        let level:u64=stack[(size-1)*2+1];
+        size=size-1;
+        if id<1 || id>count { code=814; }
+        else if mark[id-1]==1 { code=816; }
+        else if level>count { code=816; }
+        else {
+            mark[id-1]=1;
+            let mut child_id:u64=w_first(words,id);
+            while child_id!=0 && code==0 {
+                if child_id>count { code=814; }
+                else { stack[size*2]=child_id; stack[size*2+1]=level+1; size=size+1; }
+                child_id=w_next(words,child_id);
+            }
+        }
+    }
+    if code!=0 { out[0]=0; out[1]=0; out[2]=code; out[3]=0; }
+    if code==0 {
+        let mut id:u64=1;
+        while id<=count {
+            if mark[id-1]==0 {
+                code=815;
+                out[0]=w_line(words,id); out[1]=w_column(words,id); out[2]=code; out[3]=id;
+                id=count+1;
+            }
+            id=id+1;
+        }
+    }
+    rt_free(runtime(),stack);
+    rt_free(runtime(),mark);
+    return code;
+}
+
+// ---------------------------------------------------------------------------
+// THE SERIALIZATION. One line per node, ascending id, fixed field order,
+// decimal only, newline terminated. No hash, no address, no timestamp, no path
+// and no locale, because spec/ntasm/ntasm.md §16 forbids all five in an output whose
+// order is observable, and because a golden that moves when any of them does
+// is not a golden of the IR.
+//
+// The FIRST LINE IS THE FORMAT TAG, so a golden names the schema it was taken
+// under. Changing the tag changes the first line of every fixture and the gate
+// fails on the bytes.
+// ---------------------------------------------------------------------------
+fn put(out:buf<u8>,cap:u64,at:u64,byte:u64)->u64 {
+    if at>=cap { return 0; }
+    out[at]=u8(byte);
+    return at+1;
+}
+fn put_text(out:buf<u8>,cap:u64,at:u64,text:buf<u8>)->u64 {
+    let n:u64=len(text);
+    if at+n>cap { return 0; }
+    let mut i:u64=0;
+    while i<n { if text[i]==0 || text[i]>=128 { return 0; } out[at+i]=text[i]; i=i+1; }
+    return at+n;
+}
+fn put_decimal(out:buf<u8>,cap:u64,at:u64,value:u64)->u64 {
+    if value==0 { return put(out,cap,at,48); }
+    let mut digits:u64=0;
+    let mut rest:u64=value;
+    while rest!=0 { rest=rest/10; digits=digits+1; }
+    if at+digits>cap { return 0; }
+    let mut i:u64=at+digits;
+    rest=value;
+    while rest!=0 { i=i-1; out[i]=u8(48+(rest%10)); rest=rest/10; }
+    return at+digits;
+}
+// The fifteen field labels of the text form, addressed by number so the
+// serializer holds no buffer argument that is a literal. A Nova buffer
+// argument must NAME a buffer, so a literal cannot reach put_text directly.
+fn put_label(out:buf<u8>,cap:u64,at:u64,label:u64)->u64 {
+    if label==0 { let a:buf<u8>=" nodes=";return put_text(out,cap,at,a); }
+    if label==1 { let a:buf<u8>=" root=";return put_text(out,cap,at,a); }
+    if label==2 { let a:buf<u8>=" typed=";return put_text(out,cap,at,a); }
+    if label==3 { let a:buf<u8>="@";return put_text(out,cap,at,a); }
+    if label==4 { let a:buf<u8>=" c=";return put_text(out,cap,at,a); }
+    if label==5 { let a:buf<u8>=" w=";return put_text(out,cap,at,a); }
+    if label==6 { let a:buf<u8>=" s=";return put_text(out,cap,at,a); }
+    if label==7 { let a:buf<u8>=" sp=";return put_text(out,cap,at,a); }
+    if label==8 { let a:buf<u8>=" rc=";return put_text(out,cap,at,a); }
+    if label==9 { let a:buf<u8>=" f=";return put_text(out,cap,at,a); }
+    if label==10 { let a:buf<u8>=" l=";return put_text(out,cap,at,a); }
+    if label==11 { let a:buf<u8>=" n=";return put_text(out,cap,at,a); }
+    return 0;
+}
+export fn header_text()->buf<u8> { return "NTIR/0.1"; }
+
+export fn serialize(words:buf<u64>,count:u64,out:buf<u8>,length:buf<u64>)->u64 {
+    if count==0 || len(length)<1 { return 800; }
+    if len(words)<HEADER_WORDS()+count*NODE_WORDS() { return 800; }
+    if words[0]!=NTIR_MAGIC() { return 808; }
+    if words[1]!=FORMAT_MAJOR() || words[2]!=FORMAT_MINOR() { return 808; }
+    let cap:u64=len(out);
+    let tag:buf<u8>=header_text();
+    let mut at:u64=put_text(out,cap,0,tag);
+    if at==0 { return 800; }
+    at=put_label(out,cap,at,0); if at==0 { return 800; }
+    at=put_decimal(out,cap,at,count); if at==0 { return 800; }
+    at=put_label(out,cap,at,1); if at==0 { return 800; }
+    at=put_decimal(out,cap,at,words[4]); if at==0 { return 800; }
+    at=put_label(out,cap,at,2); if at==0 { return 800; }
+    at=put_decimal(out,cap,at,words[7]); if at==0 { return 800; }
+    at=put(out,cap,at,10); if at==0 { return 800; }
+    let mut id:u64=1;
+    while id<=count {
+        let at_node:u64=base_of(id);
+        at=put_decimal(out,cap,at,id); if at==0 { return 800; }
+        at=put(out,cap,at,32); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node]); if at==0 { return 800; }
+        at=put(out,cap,at,32); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+6]); if at==0 { return 800; }
+        at=put(out,cap,at,32); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+7]); if at==0 { return 800; }
+        at=put_label(out,cap,at,3); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+4]); if at==0 { return 800; }
+        at=put(out,cap,at,45); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+5]); if at==0 { return 800; }
+        at=put(out,cap,at,32); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+2]); if at==0 { return 800; }
+        at=put(out,cap,at,58); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+3]); if at==0 { return 800; }
+        at=put_label(out,cap,at,4); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+11]); if at==0 { return 800; }
+        at=put_label(out,cap,at,5); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+12]); if at==0 { return 800; }
+        at=put_label(out,cap,at,6); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+13]); if at==0 { return 800; }
+        at=put_label(out,cap,at,7); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+14]); if at==0 { return 800; }
+        at=put_label(out,cap,at,8); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+15]); if at==0 { return 800; }
+        at=put_label(out,cap,at,9); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+8]); if at==0 { return 800; }
+        at=put_label(out,cap,at,10); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+9]); if at==0 { return 800; }
+        at=put_label(out,cap,at,11); if at==0 { return 800; }
+        at=put_decimal(out,cap,at,words[at_node+10]); if at==0 { return 800; }
+        at=put(out,cap,at,10); if at==0 { return 800; }
+        id=id+1;
+    }
+    length[0]=at;
+    return 0;
+}
+
+// The name a kind prints, so the text and the table cannot drift. The number
+// is always printed as well, so a name is documentation and never the key.
+fn kind_name(kind:u64)->buf<u8> {
+    if kind==k_unit() { return "unit"; }
+    if kind==k_module() { return "module"; }
+    if kind==k_target() { return "target"; }
+    if kind==k_versions() { return "versions"; }
+    if kind==k_version_entry() { return "version_entry"; }
+    if kind==k_default_abi() { return "default_abi"; }
+    if kind==k_output() { return "output"; }
+    if kind==k_features() { return "features"; }
+    if kind==k_import() { return "import"; }
+    if kind==k_const() { return "const"; }
+    if kind==k_comptime() { return "comptime"; }
+    if kind==k_comptime_item() { return "comptime_item"; }
+    if kind==k_macro() { return "macro"; }
+    if kind==k_macro_param() { return "macro_param"; }
+    if kind==k_stub_table() { return "stub_table"; }
+    if kind==k_stub_entry() { return "stub_entry"; }
+    if kind==k_section() { return "section"; }
+    if kind==k_function() { return "function"; }
+    if kind==k_parameter() { return "parameter"; }
+    if kind==k_effects() { return "effects"; }
+    if kind==k_clobbers() { return "clobbers"; }
+    if kind==k_requires() { return "requires"; }
+    if kind==k_ensures() { return "ensures"; }
+    if kind==k_data() { return "data"; }
+    if kind==k_block() { return "block"; }
+    if kind==k_let() { return "let"; }
+    if kind==k_abi_clause() { return "abi_clause"; }
+    if kind==k_call() { return "call"; }
+    if kind==k_return() { return "return"; }
+    if kind==k_if() { return "if"; }
+    if kind==k_expand() { return "expand"; }
+    if kind==k_instruction() { return "instruction"; }
+    if kind==k_label() { return "label"; }
+    if kind==k_predicate() { return "predicate"; }
+    if kind==k_memory_operand() { return "memory_operand"; }
+    if kind==k_expr() { return "expr"; }
+    if kind==k_type() { return "type"; }
+    if kind==k_meta_block() { return "meta_block"; }
+    if kind==k_meta_let() { return "meta_let"; }
+    if kind==k_meta_if() { return "meta_if"; }
+    if kind==k_meta_for() { return "meta_for"; }
+    if kind==k_meta_return() { return "meta_return"; }
+    if kind==k_meta_emit() { return "meta_emit"; }
+    if kind==k_quote() { return "quote"; }
+    if kind==k_binding_set() { return "binding_set"; }
+    if kind==k_align_stack() { return "align_stack"; }
+    if kind==k_name() { return "name"; }
+    if kind==k_qualified() { return "qualified"; }
+    if kind==k_dashed() { return "dashed"; }
+    if kind==k_section_name() { return "section_name"; }
+    if kind==k_literal() { return "literal"; }
+    if kind==k_stub_field() { return "stub_field"; }
+    if kind==k_binding() { return "binding"; }
+    return "unknown";
+}
+export fn kind_text(index:u64)->buf<u8> { return kind_name(kind_at(index)); }
+// A kind name the gate reads back for a NUMBER, not for an index, so a table
+// renumbering is visible in the text instead of only in the layout.
+export fn kind_name_of(kind:u64)->buf<u8> { return kind_name(kind); }

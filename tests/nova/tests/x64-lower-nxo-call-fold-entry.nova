@@ -1,0 +1,69 @@
+module x64_lower_nxo_call_fold_entry;
+import ntasm_ast;
+import ntasm_parser;
+import x64_lower_nxo;
+
+// An entry that calls the producer's call_fold rule DIRECTLY.
+//
+// WHY THIS EXISTS, and it is not a convenience. The rule is correct -- its
+// predicate matches frontend.c -- and it changes NO observable verdict on any
+// source the producer currently emits. Measured: every source the frameless and
+// the framed cores accept is refused by an earlier shape gate of their own, and
+// every source the call fold refuses is ALREADY refused without it, so the
+// guard removes zero currently-green cases. A rule like that cannot be
+// exercised through a route, because on a closed tree the route's answer is the
+// same with and without the guard. So the honest instrument calls the rule, and
+// this entry exists to make it callable. It constructs nothing and decides
+// nothing: it hands the rule the tree the parser built and reports its answer.
+//
+// out[0] = the rule's verdict, 0 when every function in the unit pays
+// out[1] = kind 18 function nodes seen
+// out[2] = kind 25 body blocks found
+// out[3] = call statements reached inside a body block
+//
+// THE THREE COUNTERS ARE NOT COSMETIC. They exist because the rule's failure
+// mode is silence: a walk that compiles, returns a well-formed 0 and inspects
+// nothing. The landed flag patch had that failure and its literal AST walk never
+// fired, because a body's statements are children of the kind 25 body BLOCK and
+// not of the kind 18 function node. out[3] is therefore a POSITIVE claim about
+// the walk -- on a source that carries a call it must be non-zero -- and a 0
+// verdict beside out[3]==0 is not evidence of anything.
+//
+// THE SHAPE BELOW IS THE PROVEN ONE. An earlier revision of this file factored
+// the counting into a helper taking a Tree and a buf; that revision did not
+// compile and the compiler does not say why, so it was replaced by the inline
+// form below, which is the form that was measured working. Kept inline for
+// that reason and not for tidiness.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<8 { return 800; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree);return 800; }
+    out[1]=0;out[2]=0;out[3]=0;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==18 {
+            out[1]=out[1]+1;
+            let mut c:u64=n.first_child;
+            while c!=0 {
+                if c>tree.node_count { ntasm_ast.release(tree);return 800; }
+                let cn:ntasm_ast.Node=ntasm_ast.node_at(tree,c);
+                if cn.kind==25 {
+                    out[2]=out[2]+1;
+                    let mut s:u64=cn.first_child;
+                    while s!=0 {
+                        if s>tree.node_count { ntasm_ast.release(tree);return 800; }
+                        let sn:ntasm_ast.Node=ntasm_ast.node_at(tree,s);
+                        if sn.kind==28 || (sn.kind==35 && sn.aux==1) { out[3]=out[3]+1; }
+                        s=sn.next_sibling;
+                    }
+                    break;
+                }
+                c=cn.next_sibling;
+            }
+        }
+        id=id+1;
+    }
+    out[0]=x64_lower_nxo.call_fold(source,tree);
+    ntasm_ast.release(tree);return 0;
+}

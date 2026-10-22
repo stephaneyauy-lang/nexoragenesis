@@ -1,0 +1,6 @@
+module x64_shift_cl_entry;import x64_fixed;
+export fn main(kind:u64,name:buf<u8>,operand_count:u64,destination:u64,width:u64,count_register:u64,high8:u64,amount:u64,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if kind==0{return x64_fixed.encode_shift_cl(name,operand_count,destination,width,count_register,high8,features,cpl,out);}
+    if kind==1{return x64_fixed.encode_shift_imm(name,operand_count,destination,width,amount,features,cpl,out);}
+    return 800;
+}

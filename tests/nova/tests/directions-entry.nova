@@ -1,0 +1,94 @@
+module directions_entry;
+
+import ntasm_ast;
+import ntasm_parser;
+import abi;
+
+// Entry point for the lot-27 directions gate.
+//
+// The selector in out[4] chooses which query is asked, so ONE compiled image
+// answers every question the gate asks and the answers stay comparable: each
+// is asked of the same parser, the same tree and the same abi.nova. The
+// selector values are:
+//
+//   1  abi.obligations       -- the three obligations, one seven word row per
+//                               parameter, with out[0] the row count
+//   2  abi.alias_parameters  -- the alias answer
+//   3  abi.obligations on a tree whose FIRST parameter node's span has been
+//       rewritten to out[6]..out[6]+out[5], so the "unknown direction name"
+//       refusal is reachable
+//   4  abi.obligations       -- the control row for selector 3
+//
+// SELECTOR 3 FORGES THE TREE, NOT THE SOURCE, and the reason is measured rather
+// than chosen. My first version replaced the direction word in a COPY of the
+// source and re-parsed it, and it returned 800 on every case: parser.nova:338
+// demands keyword 29, 30 or 31 where a direction belongs, so a source spelling
+// anything else does not parse and the refusal is unreachable through the front
+// door. That is the fact the case exists to record, not a bug to work around.
+// tests_ntasm_abi.c already reaches the same refusal the only other available
+// way, by rewriting a node span after the parse; this does the same thing and
+// for the same reason.
+//
+// Returns the query's own code, or 800 when out[4] selects nothing this entry
+// implements. Neither source nor out is owned or released.
+export fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    if len(out)<5 { return 800; }
+    let selector:u64=out[4];
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false {
+        ntasm_ast.release(tree);
+        return 800;
+    }
+    if selector==3 {
+        let start:u64=out[6];
+        let width:u64=out[5];
+        if width==0 || start+width>len(source) {
+            ntasm_ast.release(tree);
+            return 800;
+        }
+        let target:u64=first_parameter(tree);
+        if target==0 {
+            ntasm_ast.release(tree);
+            return 800;
+        }
+        set_span(tree,target,start,start+width);
+    }
+    if selector==1 || selector==3 || selector==4 {
+        let code:u64=abi.obligations(source,tree,out);
+        ntasm_ast.release(tree);
+        return code;
+    }
+    if selector==2 {
+        let code:u64=abi.alias_parameters(source,tree,out);
+        ntasm_ast.release(tree);
+        return code;
+    }
+    ntasm_ast.release(tree);
+    return 800;
+}
+
+// Id of the first parameter node (kind 19) in the flat list, 0 when the tree
+// spells none. A flat scan is enough because the parser emits nodes in source
+// order, so the first kind-19 node is the first parameter of the first
+// declaration -- the same node tests_ntasm_abi.c's probe forges.
+fn first_parameter(tree:ntasm_ast.Tree)->u64 {
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==19 { return id; }
+        id=id+1;
+    }
+    return 0;
+}
+
+// Rewrite the source span of node `id`. ast.nova lays a node out as twelve
+// words and node_at reads start at offset 6 and end at offset 7, so those are
+// the two words this writes -- measured against node_at's own indexing rather
+// than against a comment about it.
+fn set_span(tree:ntasm_ast.Tree,id:u64,start:u64,end:u64)->u64 {
+    if id==0 || id>tree.node_count { return 0; }
+    let at:u64=(id-1)*12;
+    tree.node_words[at+6]=start;
+    tree.node_words[at+7]=end;
+    return 1;
+}

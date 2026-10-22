@@ -1,0 +1,951 @@
+module c_conversion;
+
+import ntasm_ast;
+import abi;
+// ---------------------------------------------------------------------------
+// THE C -> NOVA CONVERSION, made executable. Lot 62.
+//
+// lot50/lot50_table.md is a TABLE: twenty-seven rows, each naming a C record
+// word and saying what Nova does with it. A table nobody can re-derive is a
+// transcription. This module is the derivation, and its subject is exactly the
+// rows lot50 left UNDECIDED because nothing in the tree could decide them.
+//
+// WHAT IS CONVERTED, AS A STATED BOUND. One C declaration:
+//
+//   NtFFunction                (frontend.h:211)  the record itself
+//   the NtFVariable chain     (frontend.h:110)  its parameters
+//   the NtFType chain         (frontend.h:87)   the types they name
+//   the NtFRegister triple    (frontend.h:97)   a register binding
+//
+// and nothing else. That bound covers 26 of the 66 C enumerator values --
+// NtFTypeKind 13, NtFSpace 7, NtFDirection 6 -- and it is a BOUND, not a
+// claim of completeness. OUT OF SCOPE, named so the next lot starts here and
+// not from zero:
+//
+//   NtFExprKind  11   no expression is converted; the AST kind 35 node is
+//                        never produced here
+//   NtFStmtKind   7   no statement is converted; kinds 27..32 never appear
+//   NtFOp        22   no operator is converted; nothing in this module reads
+//                        an operator code
+//   NtFProgram         no program-level record is converted
+//   NtFDiagnostic      no diagnostic is converted
+//   the two conflations  RESOLVED HERE, not skipped: `conflated_arm` below
+//                        answers both from the span, and neither needs a word
+//                        added to the node record
+//
+// WHAT THE CONVERSION IS NOT. It is not a producer. It does not parse, and it
+// does not invent a tree: it takes the words of a C record -- read out of a
+// real NtFProgram by the C side -- and writes the words of a Nova AST node.
+// The C side is the reference, so every expectation here is the C's own bytes
+// and never this module's opinion of them.
+//
+// THE HEADLINE FINDING OF THIS LOT IS AT `C_VAR_DECL_START` AND IT IS NOT A
+// GAP IN THIS MODULE. Measured on the reference's own output: the C's
+// NtFVariable.span for a parameter is the span of its REGISTER, and the C's
+// NtFFunction.span is the span of its KEYWORD. No C field names the text a
+// parameter is written in, so decision A's recomputation has nothing in the C
+// record to read and this module REFUSES with R_NO_DECL_SPAN rather than
+// deriving a direction from `rax`. The exact change that would close it -- one
+// more member on NtFVariable, in compiler/c/ntasm/frontend/frontend.h -- is named
+// in out/c-bootstrap/nova/lot62/lot62_findings.md section 5 and was not made
+// here, because making it would move the reference's own numbers.
+//
+// ---------------------------------------------------------------------------
+// THE NODE RECORD IS NOT WIDENED. ast.nova's record is twelve words and it
+// stays twelve. R158 established that the two conflations are recoverable
+// from the span every node already carries, so nothing here needs a
+// thirteenth word.
+//
+// AND THE CLAIM IS AN ASSERTION, NOT A SENTENCE. `node_record_is_unchanged()`
+// below compares `NODE_WORDS()` against twelve, the driver reads the answer
+// back through mode 0, and a widening turns that check red. A refusal code
+// would have been the wrong instrument here: a conversion cannot be handed a
+// thirteen-word record to refuse, because the only thing that decides the
+// width is this module's own writer. The check belongs where the width is
+// written, and it is there.
+// ---------------------------------------------------------------------------
+
+// ---- the C record images, as flat u64 vectors ---------------------------
+//
+// The C structs hold pointers and variable-length arrays, so they are not laid
+// out as words by anything in this tree. These offsets ARE the correspondence:
+// a C field at word N of an image of this length. The C driver reads the
+// offsets back out of this module and lays its own records out with them, so
+// the two sides cannot drift by transcription -- if this module moves an
+// offset, the C side moves with it because it never wrote the number down.
+//
+// A `const char *` in C is a NAME that may be absent, and absence is the case
+// this lot has to survive, so every name field is TWO words: a byte offset
+// into the source and a LENGTH. A name of length 0 is the C's null pointer,
+// and it converts to NO NODE, not to an empty one.
+
+// NtFType, frontend.h:87-93.
+export fn C_TYPE_WORDS()->u64 { return 5; }
+export fn C_TYPE_KIND()->u64 { return 0; }
+export fn C_TYPE_SPACE()->u64 { return 1; }
+export fn C_TYPE_ELEMENT()->u64 { return 2; }
+export fn C_TYPE_COUNT()->u64 { return 3; }
+export fn C_TYPE_BITS()->u64 { return 4; }
+
+// NtFVariable, frontend.h:110-119, PLUS TWO WORDS THE C RECORD DOES NOT HAVE.
+//
+// The two are C_VAR_DECL_START and C_VAR_DECL_END, and they are here because
+// MEASUREMENT put them here. On the fixture this module converts, the C's own
+// NtFSpan for a parameter is the span of its REGISTER -- `x` is 4:20 [70..73]
+// and the bytes at [70..73] are `rax` -- and the C's NtFSpan for a function is
+// the span of its KEYWORD, `fn` at [51..53]. So `NtFVariable.span` does not
+// name the parameter declaration at all.
+//
+// That breaks decision A's recomputation, and it is worth being exact about
+// why. abi.nova:192 re-reads the direction out of the PARAMETER'S span, and
+// in Nova that span does cover `in x:u64 @rax`. In C the span the same rule
+// would read is `rax`. Running the rule on the C's own span answers NTF_IN's
+// absence where a direction was written, and a conversion that treated that
+// zero as a direction would report NTF_IN for every parameter in the program.
+//
+// SO THE CONVERSION DOES NOT GUESS. It takes the declaration extent as an
+// EXPLICIT input, and when the caller has not got one it REFUSES with
+// R_NO_DECL_SPAN instead of reading the register. A refusal here is the
+// correct answer and a derived-from-`rax` direction is a wrong one.
+//
+// WHAT THIS COSTS, AND IT IS THE FINDING: decision A cannot be closed against
+// the C record as it stands, because the C record carries no field naming the
+// declaration a parameter is written in. The exact change is in section 3's
+// answer: `NtFVariable` needs one more span, or its existing `span` member
+// has to be re-specified to cover the declaration, and either is a change to
+// compiler/c/ntasm/frontend/frontend.h and frontend.c that this lot does not own
+// and did not make.
+export fn C_VAR_WORDS()->u64 { return 21; }
+export fn C_VAR_NAME_START()->u64 { return 0; }
+export fn C_VAR_NAME_LEN()->u64 { return 1; }
+export fn C_VAR_SPAN_SOURCE()->u64 { return 2; }
+export fn C_VAR_SPAN_LINE()->u64 { return 3; }
+export fn C_VAR_SPAN_COLUMN()->u64 { return 4; }
+export fn C_VAR_SPAN_START()->u64 { return 5; }
+export fn C_VAR_SPAN_END()->u64 { return 6; }
+export fn C_VAR_TYPE()->u64 { return 7; }
+export fn C_VAR_FUNCTION()->u64 { return 8; }
+export fn C_VAR_MODULE()->u64 { return 9; }
+export fn C_VAR_INITIALIZER()->u64 { return 10; }
+export fn C_VAR_DIRECTION()->u64 { return 11; }
+export fn C_VAR_REG_FAMILY()->u64 { return 12; }
+export fn C_VAR_REG_BITS()->u64 { return 13; }
+export fn C_VAR_REG_HIGH8()->u64 { return 14; }
+export fn C_VAR_EXPORTED()->u64 { return 15; }
+export fn C_VAR_SECTION_START()->u64 { return 16; }
+export fn C_VAR_SECTION_LEN()->u64 { return 17; }
+export fn C_VAR_SCOPE()->u64 { return 18; }
+export fn C_VAR_DECL_START()->u64 { return 19; }
+export fn C_VAR_DECL_END()->u64 { return 20; }
+
+// NtFFunction, frontend.h:211-225.
+export fn C_FN_WORDS()->u64 { return 35; }
+export fn C_FN_NAME_START()->u64 { return 0; }
+export fn C_FN_NAME_LEN()->u64 { return 1; }
+export fn C_FN_ABI_START()->u64 { return 2; }
+export fn C_FN_ABI_LEN()->u64 { return 3; }
+export fn C_FN_SECTION_START()->u64 { return 4; }
+export fn C_FN_SECTION_LEN()->u64 { return 5; }
+export fn C_FN_SPAN_SOURCE()->u64 { return 6; }
+export fn C_FN_SPAN_LINE()->u64 { return 7; }
+export fn C_FN_SPAN_COLUMN()->u64 { return 8; }
+export fn C_FN_SPAN_START()->u64 { return 9; }
+export fn C_FN_SPAN_END()->u64 { return 10; }
+export fn C_FN_MODULE()->u64 { return 11; }
+export fn C_FN_RETURN_TYPE()->u64 { return 12; }
+export fn C_FN_FIRST_PARAM()->u64 { return 13; }
+export fn C_FN_BODY()->u64 { return 14; }
+export fn C_FN_REQUIRES()->u64 { return 15; }
+export fn C_FN_ENSURES()->u64 { return 16; }
+export fn C_FN_PARAM_COUNT()->u64 { return 17; }
+export fn C_FN_EFFECT_FLAGS()->u64 { return 18; }
+export fn C_FN_EFFECT_READS()->u64 { return 19; }
+export fn C_FN_EFFECT_WRITES()->u64 { return 20; }
+export fn C_FN_INFERRED_FLAGS()->u64 { return 21; }
+export fn C_FN_INFERRED_READS()->u64 { return 22; }
+export fn C_FN_INFERRED_WRITES()->u64 { return 23; }
+export fn C_FN_CLOBBERS()->u64 { return 24; }
+export fn C_FN_WRITE_FOOTPRINT()->u64 { return 25; }
+export fn C_FN_INFERRED_CLOBBERS()->u64 { return 26; }
+export fn C_FN_EXPORTED()->u64 { return 27; }
+export fn C_FN_IMPORTED()->u64 { return 28; }
+export fn C_FN_IMPORT_NAME_START()->u64 { return 29; }
+export fn C_FN_IMPORT_NAME_LEN()->u64 { return 30; }
+export fn C_FN_RESOLVED()->u64 { return 31; }
+export fn C_FN_GENERATED_STUB()->u64 { return 32; }
+export fn C_FN_STUB_VECTOR()->u64 { return 33; }
+export fn C_FN_HIGH_LEVEL_EXPRESSIONS()->u64 { return 34; }
+
+// ---- the Nova side -------------------------------------------------------
+//
+// The AST record, unchanged. ast.nova:3-5 declares twelve words and this
+// module writes twelve.
+export fn NODE_WORDS()->u64 { return 12; }
+fn N_KIND()->u64 { return 0; }
+fn N_TOKEN_BEGIN()->u64 { return 1; }
+fn N_TOKEN_END()->u64 { return 2; }
+fn N_SOURCE()->u64 { return 3; }
+fn N_LINE()->u64 { return 4; }
+fn N_COLUMN()->u64 { return 5; }
+fn N_START()->u64 { return 6; }
+fn N_END()->u64 { return 7; }
+fn N_FIRST_CHILD()->u64 { return 8; }
+fn N_LAST_CHILD()->u64 { return 9; }
+fn N_NEXT_SIBLING()->u64 { return 10; }
+fn N_AUX()->u64 { return 11; }
+
+// AST kinds this module produces, read off parser.nova's own factory sites.
+fn K_NAME()->u64 { return 90; }
+fn K_TYPE()->u64 { return 36; }
+fn K_FUNCTION()->u64 { return 18; }
+fn K_PARAMETER()->u64 { return 19; }
+fn K_SECTION()->u64 { return 17; }
+
+// ---------------------------------------------------------------------------
+// THE THREE MECHANISMS, AND WHY THERE ARE THREE AND NOT ONE.
+//
+// A C enumerator reaches a Nova node by one of three routes, and the route
+// decides what a correct conversion can even be checked against. Collapsing
+// them is the defect the owner's instruction names, so each one is a separate
+// function and each publishes which route it took.
+//
+//   M_COPIED   the fact is a WORD in both records. Checked word for word
+//              against the converted node. A span is this.
+//   M_ENUMS    the fact is an ENUMERATOR on one side and a WORD on the other,
+//              and the correspondence is a table. Checked by looking the
+//              enumerator up. The type FORM is this: C NtFTypeKind 11 (PTR)
+//              becomes aux 1.
+//   M_DERIVED  the fact is an ENUMERATOR in C and IS NOT STORED ANYWHERE in
+//              the node. It can only be re-read from the source text over a
+//              span the node already carries. Checked against the SOURCE, and
+//              this is the whole difficulty: nothing inside the converted node
+//              can witness it, so a conversion that "preserves" it by writing
+//              a word of its own is indistinguishable from a correct one by
+//              inspection -- and is wrong.
+//
+// NtFDirection is M_DERIVED and is the case decision A names. It is not stored.
+// abi.nova:192 re-reads the parameter's own span. Treating it as M_ENUMS --
+// looking NtFVariable.direction up in a table and writing the answer into
+// aux -- produces a node that is well formed, that passes every downstream
+// check this tree has, and that carries a word the format does not define.
+// That is the wrong result, and `derive_direction` below is the refusal.
+// ---------------------------------------------------------------------------
+export fn M_COPIED()->u64 { return 1; }
+export fn M_ENUMS()->u64 { return 2; }
+export fn M_DERIVED()->u64 { return 3; }
+
+// One verdict word per preserved field, in this order. The driver reads the
+// order back, so a field cannot be checked in one place and skipped in
+// another.
+export fn VERDICT_WORDS()->u64 { return 8; }
+export fn V_SYMBOL()->u64 { return 0; }
+export fn V_TYPE()->u64 { return 1; }
+export fn V_POSITION()->u64 { return 2; }
+export fn V_EFFECT()->u64 { return 3; }
+export fn V_SPACE()->u64 { return 4; }
+export fn V_DIRECTION()->u64 { return 5; }
+export fn V_CONFLATION()->u64 { return 6; }
+export fn V_MECHANISM()->u64 { return 7; }
+
+// The names, for a report a human reads. Five preserved fields plus the two
+// axes the C enums travel by.
+export fn verdict_field(index:u64)->buf<u8> {
+    if index==V_SYMBOL() { return "symbols"; }
+    if index==V_TYPE() { return "types"; }
+    if index==V_POSITION() { return "positions"; }
+    if index==V_EFFECT() { return "effects"; }
+    if index==V_SPACE() { return "memory_spaces"; }
+    if index==V_DIRECTION() { return "direction"; }
+    if index==V_CONFLATION() { return "conflations"; }
+    return "mechanism";
+}
+export fn mechanism_name(m:u64)->buf<u8> {
+    if m==M_COPIED() { return "COPIED"; }
+    if m==M_ENUMS() { return "ENUMS"; }
+    if m==M_DERIVED() { return "DERIVED"; }
+    return "NONE";
+}
+
+// ---- refusal codes -------------------------------------------------------
+// Every one of these is a REFUSAL and not a default. A conversion that cannot
+// carry a fact must say so; a zero written in its place is indistinguishable
+// from a fact that was genuinely absent, and that is the bug this lot exists
+// to find.
+export fn R_NO_SOURCE()->u64 { return 610; }   // source shorter than a span
+export fn R_BAD_SPAN()->u64 { return 611; }    // start > end
+export fn R_NO_TYPE_KIND()->u64 { return 612; }// NtFTypeKind 0, INVALID
+export fn R_SHORT_IMAGE()->u64 { return 613; } // a C image below its own size
+export fn R_EFFECT_LOSS()->u64 { return 614; } // C effect bit with no Nova home
+export fn R_SPACE_CONFLICT()->u64 { return 615; } // C space with no Nova home
+export fn R_NO_DECL_SPAN()->u64 { return 616; }   // no declaration extent
+
+// ---- byte helpers --------------------------------------------------------
+fn same(source:buf<u8>,a_start:u64,a_end:u64,text:buf<u8>)->bool {
+    if a_start>a_end || a_end>len(source) { return false; }
+    if (a_end-a_start)!=len(text) { return false; }
+    let mut i:u64=0;
+    while i<len(text) {
+        if source[a_start+i]!=text[i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// The first WORD of a span, compared whole against a literal. The blank set
+// is the one lexer.nova:75,78 accepts, so what is compared is the first NAME
+// token of the span and nothing else.
+//
+// WHOLE, and never a prefix. The prefix form read `in` out of `inx` and `out`
+// out of `outbound`, which is defect H4 of the W4-8 audit and which this
+// module does not repeat: a C parameter spelled `local` is not `in`, and a
+// conversion that believed it would report NTF_LOCAL as NTF_IN.
+fn word_is(source:buf<u8>,start:u64,end:u64,text:buf<u8>)->bool {
+    if start>end || end>len(source) { return false; }
+    let mut at:u64=start;
+    while at<end {
+        let byte:u64=source[at];
+        if byte==32 || byte==9 || byte==10 || byte==13 { at=at+1; }
+        else { break; }
+    }
+    let mut stop:u64=at;
+    while stop<end {
+        let byte:u64=source[stop];
+        if byte==32 || byte==9 || byte==10 || byte==13 { break; }
+        stop=stop+1;
+    }
+    return same(source,at,stop,text);
+}
+
+// The last non-blank byte of a span, as an offset one PAST the byte, or 0
+// when the span is blank. This is the kind 32 discriminator and it is a byte
+// the node already holds: the end of a label's span is its colon, the end of
+// an instruction's span is its last operand.
+fn last_byte_at(source:buf<u8>,start:u64,end:u64)->u64 {
+    if start>end || end>len(source) { return 0; }
+    let mut at:u64=end;
+    while at>start {
+        let byte:u64=source[at-1];
+        if byte==32 || byte==9 || byte==10 || byte==13 { at=at-1; }
+        else { break; }
+    }
+    if at<=start { return 0; }
+    return at;
+}
+
+// ---- the ENUMS route: the C type kind and its Nova form ------------------
+//
+// frontend.h:63-77, thirteen values, and the Nova type node is kind 36 with
+// the FORM in aux. This is the table, executable, and it is the whole of what
+// lot50 row 15 could not decide.
+//
+// The distinction that matters: the C enumerator names a TYPE and the Nova
+// aux names a FORM. NTF_T_U8 and NTF_T_BOOL are both a plain name and both
+// are aux 0 -- the scalar is spelled in the source and re-read from it, and
+// the enumerator that separated them has no Nova word. Only the three
+// composite forms have a form of their own. So a conversion that mapped all
+// thirteen enumerators onto thirteen aux values would write a word this
+// format does not define for ten of the thirteen.
+export fn type_form(c_kind:u64)->u64 {
+    if c_kind==11 { return 1; }  // NTF_T_PTR
+    if c_kind==12 { return 2; }  // NTF_T_ARRAY
+    if c_kind==1 { return 0; }   // NTF_T_U8   a name
+    if c_kind==2 { return 0; }   // NTF_T_U16
+    if c_kind==3 { return 0; }   // NTF_T_U32
+    if c_kind==4 { return 0; }   // NTF_T_U64
+    if c_kind==5 { return 0; }   // NTF_T_I8
+    if c_kind==6 { return 0; }   // NTF_T_I16
+    if c_kind==7 { return 0; }   // NTF_T_I32
+    if c_kind==8 { return 0; }   // NTF_T_I64
+    if c_kind==9 { return 0; }   // NTF_T_BOOL
+    if c_kind==10 { return 0; }  // NTF_T_NEVER
+    return 0xffffffff;           // NTF_T_INVALID 0, and anything past 12
+}
+
+// The bit width a C type enumerator declares, 0 when the enumerator names no
+// width. bool and never are 0 on purpose: they are the two the C enumerator
+// separates and register_widths.type_width answers 0 for both, so a
+// conversion that gave them a width would be inventing one.
+export fn type_bits_of(c_kind:u64)->u64 {
+    if c_kind==1 { return 8; }
+    if c_kind==2 { return 16; }
+    if c_kind==3 { return 32; }
+    if c_kind==4 { return 64; }
+    if c_kind==5 { return 8; }
+    if c_kind==6 { return 16; }
+    if c_kind==7 { return 32; }
+    if c_kind==8 { return 64; }
+    return 0;
+}
+
+// NTF_T_NEVER is 10 and NTF_T_BOOL is 9, and neither has a width. They are
+// named so a reader can see the table has an answer for thirteen values and
+// not eleven.
+export fn type_kind_is_never(c_kind:u64)->bool { if c_kind==10 { return true; } return false; }
+
+// ---- the DERIVED route: memory space -------------------------------------
+//
+// frontend.h:78-86, seven values. A space lives in the C as an ENUMERATOR on
+// NtFType and in Nova as the TEXT of a name child, from which
+// pointer_spaces.nova:5-6 derives a bit. There is no word. A conversion that
+// looked the enumerator up in a table and wrote the bit into the node would
+// put a sixth meaning in a word that carries five.
+//
+// The negative that matters: 0 is BOTH "NTF_SPACE_NONE" and "not a pointer",
+// and pointer_spaces.nova's own bit() answers 0 for a name outside the
+// catalogue. A single zero therefore cannot say which of the three happened.
+// `space_present` keeps them apart by refusing to answer at all.
+export fn space_bit_of(c_space:u64)->u64 {
+    if c_space==0 { return 0; }   // NTF_SPACE_NONE
+    if c_space==1 { return 1; }   // NTF_SPACE_USER
+    if c_space==2 { return 2; }   // NTF_SPACE_KERNEL
+    if c_space==3 { return 4; }   // NTF_SPACE_PHYSICAL
+    if c_space==4 { return 8; }   // NTF_SPACE_MMIO
+    if c_space==5 { return 16; }  // NTF_SPACE_DEVICE
+    if c_space==6 { return 32; }  // NTF_SPACE_FIRMWARE
+    return 0xffffffff;           // past the catalogue
+}
+
+// Is this C type a pointer at all. A space on a non-pointer is not a space
+// with the value NONE, it is a fact the C record cannot hold, and a
+// conversion that wrote 0 for it would be reporting an absence as a value.
+export fn type_is_pointer(c_kind:u64)->bool { if c_kind==11 { return true; } return false; }
+
+// ---- the DERIVED route: direction -----------------------------------------
+//
+// frontend.h:102-109, six values. DECISION A: this one is NOT stored. The
+// direction is re-read from the parameter's source span, and that read is the
+// one abi.nova OWNS (fn direction): direction_in_span below builds the
+// parameter node from the span and asks the owner through its export,
+// abi.parameter_mode. It carries none of the rule.
+//
+// UNTIL 7 OCTOBER 2026 THIS MODULE CARRIED ITS OWN COPY -- `export fn
+// direction` and the trimming loop -- on the ground that it "cannot import
+// abi.nova, because abi.nova is 2116 lines". That was a preference, not a
+// constraint, and it was measured as one before the copy was removed: the copy
+// answered as the owner on all fourteen decoys of the direction conformance
+// table of tests_ntasm_abi.c (its out[24] column); exactly one harness
+// compiles this module, tests_ntasm_c_conversion.c, and the import adds two
+// files to its closure, abi.nova and clobbers.nova. A copy must be changed by
+// hand with its owner, and the copy census of tests_ntasm_abi.c could not see
+// this one because it was written `export fn`; a relay cannot drift, and that
+// census now declares this function a relay and fails if its body stops
+// calling abi.parameter_mode. The measurement is in MEM.md, « export fn ».
+//
+// THE SHAPE IS NOT THE C's. The C numbers the six directions 0..5 from
+// NTF_IN; the owner answers 1,2,3 for in,out,inout and 0 for a REFUSAL, which
+// is not the C's NTF_IN. Returning the C's 0 for NTF_IN and 0 for "no
+// direction word in the source" would collapse a value and an absence into
+// one word, and the two are different: a C parameter always has a direction,
+// and a source that spells none is a source this conversion must refuse.
+//
+// The four the C declares and this cannot produce are NTF_LOCAL 3, NTF_CONST
+// 4 and NTF_DATA 5. They are named, and `direction_has_no_nova_home` is the
+// answer, because a conversion that mapped them onto 0 would report them as
+// NTF_IN.
+//
+// A first word of `in`/`out`/`inout` anywhere in the span, which is the form
+// the C's own front end accepts: frontend.c:469 matches a whole NAME token and
+// frontend.c:2741-2748 takes only these three. The prefix comparison that read
+// `in` out of `inx` is defect H4, and the owner does not repeat it: it
+// compares the WHOLE first word. Only the span is read, so every other field
+// of the node is zero; an empty or reversed span, or one past the source, is
+// the owner's refusal 0.
+export fn direction_in_span(source:buf<u8>,start:u64,end:u64)->u64 {
+    let span:ntasm_ast.Node=ntasm_ast.Node{kind:0,token_begin:0,token_end:0,
+        source:0,line:0,column:0,start:start,end:end,first_child:0,
+        last_child:0,next_sibling:0,aux:0};
+    return abi.parameter_mode(source,span);
+}
+
+export fn direction_has_no_nova_home(c_direction:u64)->bool {
+    if c_direction==3 { return true; }  // NTF_LOCAL
+    if c_direction==4 { return true; }  // NTF_CONST
+    if c_direction==5 { return true; }  // NTF_DATA
+    if c_direction==6 { return true; }  // past the catalogue
+    return false;
+}
+
+// ---- DECISION G: the two conflations, answered from the span --------------
+//
+// lot50 rows 23 and 24. The C distinguishes them in the KIND -- NTF_S_CALL
+// with a clause role against NTF_S_INSTRUCTION and NTF_S_LABEL -- and Nova
+// does not, because one AST kind carries both. ntir.nova splits them with a
+// predicate. R158 settled that this is a FIELD DISAGREEMENT and not a loss:
+// the distinction is in the KIND on one side and in the SPAN on the other, and
+// every node already carries the span.
+//
+// So the discriminator is READ, never ADDED. `conflated_arm` returns which
+// side a node is on and `proof` receives the bytes it looked at, so a reader
+// sees the evidence instead of taking the verdict. NODE_WORDS() stays 12.
+// That is the whole content of decision G and it is short because the node
+// already had the answer in it.
+//
+// ARMS. kind 28: 1 the abi clause, 2 the call statement, 0 NO ANSWER.
+// kind 32: 1 the label, 2 the instruction, 0 NO ANSWER. 0 is a refusal in both
+// and is never one of the two; it is not the C's NTF_S_BLOCK and a reader
+// must not take it for one.
+export fn conflated_arm(source:buf<u8>,start:u64,end:u64,kind:u64,
+                        proof:buf<u64>)->u64 {
+    if len(proof)<3 { return 0; }
+    proof[0]=0;proof[1]=0;proof[2]=0;
+    if start>end || end>len(source) { return 0; }
+    proof[0]=start;proof[1]=end;
+    if kind==28 {
+        // The abi clause SPELLS `abi` and the call statement SPELLS `call`.
+        // parser.nova:369 builds kind 28 from the `abi` keyword and :381 from
+        // `call`, twelve lines apart in a file this module does not own, and
+        // the two first words are the discriminator.
+        proof[2]=1;
+        let abi_:buf<u8>="abi";
+        if word_is(source,start,end,abi_) { return 1; }
+        let call_:buf<u8>="call";
+        if word_is(source,start,end,call_) { return 2; }
+        return 0;
+    }
+    if kind==32 {
+        let at:u64=last_byte_at(source,start,end);
+        proof[2]=at;
+        if at==0 { return 0; }
+        if source[at-1]==58 { return 1; }   // ':' -- a label
+        return 2;
+    }
+    return 0;
+}
+
+// The NEGATIVE that makes the arms usable. 0 is NO ANSWER, and a caller that
+// read 0 as "the instruction" would be answering a question nobody asked.
+// This asks the same question the arms ask and answers it the other way, so
+// the driver can require BOTH: an arm on a span that discriminates, and a
+// refusal on a span that does not. One without the other is half a contract.
+export fn conflated_arm_refuses(source:buf<u8>,start:u64,end:u64,
+                                kind:u64)->bool {
+    if start>end || end>len(source) { return true; }
+    if kind==28 {
+        let abi_:buf<u8>="abi";
+        let call_:buf<u8>="call";
+        if word_is(source,start,end,abi_) { return false; }
+        if word_is(source,start,end,call_) { return false; }
+        return true;
+    }
+    if kind==32 {
+        if last_byte_at(source,start,end)==0 { return true; }
+        return false;
+    }
+    return true;
+}
+
+// Does resolving the two conflations need a thirteenth word. It does not, and
+// the claim is an assertion rather than a sentence so that a later change
+// which DID widen the record turns a check red instead of a comment stale.
+export fn node_record_is_unchanged()->bool { if NODE_WORDS()==12 { return true; } return false; }
+
+// ---- the conversion ------------------------------------------------------
+//
+// One NtFType image into one Nova type node. `out` receives twelve words.
+//
+// The five preserved fields, and where each one comes from:
+//
+//   types     M_ENUMS on the FORM (type_form) plus the scalar spelled in the
+//             source. The C's NtFType.bits is checked against the form's own
+//             answer and a disagreement is R_NO_TYPE_KIND, not a preference.
+//   positions M_COPIED, five words, and a span that does not fit the source
+//             is R_BAD_SPAN / R_NO_SOURCE. Never clamped.
+//   spaces    M_DERIVED. A pointer with a space the catalogue does not hold
+//             is R_SPACE_CONFLICT.
+//   symbols   handled by convert_variable, which owns the name node.
+//   effects   not on a type; convert_function owns it.
+export fn convert_type(source:buf<u8>,img:buf<u64>,at:u64,out:buf<u64>)->u64 {
+    if len(img)<at+C_TYPE_WORDS() { return R_SHORT_IMAGE(); }
+    if len(out)<NODE_WORDS() { return 800; }
+    let c_kind:u64=img[at+C_TYPE_KIND()];
+    let c_space:u64=img[at+C_TYPE_SPACE()];
+    let c_bits:u64=img[at+C_TYPE_BITS()];
+    let form:u64=type_form(c_kind);
+    if form==0xffffffff { return R_NO_TYPE_KIND(); }
+    let mut i:u64=0;
+    while i<NODE_WORDS() { out[i]=0; i=i+1; }
+    out[N_KIND()]=K_TYPE();
+    out[N_AUX()]=form;
+    // `bits` is checked only where it names the same thing on both sides. For
+    // a SCALAR the C's `bits` is the type's width and there is a table entry
+    // for it. For a COMPOSITE -- NTF_T_PTR 11 -- the C's `bits` is the
+    // ADDRESS width, 64 on this target, and there is no Nova word for an
+    // address width at all: aux 1 says `ptr` and nothing more. Comparing 64
+    // against the scalar table's answer of 0 would refuse every pointer in the
+    // program, which is what the first version of this line did.
+    //
+    // So the composite case is checked against the address width instead, and
+    // a composite whose `bits` is neither 0 nor 64 is a C record this
+    // conversion cannot carry and is refused rather than rounded.
+    if form==0 {
+        if c_bits!=type_bits_of(c_kind) { return R_NO_TYPE_KIND(); }
+    } else {
+        if c_bits!=0 && c_bits!=64 { return R_NO_TYPE_KIND(); }
+    }
+    // A space on something that is not a pointer. The C cannot hold one and a
+    // zero written here would report the absence as NTF_SPACE_NONE.
+    if type_is_pointer(c_kind)==false && c_space!=0 { return R_SPACE_CONFLICT(); }
+    if type_is_pointer(c_kind)==true {
+        if space_bit_of(c_space)==0xffffffff { return R_SPACE_CONFLICT(); }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ONE C PARAMETER, AND THE FIVE FIELDS, EACH WITH ITS OWN OWNER.
+//
+// The symbol is a SEPARATE NODE on both sides and that is not a layout choice,
+// it is the shape of the fact: in C a name is a pointer in its own right and in
+// Nova it is a name node, so the conversion emits the parameter node into
+// `node` and the name node into `name`, and the comparison reads both. A
+// conversion that folded the name into the parameter's span would be unable
+// to tell a parameter named `x` from one whose span happens to be one byte
+// long, and the whole symbol question would be unaskable.
+//
+// THE NEGATIVE FOR SYMBOLS IS THE POINT. A C name of length 0 is a null
+// pointer. It converts to NO NAME NODE AT ALL: `name_kind` returns 0, meaning
+// the caller is to write no node, and the parameter's first and last child
+// stay 0. It does not become a name node with an empty span. That is the
+// failure a reader cannot see: the node count would be right, the links would
+// be right, every downstream check would pass, and the tree would carry a
+// symbol that is in neither the source nor the C.
+// ---------------------------------------------------------------------------
+
+// The name node for a C variable image, or the answer 0 meaning NO NODE.
+// 1 means a node was written into `out`; 0 means none exists and none was
+// written; a refusal code means the C named one that does not fit the source.
+export fn convert_symbol(source:buf<u8>,img:buf<u64>,at:u64,out:buf<u64>)->u64 {
+    if len(img)<at+C_VAR_WORDS() { return R_SHORT_IMAGE(); }
+    let name_start:u64=img[at+C_VAR_NAME_START()];
+    let name_len:u64=img[at+C_VAR_NAME_LEN()];
+    if name_len==0 { return 0; }
+    if len(out)<NODE_WORDS() { return 800; }
+    if name_start>len(source) || (name_start+name_len)>len(source) {
+        return R_NO_SOURCE();
+    }
+    // The token bounds are the DECLARATION's extent, not the C record's
+    // span: ast.nova's token_begin/token_end index the whole lexeme stream of
+    // the thing a node names, and on the C side the span that exists is the
+    // register's. Writing the register's bytes into the token bounds would be
+    // a pair of indices that address nothing, which is worse than a zero
+    // because it looks like an answer.
+    let decl_start:u64=img[at+C_VAR_DECL_START()];
+    let decl_end:u64=img[at+C_VAR_DECL_END()];
+    let mut i:u64=0;
+    while i<NODE_WORDS() { out[i]=0; i=i+1; }
+    out[N_KIND()]=K_NAME();
+    out[N_SOURCE()]=img[at+C_VAR_SPAN_SOURCE()];
+    out[N_LINE()]=img[at+C_VAR_SPAN_LINE()];
+    out[N_COLUMN()]=img[at+C_VAR_SPAN_COLUMN()];
+    out[N_START()]=name_start;
+    out[N_END()]=name_start+name_len;
+    if decl_start==0 && decl_end==0 { return R_NO_DECL_SPAN(); }
+    out[N_TOKEN_BEGIN()]=decl_start;
+    out[N_TOKEN_END()]=decl_end;
+    return 1;
+}
+
+// One NtFVariable image into one Nova parameter node. The name node is NOT
+// written here; `convert_symbol` owns it and the caller links the two, so a
+// name is either present as a node or absent, and there is no third state
+// where a node exists with nothing in it.
+//
+// `verdict` receives one word per preserved field and the mechanism word. The
+// verdict for symbols is the name LENGTH when there is one and 0 when there
+// is not, and those two are different answers the caller must not conflate --
+// a length of 0 is also what a length-less name would report, and the reason
+// this module refuses to write an empty node is exactly that the two would be
+// indistinguishable afterwards.
+export fn convert_variable(source:buf<u8>,img:buf<u64>,at:u64,
+                           out:buf<u64>,verdict:buf<u64>)->u64 {
+    if len(img)<at+C_VAR_WORDS() { return R_SHORT_IMAGE(); }
+    if len(out)<NODE_WORDS() { return 800; }
+    if len(verdict)<VERDICT_WORDS() { return 800; }
+    let name_start:u64=img[at+C_VAR_NAME_START()];
+    let name_len:u64=img[at+C_VAR_NAME_LEN()];
+    let sp_start:u64=img[at+C_VAR_SPAN_START()];
+    let sp_end:u64=img[at+C_VAR_SPAN_END()];
+    let decl_start:u64=img[at+C_VAR_DECL_START()];
+    let decl_end:u64=img[at+C_VAR_DECL_END()];
+    let c_direction:u64=img[at+C_VAR_DIRECTION()];
+
+    if sp_start>sp_end { return R_BAD_SPAN(); }
+    if sp_end>len(source) { return R_NO_SOURCE(); }
+    // The declaration extent, when the caller has one. Zero means the C record
+    // was all that was available, and the C record does not name a
+    // declaration -- see C_VAR_DECL_START. The direction cannot be derived
+    // without it and is NOT derived from the register.
+    if decl_start==0 && decl_end==0 { return R_NO_DECL_SPAN(); }
+    if decl_start>decl_end { return R_BAD_SPAN(); }
+    if decl_end>len(source) { return R_NO_SOURCE(); }
+    if name_len!=0 && (name_start+name_len)>len(source) { return R_NO_SOURCE(); }
+    // A direction this conversion cannot produce. NTF_LOCAL, NTF_CONST and
+    // NTF_DATA are declared by the C and have no Nova home, and reporting one
+    // of them as NTF_IN would be a wrong answer rather than a refusal.
+    if direction_has_no_nova_home(c_direction)==true { return R_EFFECT_LOSS(); }
+
+    let mut i:u64=0;
+    while i<NODE_WORDS() { out[i]=0; i=i+1; }
+    while i<VERDICT_WORDS() { verdict[i]=0; i=i+1; }
+    out[N_KIND()]=K_PARAMETER();
+    out[N_SOURCE()]=img[at+C_VAR_SPAN_SOURCE()];
+    out[N_LINE()]=img[at+C_VAR_SPAN_LINE()];
+    out[N_COLUMN()]=img[at+C_VAR_SPAN_COLUMN()];
+    out[N_START()]=sp_start;
+    out[N_END()]=sp_end;
+    verdict[V_POSITION()]=1;
+    verdict[V_SYMBOL()]=name_len;
+
+    // M_DERIVED. Read out of the DECLARATION -- `in x:u64 @rax` -- and never
+    // out of the C's own span, which is the register. The C's enumerator is
+    // then checked against the reading, and a disagreement is a refusal: a C
+    // record claiming NTF_IN over a source spelling `out` is a disagreement
+    // about the PROGRAM and not about the format, and a conversion that picked
+    // a winner would be hiding it.
+    let derived:u64=direction_in_span(source,decl_start,decl_end);
+    if derived==0 { return R_EFFECT_LOSS(); }
+    if c_direction+1!=derived { return R_EFFECT_LOSS(); }
+    verdict[V_DIRECTION()]=derived;
+    verdict[V_MECHANISM()]=M_DERIVED();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// EFFECTS, and the negative that decides whether this conversion is honest.
+//
+// NtFFunction carries two triples: `effects` (declared) and `inferred_effects`
+// (the C's own inference over the body). Both are {flags, reads, writes} and
+// both are bit words, so both are M_COPIED in the sense that a bit is a bit.
+//
+// But a bit is not the whole fact. The eleven flag positions are named at
+// frontend.h:195-207, and effects.nova:178-190 is the closed vocabulary that
+// reads them back from the source. So a flag can be checked against a NAME,
+// and `effect_flag_name` is that check: a conversion that carried the bit and
+// dropped the name would carry a number nobody can read back.
+//
+// THE NEGATIVE. An effect-free body. C `effects {}` gives a triple of zeros,
+// and a zero triple is a REAL ANSWER and not an absence. `effect_flag_name(0)`
+// names nothing rather than naming a first effect, and
+// `effect_flag_count(0)` is 0 rather than 11. A conversion that read "no flags"
+// as "flags not read" would report a difference between a function that
+// promises nothing and a function whose promise was dropped, and nothing
+// downstream could tell the two apart -- which is the false positive this lot
+// exists to make impossible.
+// ---------------------------------------------------------------------------
+export fn effect_flag_name(bit:u64)->buf<u8> {
+    if bit==1 { return "privileged"; }
+    if bit==2 { return "changes_flags"; }
+    if bit==4 { return "mmio"; }
+    if bit==8 { return "io_port"; }
+    if bit==16 { return "msr"; }
+    if bit==32 { return "control"; }
+    if bit==64 { return "interrupt_state"; }
+    if bit==128 { return "no_return"; }
+    if bit==256 { return "memory_ordering"; }
+    if bit==512 { return "reads_clock"; }
+    if bit==1024 { return "suspends"; }
+    return "";
+}
+
+// How many of the eleven positions a flag word sets. A word with a bit outside
+// the eleven is a word the closed vocabulary cannot read, and R_EFFECT_LOSS is
+// the refusal. Masking the unknown bit away would report a SMALLER promise
+// than the C made, which is the worst direction to be wrong in: a function
+// that promised `no_return` and reads as promising nothing is a lie about
+// control flow.
+export fn effect_flag_count(flags:u64)->u64 {
+    let known:u64=2047;
+    if (flags & (2047+1))!=0 { return 0xffffffff; }
+    let mut n:u64=0;
+    let mut bit:u64=1;
+    while bit<=1024 {
+        if (flags & bit)!=0 { n=n+1; }
+        bit=bit+bit;
+    }
+    return n;
+}
+
+// The two triples out of an NtFFunction image, eight words:
+//   0 declared flags   1 declared reads   2 declared writes
+//   3 inferred flags   4 inferred reads   5 inferred writes
+//   6 how many of the eleven the declared flags set
+//   7 reserved, always 0
+export fn convert_effects(img:buf<u64>,at:u64,out:buf<u64>)->u64 {
+    if len(img)<at+C_FN_WORDS() { return R_SHORT_IMAGE(); }
+    if len(out)<8 { return 800; }
+    let flags:u64=img[at+C_FN_EFFECT_FLAGS()];
+    let reads:u64=img[at+C_FN_EFFECT_READS()];
+    let writes:u64=img[at+C_FN_EFFECT_WRITES()];
+    if effect_flag_count(flags)==0xffffffff { return R_EFFECT_LOSS(); }
+    if effect_flag_count(img[at+C_FN_INFERRED_FLAGS()])==0xffffffff {
+        return R_EFFECT_LOSS();
+    }
+    // reads and writes are SPACE masks over the six v0 spaces, so a bit
+    // outside the six is a space the catalogue does not hold.
+    if (reads & 63)!=reads { return R_SPACE_CONFLICT(); }
+    if (writes & 63)!=writes { return R_SPACE_CONFLICT(); }
+    out[0]=flags;out[1]=reads;out[2]=writes;
+    out[3]=img[at+C_FN_INFERRED_FLAGS()];
+    out[4]=img[at+C_FN_INFERRED_READS()];
+    out[5]=img[at+C_FN_INFERRED_WRITES()];
+    out[6]=effect_flag_count(flags);
+    out[7]=0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// THE FIELD-BY-FIELD COMPARISON, WHICH IS THE ACCEPTANCE AND NOT A GATE.
+//
+// A converted tree can lose a symbol and still validate: the node count is
+// right, the links are right, and nothing in this tree reads names out of a
+// node record to decide whether one is there. So the acceptance for this
+// conversion is NOT a downstream gate answering 0. It is this function, which
+// takes the C record and the CONVERTED Nova nodes and walks the five preserved
+// fields one at a time, naming the first that differs.
+//
+// `name_present` says whether a name node was written. Passing 1 with a
+// twelve-word buffer full of zeros is the false positive this lot was opened
+// to catch, and the driver is required to run exactly that: the conversion
+// claims a symbol, a node exists, its span is empty, and every structural
+// check on it passes.
+//
+// `verdict` receives one word per field; 0 is agreement and a refusal code is
+// not, and the return value is 0 only when all of them are 0.
+// ---------------------------------------------------------------------------
+export fn compare_variable(source:buf<u8>,img:buf<u64>,at:u64,
+                           node:buf<u64>,name:buf<u64>,name_present:u64,
+                           verdict:buf<u64>)->u64 {
+    if len(img)<at+C_VAR_WORDS() { return R_SHORT_IMAGE(); }
+    if len(node)<NODE_WORDS() { return 800; }
+    if len(verdict)<VERDICT_WORDS() { return 800; }
+    let mut i:u64=0;
+    while i<VERDICT_WORDS() { verdict[i]=0; i=i+1; }
+
+    // POSITIONS, M_COPIED, word for word. This is the one field with a
+    // word-for-word witness on both sides, and it is checked as FIVE
+    // separate comparisons so a driver can name which one moved.
+    if node[N_SOURCE()]!=img[at+C_VAR_SPAN_SOURCE()] { verdict[V_POSITION()]=R_NO_SOURCE(); }
+    if node[N_LINE()]!=img[at+C_VAR_SPAN_LINE()] { verdict[V_POSITION()]=R_BAD_SPAN(); }
+    if node[N_COLUMN()]!=img[at+C_VAR_SPAN_COLUMN()] { verdict[V_POSITION()]=R_BAD_SPAN(); }
+    if node[N_START()]!=img[at+C_VAR_SPAN_START()] { verdict[V_POSITION()]=R_BAD_SPAN(); }
+    if node[N_END()]!=img[at+C_VAR_SPAN_END()] { verdict[V_POSITION()]=R_BAD_SPAN(); }
+
+    // SYMBOLS, and the two directions are different defects.
+    //
+    // The C had a name of length L. The conversion must have produced a name
+    // node whose span is L bytes long over the same bytes. A missing node is a
+    // LOST symbol; a node whose span is not L is a WRONG one; and a node where
+    // the C had none is an INVENTED one. Three defects, three codes, because
+    // a reader who is told "symbol wrong" cannot tell which of the three
+    // happened and will fix the wrong one.
+    let name_len:u64=img[at+C_VAR_NAME_LEN()];
+    let name_start:u64=img[at+C_VAR_NAME_START()];
+    if name_len==0 {
+        // The C had NO name. Any node here is one this conversion invented,
+        // and an invented symbol is worse than a lost one: a lost symbol
+        // fails loudly downstream, an invented one is a name that resolves
+        // against nothing.
+        if name_present!=0 { verdict[V_SYMBOL()]=R_BAD_SPAN(); }
+    } else {
+        if name_present==0 { verdict[V_SYMBOL()]=R_BAD_SPAN(); }
+        else {
+            if name[N_KIND()]!=K_NAME() { verdict[V_SYMBOL()]=R_BAD_SPAN(); }
+            if name[N_START()]!=name_start { verdict[V_SYMBOL()]=R_BAD_SPAN(); }
+            if (name[N_END()]-name[N_START()])!=name_len {
+                verdict[V_SYMBOL()]=R_BAD_SPAN();
+            }
+        }
+    }
+
+    // TYPES, M_ENUMS. The C's enumerator and the node's aux, through the
+    // table, and the agreement is on the FORM because the FORM is the only
+    // part of the enumerator with a Nova word. `C_VAR_TYPE` carries a C
+    // NtFId, which is an INDEX into the program's type table and not a kind,
+    // so the driver resolves it and writes the kind in its place; a resolver
+    // that passed the id through would compare a type index against a form and
+    // get a wrong answer that looks like a mismatch on every record.
+    if type_form(img[at+C_VAR_TYPE()])!=node[N_AUX()] {
+        verdict[V_TYPE()]=R_NO_TYPE_KIND();
+    }
+
+    // DIRECTION, M_DERIVED, checked against the SOURCE and never against the
+    // node. A node that carried a direction word could not be checked here at
+    // all, and that is the entire reason this field is on this list: it is
+    // the one preserved field whose witness lives outside both records.
+    //
+    // It is read from the DECLARATION EXTENT and not from the converted
+    // node's own span, because the C's span is the register and a comparison
+    // that read the node's span would be checking the conversion against
+    // itself -- a tautology, and the exact shape of the false positive this
+    // lot exists to refuse. The witness has to come from the C record, and
+    // the C record's direction-bearing fact is the enumerator, which is what
+    // the second half of this test confronts.
+    let decl_start:u64=img[at+C_VAR_DECL_START()];
+    let decl_end:u64=img[at+C_VAR_DECL_END()];
+    if decl_start==0 && decl_end==0 {
+        verdict[V_DIRECTION()]=R_NO_DECL_SPAN();
+    } else {
+        let derived:u64=direction_in_span(source,decl_start,decl_end);
+        if derived==0 { verdict[V_DIRECTION()]=R_EFFECT_LOSS(); }
+        // The C numbers directions 0..5 from NTF_IN; this numbers them 1..3
+        // from `in`, so the two are offset by one and the comparison is on the
+        // MEANING. A C parameter whose direction the source does not spell is
+        // a disagreement about the program, and it is refused.
+        if derived!=0 && img[at+C_VAR_DIRECTION()]+1!=derived {
+            verdict[V_DIRECTION()]=R_EFFECT_LOSS();
+        }
+    }
+
+    // SPACES, M_DERIVED again, and the same reason. A space is TEXT.
+    if type_is_pointer(img[at+C_VAR_TYPE()])==true {
+        if space_bit_of(img[at+C_VAR_TYPE()])==0xffffffff {
+            verdict[V_SPACE()]=R_SPACE_CONFLICT();
+        }
+    }
+
+    let mut j:u64=0;
+    while j<VERDICT_WORDS() {
+        if verdict[j]!=0 { return verdict[j]; }
+        j=j+1;
+    }
+    return 0;
+}
+
+// ---- the function header -------------------------------------------------
+//
+// The C's NtFFunction name is a symbol like any other and the function's span
+// is the span of everything. `convert_function` writes the node and nothing
+// else: the name, the section and the parameter chain are separate
+// conversions, so that each of the five preserved fields has ONE owner and a
+// failure names which one.
+export fn convert_function(source:buf<u8>,img:buf<u64>,at:u64,
+                           out:buf<u64>,verdict:buf<u64>)->u64 {
+    if len(img)<at+C_FN_WORDS() { return R_SHORT_IMAGE(); }
+    if len(out)<NODE_WORDS() { return 800; }
+    if len(verdict)<VERDICT_WORDS() { return 800; }
+    let sp_start:u64=img[at+C_FN_SPAN_START()];
+    let sp_end:u64=img[at+C_FN_SPAN_END()];
+    if sp_start>sp_end { return R_BAD_SPAN(); }
+    if sp_end>len(source) { return R_NO_SOURCE(); }
+    let name_len:u64=img[at+C_FN_NAME_LEN()];
+    let name_start:u64=img[at+C_FN_NAME_START()];
+    if name_len!=0 && (name_start+name_len)>len(source) { return R_NO_SOURCE(); }
+
+    let mut i:u64=0;
+    while i<NODE_WORDS() { out[i]=0; i=i+1; }
+    while i<VERDICT_WORDS() { verdict[i]=0; i=i+1; }
+    out[N_KIND()]=K_FUNCTION();
+    out[N_SOURCE()]=img[at+C_FN_SPAN_SOURCE()];
+    out[N_LINE()]=img[at+C_FN_SPAN_LINE()];
+    out[N_COLUMN()]=img[at+C_FN_SPAN_COLUMN()];
+    out[N_START()]=sp_start;
+    out[N_END()]=sp_end;
+    // The one enumerator on this record that IS a word: `exported` is a C
+    // int and parser.nova:412 writes it into aux. M_ENUMS, two entries,
+    // because the C has two values and the table has two rows.
+    if img[at+C_FN_EXPORTED()]!=0 { out[N_AUX()]=1; }
+    verdict[V_POSITION()]=1;
+    verdict[V_SYMBOL()]=name_len;
+    verdict[V_MECHANISM()]=M_COPIED();
+    return 0;
+}

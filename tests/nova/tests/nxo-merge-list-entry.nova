@@ -1,0 +1,41 @@
+module ntasm_nxo_merge_list_entry;
+import ntasm_nxo;
+import ntasm_nxo_merge;
+import ntasm_pe;
+// out layout matches the pairwise entry: bytes 0..8 = merged size (u64 little
+// endian), bytes 8.. = image. `inputs` is one arena holding `count`
+// descriptors of 16 bytes (offset,length) followed by the NXO payloads:
+// buf<u8> is the only shape that crosses the Nova boundary, so a variable
+// length link unit is described in band instead of through a handle table.
+// mode 0 links the whole arena with merge_list; mode 1 links the first two
+// descriptors with the pairwise merge, so one entry can compare both paths;
+// mode 2 merges `inputs` against `aux` as two independent borrows, which is the
+// only way to observe a capacity limit above the 64MiB single-buffer ceiling.
+// 822: out is too short to hold 8+size bytes; nothing is written and the
+// WriteResult bytes are freed, so the call is transactional.
+fn forward(result:ntasm_nxo.WriteResult,out:buf<u8>)->u64 {
+    if result.code!=0 { return result.code; }
+    let bytes:buf<u8>=result.bytes;
+    let size:u64=len(bytes);
+    if len(out)<size+8 {
+        rt_free(runtime(),bytes);
+        return 822;
+    }
+    ntasm_pe.copy(out,8,bytes);
+    rt_free(runtime(),bytes);
+    ntasm_pe.put64(out,0,size);
+    return 0;
+}
+fn pair(inputs:buf<u8>,count:u64,out:buf<u8>)->u64 {
+    if count<2 || len(inputs)<32 { return 800; }
+    let left:buf<u8>=slice(inputs,ntasm_pe.read64(inputs,0),ntasm_pe.read64(inputs,8));
+    let right:buf<u8>=slice(inputs,ntasm_pe.read64(inputs,16),ntasm_pe.read64(inputs,24));
+    let result:ntasm_nxo.WriteResult=ntasm_nxo_merge.merge(left,right);
+    rt_free(runtime(),left);rt_free(runtime(),right);
+    return forward(result,out);
+}
+export fn main(inputs:buf<u8>,count:u64,out:buf<u8>,mode:u64,aux:buf<u8>)->u64 {
+    if mode==1 { return pair(inputs,count,out); }
+    if mode==2 { return forward(ntasm_nxo_merge.merge(inputs,aux),out); }
+    return forward(ntasm_nxo_merge.merge_list(inputs,count),out);
+}

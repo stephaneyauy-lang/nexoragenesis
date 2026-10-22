@@ -1,0 +1,89 @@
+module machine_link_entry;
+
+import ntasm_nxo_link_pe;
+import ntasm_nxo_pe;
+
+// ===========================================================================
+// THE LINK ENTRY, and why it is not the same file as machine-driver-entry.nova.
+//
+// MEASURED, NOT ASSUMED. The driver's first shape put both faces in one Nova
+// program: the entry imported `machine_pipeline` AND `ntasm_nxo_link_pe`, whose
+// closure is fifty-one modules. `nova_compile_many_v2` compiled them -- and the
+// image it produced was 17101321 bytes of .text, while `nova/run_host.c`
+// refuses to map anything above 16 MiB. The driver then refused to open with
+// "could not be mapped", which is a fact about the host adapter and not about
+// the producer, and no amount of reading the pipeline would have said which of
+// the two it was.
+//
+// So the linker has its own entry over its own five-module closure and the C
+// driver holds two images. A step that merges containers needs no parser, no
+// validator, no NTIR and no encoder, and it does not pay for them.
+//
+// THE ARENA IS NOT BUILT HERE. `inputs` is the arena `link_pe_list` reads:
+// `count` 16-byte (offset,length) descriptors followed by the NXO payloads. The
+// C driver builds it, because that arithmetic already exists in
+// tests_ntasm_nxo_link_pe_list.c and duplicating it here would be the third
+// copy of one layout.
+//
+// TRANSACTIONAL. A refusal frees the converted bytes and writes NOTHING to
+// `out`; a success takes its length from the buffer Nova itself allocated, so a
+// success with no bytes is not a shape this function can produce. report[8] and
+// report[9] name the refusing stage and its code on the same two words the
+// pipeline uses, so the C driver reads one report layout for both images.
+//
+//   mode 0  the VOCABULARY, four words: the link face's number, the report
+//           width this entry needs, and the two literals it cannot read from
+//           `machine_pipeline` because importing that module is the thing this
+//           file exists to avoid. They are PUBLISHED rather than trusted: the C
+//           driver refuses to call this entry unless the delivery code and the
+//           link stage it publishes are the ones the pipeline image published.
+//           Two files writing one number and never comparing them is how a
+//           caller ends up reading a refusal's code as something it is not.
+//   mode 4  ntasm_nxo_link_pe.link_pe_list over the arena.
+// ===========================================================================
+
+// Those two literals as FUNCTIONS and not as words in the report, because
+// `main` clears the report on entry: a value published by mode 0 and read back
+// by mode 4 would be reading its own zero. The vocabulary and the refusals both
+// go through these two, so they cannot drift apart inside this file either.
+fn LINK_STAGE()->u64 { return 9; }
+fn DELIVERY()->u64 { return 970; }
+fn REPORT_WIDTH()->u64 { return 16; }
+
+export fn main(inputs:buf<u8>,want:u64,count:u64,out:buf<u8>,
+        length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<REPORT_WIDTH() { return 800; }
+    if len(length)<1 { return 800; }
+    length[0]=0;
+    let mut i:u64=0;
+    while i<REPORT_WIDTH() { report[i]=0; i=i+1; }
+    if want==0 {
+        report[0]=4;
+        report[1]=REPORT_WIDTH();
+        report[2]=DELIVERY();
+        report[3]=LINK_STAGE();
+        return 0;
+    }
+    if want!=4 { return 800; }
+    let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_link_pe.link_pe_list(inputs,count);
+    let bytes:buf<u8>=converted.bytes;
+    if converted.code!=0 {
+        rt_free(runtime(),bytes);
+        report[8]=LINK_STAGE();
+        report[9]=converted.code;
+        return converted.code;
+    }
+    let size:u64=len(bytes);
+    if len(out)<size {
+        rt_free(runtime(),bytes);
+        report[8]=LINK_STAGE();
+        report[9]=DELIVERY();
+        return DELIVERY();
+    }
+    let mut k:u64=0;
+    while k<size { out[k]=bytes[k]; k=k+1; }
+    rt_free(runtime(),bytes);
+    report[5]=size;
+    length[0]=size;
+    return 0;
+}

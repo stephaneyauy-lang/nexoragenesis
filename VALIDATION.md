@@ -1,57 +1,41 @@
-# Vérification du snapshot public
+# Validation de la réorganisation — 22 octobre 2026
 
-Rejoué le **26 septembre 2026** dans cette copie sous WSL/Linux x86_64, GCC, AddressSanitizer et UndefinedBehaviorSanitizer, avec détection des fuites. Les harnesses ci-dessous sont compilés avec `-Wall -Wextra -Werror`.
+**Copie de revue locale. Aucun commit, push ni livraison B2.1 annoncée.**
 
-| Contrôle | Vérifications réussies |
-|---|---:|
-| Lexer / parser NTASM | 311 / 52 |
-| Initialisations / retours / arguments / conditions | 96 / 87 / 78 / 150 |
-| Pipeline global | 243 (80 cas) |
-| Encodeur fixe / immédiats / mémoire / setcc | 225 / 8715 / 1284 / 792 |
-| Appels locaux multiples : NXO / PE | 225 / 225 |
-| Appel local avec données : NXO / PE | 52 / 55 |
-| Objet combiné données/import | 42 |
-| Fusion NXO / liaison PE | 84 / 35 |
-| Nova v2 | 59 |
-| Reader/writer NXO (fixture publiée) | 2490 |
-| Appel indirect GPR64 | 4 |
+| Contrôle réellement exécuté | Résultat et portée |
+|---|---|
+| Compilation du compilateur principal | 17 unités C compilées et liées avec GCC O0 ; contrôle de déplacement distinct du build officiel |
+| Corpus NTASM épinglé | 8 PE produits, 8 empreintes identiques aux références antérieures |
+| Objet NXO via le backend C | Réussi, 496 octets, exemple return42 |
+| Objet NXO via le backend MIR | Non validé : allocation Nova refusée sous la limite de 1 Gio du test |
+| Includes C locaux | 730 références, aucune cible manquante |
+| Modules Nova chargés explicitement par C | 57 chemins, tous présents |
+| En-tête supprimé dans une copie de contrôle | Refus effectif, code 78 |
+| Corpus déclaré du build | 9 fichiers épinglés, 3 exclusions, aucun désaccord |
+| Syntaxe des scripts actifs et exemples OS | 9 Python et 6 Bash, aucune erreur |
+| Liens des nouveaux documents d'entrée | Aucune cible manquante |
+| Bannière SVG | XML valide, ressource locale sans script ni service externe |
 
-## Reproduire les contrôles
+## Trois écarts préexistants restent visibles
 
-Depuis la racine du dépôt, dans Bash avec GCC disponible :
+`bash scripts/ntbuild.sh pins --verify` vérifie 35 entrées : **32 conformes, 3 écarts**.
 
-```bash
-set -euo pipefail
-mkdir -p build
-root=bootstrap/quarantine/c
-libs=("$root"/{nova,ntasm,frontend,codegen,x64,pe,object,object_build,object_link,object_materialize,conformance}.c "$root/nova/run_host.c" "$root/nova/runtime_v2.c")
-objects=()
-for source in "${libs[@]}"; do
-  object="build/$(basename "$source" .c).o"
-  gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-    -I"$root" -c "$source" -o "$object"
-  objects+=("$object")
-done
-for gate in lexer parser initializer_types return_types call_types condition_types validate x64_fixed x64_ri x64_memory x64_setcc x64_lower_nxo_local_multi x64_lower_nxo_local_multi_pe x64_lower_nxo_local_data x64_lower_nxo_local_data_pe x64_lower_nxo_combined nxo_merge nxo_link_pe; do
-  gcc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-    -I"$root" "${objects[@]}" "$root/nova/tests_ntasm_${gate}.c" -o "build/$gate"
-  ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "build/$gate"
-done
-gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-  -I"$root" "${objects[@]}" "$root/tests_nova_v2.c" -o build/nova_v2
-ASAN_OPTIONS=detect_leaks=1 build/nova_v2
-```
+- `compiler/c/nova/frontend/nova.c` : empreinte déclarée antérieure au contenu du principal.
+- `compiler/c/nova/frontend/nova.h` : même situation.
+- `compiler/c/nova/analysis/seed_reachability.h` : en-tête requis sans empreinte déclarée.
 
-## Portée et limites
+Les références des autres sources ont été adaptées uniquement lorsque l'ancienne source correspondait déjà à son empreinte et que la transformation concernait les chemins/includes. Les trois écarts antérieurs n'ont pas été effacés. Les préimages et empreintes des transformations sont conservées dans le reçu local.
 
-Ces résultats portent sur les corpus fournis, pas sur toute la spécification. Les NXO/PE sont comparés octet par octet aux oracles C. Les API d'abaissement restent des profils bornés : noms et formes contrôlés, appels multiples vers le helper local, données scalaires émises mais non référencées par le code.
+La compilation de contrôle démontre que le déplacement permet de reconstruire le programme et de reproduire son corpus. Elle ne remplace pas l'acceptation du build officiel, toujours bloqué par ces trois écarts de confiance.
 
-`&&` et `||` ont une preuve lexicale, syntaxique et de typage ; aucun court-circuit x64 à l'exécution n'est encore revendiqué. Les expressions constantes ne sont pas encore évaluées et transmises aux octets de données.
+## Travail restant
 
-Le compilateur Nova dépend encore du bootstrap C. Aucun auto-hébergement, NTASM B2.1 complet ou build complet de l'OS n'est revendiqué. Voir [la spécification](spec/ntasm.md) et [les critères de livraison](docs/ntasm-completion.md).
+- Valider explicitement les trois entrées avant de mettre à jour leurs empreintes.
+- Rejouer le backend MIR avec une enveloppe mémoire adaptée, dans les gardes de la machine.
+- Rejouer la suite étendue après déplacement : les chemins construits dynamiquement par les anciens harnesses ne sont pas tous couverts par le contrôle statique.
+- Rejouer les OS/QEMU : les chemins des scripts ont été adaptés, pas leurs boots revalidés.
+- Terminer A8, dont l'essai 05 s'est arrêté en `paused (shutdown)`, puis finaliser A9.
 
-La preuve UEFI du Hello World du 20 septembre provient de l'espace de travail original ; aucun nouveau boot QEMU n'est revendiqué pour cette publication.
+Les cases A1–A7/A10 du README reflètent les validations enregistrées du principal, pas une certification exhaustive de cette copie. Les archives citées sous `out/` ne sont pas toutes distribuées.
 
-## Adaptations de publication
-
-Deux dépendances de test auparavant sous `out/` sont distribuées sous `toolchain/ntasm-nova/tests/fixtures/` : le témoin NTASM d'exception et le module PE de dépendance du banc NXO. Seuls les chemins des harnesses ont été adaptés dans cette copie. Aucune note privée, clé, configuration d'agent ou image disque n'est incluse.
+Les traces détaillées de préparation sont dans `.publication-local/`, exclu de Git. Le laboratoire principal, le checkout public avec ses changements OS et la clé USB sont préservés.

@@ -1,69 +1,128 @@
+<p align="center"><img src="assets/nexora-banner.svg" alt="Nexora Genesis — Du langage à la machine" width="100%"></p>
+
 # Nexora Genesis
 
-Chaîne NTASM/Nova pour produire des programmes exécutables.
+**Un assembleur typé, des compilateurs et des langages pour construire des systèmes.**
 
-**Nature :** Langages · recherche. Projet d’apprentissage et d’expérimentation réalisé avec l’aide d’IA. Cela ne signifie pas qu’une personne seule a écrit ou maîtrise l’ensemble du code.
+[Démarrer](docs/guides/ntasm-quickstart.md) · [Explorer le compilateur](compiler/README.md) · [Spécifications](spec/README.md) · [Roadmaps](#roadmaps) · [Validation](VALIDATION.md) · [Licence MIT](LICENSE)
 
-## État de ce dépôt
+> **Édition de recherche — 22 octobre 2026.** Le compilateur principal fonctionne encore avec un bootstrap C. La relève en Nova progresse, mais A8 et A9 restent ouverts : cette copie n'est pas annoncée comme une livraison B2.1 achevée.
 
-**Snapshot de recherche, pas encore une toolchain complète livrable.** Cette copie de publication est mise à jour le **26 septembre 2026**, avec le pipeline NTASM en Nova et les modules validés jusqu'à la campagne du 25 septembre. Elle ne contient pas l’historique Git des originaux.
+## Trouver ce que l'on cherche
 
-Les deux catégories de preuve sont séparées : les anciens résultats concernent l’espace de travail original ; seuls les tests explicitement marqués « rejoué » ci-dessous concernent cette copie.
-
-Binaires du compilateur, snapshots de campagne, images UEFI, journaux et recettes de publication privées sont absents. Aucun point fixe final ni NTASM v0 complet revendiqué.
-
-## Parcours de lecture et exemple
-
-Lire l’exemple return42, puis suivre l’analyse et la liaison dans le bootstrap C. Les familles de langages NTASM et Nova restent en construction.
-
-| Fichier présent | Rôle ou repère réel |
+| Dossier | Rôle |
 |---|---|
-| [examples/ntasm-v0/c-bootstrap/return42.ntasm](examples/ntasm-v0/c-bootstrap/return42.ntasm) | Symboles repérés : `bootstrap` |
-| [bootstrap/quarantine/c/main.c](bootstrap/quarantine/c/main.c) | Source ou point d’entrée à examiner |
-| [bootstrap/quarantine/c/frontend.c](bootstrap/quarantine/c/frontend.c) | Symboles repérés : `Allocation` |
-| [bootstrap/quarantine/c/object_link.c](bootstrap/quarantine/c/object_link.c) | Source ou point d’entrée à examiner |
+| [`compiler/c/`](compiler/c/README.md) | Implémentation C actuellement utilisée pour construire le compilateur principal |
+| [`compiler/nova/`](compiler/nova/README.md) | Modules Nova : frontend, types, appels, ABI, macros, IR, x86-64, NXO et PE |
+| [`compiler/runtime/`](compiler/runtime/README.md) | Exécution Nova et hôte UEFI natif |
+| [`tests/`](tests/README.md) | Tests, cas négatifs et programmes de contrôle, séparés des implémentations |
+| [`spec/`](spec/README.md) | Contrats de langage, formats et cible x86-64 |
+| [`docs/`](docs/README.md) | Guides d'usage, architecture et état des jalons |
+| [`examples/os/`](examples/os/README.md) | Exemples OS et démonstrations, conservés hors de `legacy/` |
+| [`tools/`](tools/README.md) | Outils utiles à la copie actuelle |
+| [`bootstrap/`](bootstrap/README.md) | Description du seed minimal ; les anciens bootstrap sont archivés |
+| [`legacy/`](legacy/README.md) | Anciennes implémentations et outils de campagne, hors du build normal |
 
-## Structure
+## De la source à l'exécutable
 
-Les sources sont réparties entre `bootstrap`, `examples`, `toolchain` et `os` ; `spec` et `docs` décrivent les contrats et les limites de livraison.
+```mermaid
+flowchart LR
+    A[Sources NTASM] --> B[Lexique et parseur]
+    B --> C[Types · appels · ABI · macros]
+    C --> D[IR et émission x86-64]
+    D --> E[Objet NXO]
+    E --> F[Liaison et PE]
+```
 
-La liste exhaustive des sources sélectionnées figure dans [PUBLICATION.json](PUBLICATION.json). Elle permet de vérifier ce qui est réellement distribué et les adaptations propres à cette copie.
+Le backend C est la voie principale actuelle. Le backend MIR charge des modules Nova. Les deux chemins ne constituent pas deux preuves équivalentes : leurs tests et limites sont décrits dans [VALIDATION.md](VALIDATION.md).
 
-## Modules désormais inclus
+## Première lecture
 
-- Analyse des déclarations, références, appels et arité ; contrôle des noms, paramètres, variables et registres dans `toolchain/ntasm-nova/`.
-- Validation sémantique commune en Nova : [validate.nova](toolchain/ntasm-nova/validate.nova), comprenant 33 passes et les alias physiques x86_64.
-- Effets et clobbers déclarés, propagation aux appels, contrôles des accès mémoire et d'intrinsèques ; preuve aux appels d'un sous-ensemble des contrats, décrit dans la [spécification](spec/ntasm.md).
-- Contrôle de flot terminal, ABI nx64, types des arguments et retours, espaces de pointeurs, cibles, versions et fonctionnalités CPU.
-- Expressions entières imbriquées, opérateurs unaires, portée lexicale et rejet des noms qualifiés invalides dans les initialisations, retours, arguments et conditions.
-- Syntaxe et typage de `!`, `&&` et `||`, avec précédence et profondeur bornée. Le court-circuit à l'exécution n'est pas encore démontré ; les expressions constantes ne sont pas encore évaluées et transmises aux octets de données.
-- Inspection des symboles et relocations NXO, fusion de deux objets et chaîne [NXO vers PE](toolchain/ntasm-nova/nxo_link_pe.nova).
-- Encodeur x64 écrit en Nova, labels en deux passes, adressage ModRM/SIB et API de longueur large. Producteurs NXO ciblés : données scalaires, imports REL32, deux fonctions locales et jusqu'à 64 appels au helper ; [conversion en PE](toolchain/ntasm-nova/x64_lower_nxo_pe.nova) comparée à l'oracle C. Les noms et formes admis restent bornés, les données émises ne sont pas encore référencées par le code.
-- Correction du bootstrap Nova pour passer un champ buffer aux fonctions et à `slice`.
-- Capacité du bootstrap Nova portée à 524 288 nœuds et 131 072 variables locales après reproduction de limites sur le pipeline composé ; la suite Nova v2 reste verte.
+```ntasm
+module bootstrap.return42
+target x86_64-nexora-uefi
+section .text {
+    export fn main() -> u64
+    effects {}
+    clobbers {rax} {
+        return 42;
+    }
+}
+```
 
-Ces composants ne constituent pas encore NTASM v0 complet. Restent notamment les effets et contrats complets, l'ABI, les macros/comptime, la couverture d'encodage, les stubs système et la reconstruction autonome.
+Cet exemple est conservé dans [`examples/ntasm-v0/c-bootstrap/return42.ntasm`](examples/ntasm-v0/c-bootstrap/return42.ntasm). Les exemples ne remplacent pas la [spécification](spec/ntasm/ntasm.md).
 
-## Prérequis
+## Construire
 
-### Premier programme de démarrage
+Sous Linux ou WSL avec Bash, GCC et les outils GNU :
 
-[Stage 0 en NTASM](os/boot/stage0.ntasm) appelle la console UEFI pour afficher `Hello World`, conserve le témoin debugcon puis termine la VM de test. La preuve QEMU/OVMF du 20 septembre vient de l'espace de travail original, avec une image UEFI de 3 072 octets ; elle n'est pas revendiquée comme un nouveau boot de cette publication. Ce programme reste un pré-noyau. Voir [sa portée et ses limites](os/boot/README.md). Le périmètre PolyForm des compilateurs n'est pas étendu au répertoire `os/` par cet ajout.
+```bash
+bash scripts/ntbuild.sh policy
+bash scripts/ntbuild.sh pins --verify
+bash scripts/ntbuild.sh build
+```
 
-Compilateur C pour le bootstrap ; les autres étapes dépendent des outils et versions de la chaîne originale.
+**La vérification des empreintes signale encore trois écarts hérités du principal.** Ils sont conservés et documentés ; ne pas les contourner pour annoncer un build officiel réussi. Le contrôle de réorganisation a néanmoins recompilé les 17 unités C et reproduit les huit sorties PE de référence. Les sorties de travail restent dans `out/`, exclu de Git.
 
-## Commandes et vérification
+## Roadmaps
 
-Les contrôles ciblés sont décrits dans [VALIDATION.md](VALIDATION.md), avec les commandes GCC utilisables depuis la racine de cette copie. Ils construisent des exécutables de test hôte ; aucune VM ni intervention sur un disque réel n'est nécessaire. Une construction complète de l'OS et le point fixe final restent hors de cette preuve.
+Les cases cochées indiquent les jalons déclarés validés dans le principal, ou une preuve précisément nommée. Elles ne certifient pas que toute cette copie a été retestée. Les autres roadmaps sont des objectifs de développement, sans date ni pourcentage inventé.
 
-La validation publiée distingue les suites réellement rejouées dans cette copie des preuves historiques. Elle ne remplace ni un build intégral de l'OS ni l'auto-hébergement des compilateurs.
+### NTASM — B2.1
 
-## Ce qui a été exclu ou adapté
+- [x] **A1 — Spécification et formats** : grammaire et formats figés selon le contrat actuel.
+- [x] **A2 — x86-64** : encodages, adressage et relocations du périmètre v0.
+- [x] **A3 — Modules et typage** : fonctions, modules et types machine.
+- [x] **A4 — Contrats et ABI** : effets, clobbers et conventions d'appel.
+- [x] **A5 — Macros et comptime** : expansion, hygiène et bornes.
+- [x] **A6 — Stubs système** : chemins structurés et preuves QEMU enregistrées.
+- [x] **A7 — Chaîne commune** : IR, objets NXO, PE et exécution enregistrée.
+- [ ] **A8 — Auto-hébergement complet** : terminer le build maison, le vérifier et retirer le C du build normal.
+- [ ] **A9 — Livraison utilisable** : finaliser commandes, paquet et reproductibilité après A8.
+- [x] **A10 — Diagnostics et contrôles** : améliorations et comparaisons enregistrées.
 
-Conversations, notes de travail privées, identifiants, clés, modèles, profils de navigateur, journaux, images disque, assets et dépendances locales ne sont pas redistribués. Les chemins de profil personnel ont été remplacés par des chemins d’exemple uniquement dans la copie. Les sources originales restent inchangées. Les scripts de système ou de matériel doivent rester dans un environnement de laboratoire : ne pas les lancer sur un disque réel ou une machine de production.
+Référence : [contrat B2.1](docs/status/ntasm-completion.md). **Avant le push de cette édition :** valider les trois écarts d'empreintes et revoir la réorganisation ; ne pas cocher A8 sur la seule réussite d'un lot.
 
-## Aide de l’IA, composants tiers et droits
+### Nova — une chaîne autonome
 
-Les IA ont participé aux explications, à l’écriture et aux vérifications. Les langages, bibliothèques, moteurs et outils utilisés restent attribués à leurs auteurs. Une adaptation ou un prototype inspiré d’un univers tiers n’en revendique pas la création.
+- [x] Observer un point fixe du compilateur Nova : P1 et P2 identiques sur les sources du 21 octobre.
+- [x] Produire le pilote NTASM avec P2 et vérifier son corpus de 19 cas dans le laboratoire.
+- [ ] Terminer la reconstruction complète sur le runtime maison, sans traduction des sources par C.
+- [ ] Rejouer les preuves depuis une copie propre, avec les nouveaux chemins du dépôt.
+- [ ] Faire de cette chaîne le build normal et déplacer le bootstrap C hors des dépendances requises.
+- [ ] Figer la grammaire, les interfaces du runtime et la bibliothèque minimale de la prochaine version Nova.
+- [ ] Mesurer les coûts de compilation et corriger les lenteurs avec des cas reproductibles.
+- [ ] Définir et valider séparément les besoins GPU avant d'annoncer un compilateur GPU utilisable.
 
-Les compilateurs couverts sont proposés sous [PolyForm Small Business 1.0.0](LICENSE), texte officiel inchangé. Le [périmètre de la licence](LICENSING.md) distingue les compilateurs des autres composants et précise la possibilité d'un accord commercial séparé. Les licences tierces restent applicables. Aucun taux automatique de redevance n'est ajouté à PolyForm.
+### C-Nova — programmation système
+
+- [ ] Définir précisément le périmètre CPU/système et sa différence avec Nova et NTASM.
+- [ ] Écrire la grammaire, les règles de types, de mémoire et d'interopérabilité.
+- [ ] Construire une première verticale : source → IR commune → exécutable testé.
+- [ ] Ajouter les fonctions, structures, modules et accès mémoire prévus par la spécification.
+- [ ] Valider un petit composant système avec cas positifs et négatifs.
+- [ ] Documenter les garanties et les opérations explicitement non sûres.
+
+### NX — applications et outils
+
+- [ ] Figer les premiers usages et le contrat d'exécution.
+- [ ] Définir les types, modules, erreurs et interfaces avec Nova/C-Nova.
+- [ ] Relier un frontend minimal à la chaîne commune.
+- [ ] Livrer un programme d'application complet et reproductible.
+- [ ] Ajouter bibliothèque, diagnostics, outils et guide utilisateur au rythme des usages validés.
+
+### MEM et scheduler — pistes à spécifier
+
+- [ ] **MEM** : préciser le besoin que les langages existants ne couvrent pas déjà.
+- [ ] Définir régions, durées de vie, permissions et interfaces mémoire à tester.
+- [ ] Comparer un prototype à une implémentation de référence avant de promettre un gain.
+- [ ] **Scheduler** : définir le modèle de tâches, les contraintes temporelles et les invariants.
+- [ ] Valider d'abord le modèle dans un simulateur, puis dans un exemple OS contrôlé.
+
+L'ordre de priorité reste **NTASM A8 → A9 → consolidation Nova → nouveaux langages**. Ces pistes ne signifient pas que MEM ou un langage de scheduler sont déjà implémentés.
+
+## Licence et contribution
+
+Cette édition du code original et de sa documentation est proposée sous **[MIT](LICENSE)** : utilisation gratuite, y compris commerciale, avec conservation des mentions exigées. Les licences propres aux composants tiers restent applicables. Voir [LICENSING.md](LICENSING.md).
+
+Projet développé avec l'aide d'IA. Une preuve historique, un fichier généré ou une case cochée ne remplacent pas un test reproductible sur la version que l'on publie.

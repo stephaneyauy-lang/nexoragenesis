@@ -1,0 +1,55 @@
+module native_runtime_roundtrip;
+// Seed/oracle fixture: real Nova ABI2 operations; not a compiler producer.
+struct Progress { bytes:u64 }
+fn main()->u64 {
+    let progress:Progress=Progress{bytes:0};
+    let source:buf<u8>=alloc(runtime(),16);
+    let destination:buf<u8>=alloc(runtime(),16);
+    let mut i:u64=0;
+    while i<16 {
+        if i<10 { source[i]=u8(48+i); }
+        else { source[i]=u8(87+i); }
+        if destination[i]!=0 { return 10; }
+        i=i+1;
+    }
+    let source_window:buf<u8>=slice(source,4,8);
+    let destination_window:buf<u8>=slice(destination,2,8);
+    if len(source_window)!=8 || len(destination_window)!=8 { return 11; }
+    let copied:u64=rt_copy(runtime(),destination_window,source_window,8);
+    if copied!=8 { return 12; }
+    i=0;
+    while i<8 {
+        if destination[2+i]!=source[4+i] { return 13; }
+        i=i+1;
+    }
+    rt_free(runtime(),source_window);
+    rt_free(runtime(),destination_window);
+    rt_copy(runtime(),destination,source,16);
+    let path:buf<u8>="NOVA.BIN";
+    let writer:u64=rt_open_new(runtime(),path);
+    let written:u64=rt_write(runtime(),writer,destination);
+    rt_close(runtime(),writer);
+    if written!=16 { return 14; }
+    i=0;
+    while i<16 { destination[i]=0; i=i+1; }
+    let reader:u64=rt_open_read(runtime(),path);
+    let received:u64=rt_read(runtime(),reader,destination);
+    rt_close(runtime(),reader);
+    if received!=16 { return 15; }
+    progress.bytes=received;
+    if progress.bytes!=16 { return 17; }
+    i=0;
+    while i<16 {
+        if destination[i]!=source[i] { return 16; }
+        i=i+1;
+    }
+    let diagnostic:buf<u8>="NG_NOVA_ABI2_BYTES_OK\r\n";
+    rt_diag(runtime(),diagnostic);
+    rt_free(runtime(),diagnostic);
+    rt_free(runtime(),path);
+    rt_free(runtime(),destination);
+    rt_free(runtime(),source);
+    rt_free(runtime(),progress);
+    return 0;
+}
+

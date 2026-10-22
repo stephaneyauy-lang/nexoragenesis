@@ -1,0 +1,9 @@
+module x64_lower_lea_entry;import ntasm_ast;import ntasm_parser;import x64_lower_control;
+export fn main(source:buf<u8>,features:u64,cpl:u64,out:buf<u8>)->u64 {
+    if len(out)<2{return 800;}let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false{ntasm_ast.release(tree);return 800;}
+    let bytes:buf<u8>=alloc(runtime(),len(out)-1);let length:buf<u64>=alloc(runtime(),1);
+    let code:u64=x64_lower_control.lower_wide(source,tree,features,cpl,bytes,length);
+    if code==0{out[0]=u8(length[0]);let mut i:u64=0;while i<length[0]{out[i+1]=bytes[i];i=i+1;}}
+    rt_free(runtime(),bytes);rt_free(runtime(),length);ntasm_ast.release(tree);return code;
+}

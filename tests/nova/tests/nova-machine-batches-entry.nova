@@ -1,0 +1,89 @@
+module nova_machine_batches_entry;
+import nova_language_parse;
+import nova_machine_batches;
+import machine_pipeline;
+import ntasm_nxo_link_pe;
+import ntasm_nxo_pe;
+import ntasm_pe;
+
+// THE BATCH ENTRY.
+//
+// parse_many -> build_objects -> link_pe_list, and nothing else: the frontend
+// is the frontend, the batches are the batches, and the linker is the linker.
+// No stage is copied here.
+//
+// THE OUTPUT LAYOUT is the pairwise entry's: bytes 0..8 are the PE's size
+// (u64 little endian), bytes 8.. are the image. 827: `out` is too short to
+// hold 8+size bytes; nothing is written and the PE bytes are freed, so the
+// call is transactional.
+//
+// THE BORROWED BUFFERS ARE NOT FREED. The tables, the words, the declaration
+// text, the arena and the output belong to the caller, and the arena is what
+// the linker reads: this entry lends them and gives them back. What the entry
+// OWNS -- the lengths cell and the conversion record -- is freed on every
+// path, refusals included, and the record's own buffer is freed with it.
+//
+// NOTHING IS PUBLISHED WHEN THE LINK OR THE DELIVERY FAILS: the arena's
+// lengths go back to zero and the report names the stage that refused.
+fn forward(result:ntasm_nxo_pe.ConvertResult,out:buf<u8>,cap:u64,report:buf<u64>)->u64 {
+    let bytes:buf<u8>=result.bytes;
+    let code:u64=result.code;
+    if code!=0 {
+        rt_free(runtime(),bytes);rt_free(runtime(),result);
+        report[0]=0;report[1]=0;report[2]=code;report[3]=0;
+        report[8]=machine_pipeline.STAGE_LINK();
+        return code;
+    }
+    let size:u64=len(bytes);
+    if cap<8 || size>cap-8 {
+        rt_free(runtime(),bytes);rt_free(runtime(),result);
+        report[0]=0;report[1]=0;report[2]=827;report[3]=0;
+        report[8]=machine_pipeline.STAGE_DELIVER();
+        return 827;
+    }
+    ntasm_pe.copy(out,8,bytes);
+    rt_free(runtime(),bytes);
+    ntasm_pe.put64(out,0,size);
+    rt_free(runtime(),result);
+    return 0;
+}
+export fn main(blob:buf<u8>,spans:buf<u64>,count:u64,root:u64,
+               nodes:buf<u64>,scopes:buf<u64>,binds:buf<u64>,fields:buf<u64>,modules:buf<u64>,
+               words:buf<u64>,capacity:u64,
+               decls:buf<u8>,arena:buf<u8>,arena_count:u64,
+               out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>,
+               batch_limit:u64)->u64 {
+    // THE LENGTHS ARE INVALIDATED FIRST, even when the interface itself is
+    // refused: a caller that reads a length after any refusal reads zero.
+    if len(length)>=2 { length[0]=0;length[1]=0; }
+    if len(report)<14 || len(length)<2 { return 800; }
+    // THE OUTPUT'S CAPACITY is the smaller of the capacity the caller claims
+    // and the buffer it really lent.
+    let mut cap:u64=len(out);
+    if out_count<cap { cap=out_count; }
+    if cap>=8 { ntasm_pe.put64(out,0,0); }
+    // THE FRONTEND. The tree it resolves is the tree the batch plan needs,
+    // and the two counts it publishes are read before the lower runs.
+    let mut code:u64=nova_language_parse.parse_many(blob,spans,count,root,nodes,scopes,binds,fields,modules,report);
+    if code!=0 { return code; }
+    let node_count:u64=report[5];
+    let program:u64=report[6];
+    report[8]=1;
+    // THE BATCHES. The arena is all the linker will read, so the caller may
+    // free the tree and the MIR as soon as this returns.
+    let text_length:buf<u64>=alloc(runtime(),1);
+    code=nova_machine_batches.build_objects(blob,spans,count,root,nodes,node_count,program,
+                                            scopes,binds,fields,modules,words,capacity,
+                                            decls,text_length,arena,arena_count,length,report,batch_limit);
+    rt_free(runtime(),text_length);
+    if code!=0 { return code; }
+    // THE LINK. The objects are merged and converted by the existing linker,
+    // and the result is the caller's PE.
+    let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_link_pe.link_pe_list(arena,length[1]);
+    let delivered:u64=forward(converted,out,cap,report);
+    if delivered!=0 {
+        length[0]=0;length[1]=0;
+        report[6]=0;report[12]=0;report[13]=0;
+    }
+    return delivered;
+}

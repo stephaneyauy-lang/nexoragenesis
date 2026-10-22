@@ -1,0 +1,26 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line
+isolated-scalars,ISOLATED-SC-R00,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R00.ntasm,107,b295aef3257684322475b12f7da62a4b3cb79741a7d6b83007d6c8f651d4cbbe,NGS0 E401 L0008 C0006 O00000056
+isolated-scalars,ISOLATED-SC-R01,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R01.ntasm,108,ae1bc3ad555313cf11fdaa2595db6be96d5ae7f1822e0559974c996505b4bb23,NGS0 E401 L0008 C0006 O00000056
+isolated-scalars,ISOLATED-SC-R02,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R02.ntasm,109,cf7dbd65da8b04cdc615cf4bc81a68f7341bf7bab7b6b0bcf498a1d29aaba1c2,NGS0 E401 L0008 C0006 O00000056
+isolated-scalars,ISOLATED-SC-R03,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R03.ntasm,110,765eccd42f411d6b64d70a98c0ae0bfa3fc8a0d70e4c537e52f1a27750cc6772,NGS0 E401 L0008 C0006 O00000056
+isolated-scalars,ISOLATED-SC-R04,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R04.ntasm,115,1cecda8b74c6bbff88c9a5467e133c65914f48e5f30dd71d1ca592ca888fc868,NGS0 E401 L0008 C0007 O00000057
+isolated-scalars,ISOLATED-SC-R05,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R05.ntasm,116,0e0b5428ba484a12c70ffa92be0dd75b7d7df956e4b4710f59de101e3fb90efa,NGS0 E401 L0008 C0007 O00000057
+isolated-scalars,ISOLATED-SC-R06,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R06.ntasm,106,20a4dcad79d21231cb32696b027b8b97a15819b1c74ab19e8e423693d67b5335,NGS0 E102 L0008 C0007 O00000057
+isolated-scalars,ISOLATED-SC-R07,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R07.ntasm,106,1d6fc47a567d82376a1baf5273740124a3b25c5ea635d2742c67ff6a10188a1b,NGS0 E102 L0008 C0008 O00000058
+isolated-scalars,ISOLATED-SC-R08,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R08.ntasm,107,6ff99954ce2462c54c6378b41a95c8d8724c2b2184f4c8bf80910ceaca05debe,NGS0 E102 L0008 C0007 O00000057
+isolated-scalars,ISOLATED-SC-R09,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R09.ntasm,107,f14cbb116325084a0f800de3214268fdaabfb5c71ac0c50e8e38b8f7bf3c93d1,NGS0 E102 L0008 C0008 O00000058
+isolated-scalars,ISOLATED-SC-R10,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R10.ntasm,106,7ec5ced82a7049c320d5f125e078851b40105b80350bf33cce3760dabbc9f4f0,NGS0 E201 L0008 C0006 O00000056
+isolated-scalars,ISOLATED-SC-R11,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R11.ntasm,107,86d2767b8423ab3471362cf283002ddb3f5d2b0a3d86166df387d4b6b4f52a98,NGS0 E102 L0008 C0007 O00000057
+isolated-scalars,ISOLATED-SC-R12,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R12.ntasm,107,74c423bb1027398b473b8dc78f2f8ff6bb27a782a512c7f33ec0a824b5c3975a,NGS0 E201 L0008 C0008 O00000058
+isolated-scalars,ISOLATED-SC-R13,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R13.ntasm,106,e0e3af9682fe425f18b8271a8ae599a6cce9cd25811083acc6c44f674ee73fc4,NGS0 E201 L0008 C0008 O00000058
+isolated-scalars,ISOLATED-SC-R14,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R14.ntasm,108,9564dd8069ff0e58745ea18dfa7f901e8de0a93962588fbd6e829bf4816a9ac6,NGS0 E201 L0008 C0008 O00000058
+isolated-scalars,ISOLATED-SC-R15,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R15.ntasm,103,abdf78b38dfacffa3ff4306b3e776be015ce5e8b260872ba4601272edcb8a9b7,NGS0 E201 L0008 C0005 O00000055
+isolated-scalars,ISOLATED-SC-R16,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R16.ntasm,111,e3d30734fbd0a8fc07343f4fd5b91e612e9407644bd7770f2a4955740e85005c,NGS0 E301 L0008 C0006 O00000056
+isolated-scalars,ISOLATED-SC-R17,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R17.ntasm,110,f251037b117ccf8d2a37718f80e73009a8ff3d5ce607be61aad9e33c68f0e724,NGS0 E301 L0009 C0006 O0000005A
+isolated-scalars,ISOLATED-SC-R18,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R18.ntasm,112,49dc7dc97137281bf4bbac7ae7f06f1635ff5ad737d1ba7a3a24010336718954,NGS0 E402 L0009 C0001 O00000058
+isolated-scalars,ISOLATED-SC-R19,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R19.ntasm,113,02368b6f9ca6f084c2b7b942e8896325e194473bc5e172feb523609ad7c45590,NGS0 E402 L0009 C0001 O00000058
+isolated-scalars,ISOLATED-SC-R20,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R20.ntasm,113,0d43b1a8edef3c26e154d4fb01147fdf47ffe2864e481b1d7ab83ca089061428,NGS0 E402 L0009 C0001 O00000058
+isolated-scalars,ISOLATED-SC-R21,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R21.ntasm,125,1e45b5aec3da3f8a8a9b264ef915203df1d888b1d90a9b0916a66314a872f333,NGS0 E102 L0008 C001A O0000006A
+isolated-scalars,ISOLATED-SC-R22,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R22.ntasm,125,8b036268f5b5405432e9d397c7e6a28a0768bb1bf2d408a952778392373f7fc1,NGS0 E102 L0008 C001A O0000006A
+isolated-scalars,ISOLATED-SC-R23,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R23.ntasm,107,b29fa6d86b90594f18131aee8dbbd62a1326386a54e7bd80de6b72577c5c3359,NGS0 E201 L0008 C0006 O00000056
+isolated-scalars,ISOLATED-SC-R24,file,legacy/ntasm-s0/isolated-scalars/ISOLATED-SC-R24.ntasm,121,0b74ef423f3dc01b33a0d61bf870e36737996c63defdc735a2f8009a304ebe2a,NGS0 E101 L0008 C0015 O00000065

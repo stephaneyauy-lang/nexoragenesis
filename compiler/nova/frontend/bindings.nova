@@ -1,0 +1,207 @@
+module bindings;
+
+import ntasm_ast;
+
+// Node kinds: function declaration 18, parameter 19, block 25,
+// let statement 27.
+
+// Byte-wise name comparison over the real source text with bounds.
+fn same_name(source:buf<u8>,a_start:u64,a_end:u64,b_start:u64,b_end:u64)->bool {
+    if a_start>a_end || b_start>b_end || a_end>len(source) || b_end>len(source) {
+        return false;
+    }
+    if (a_end-a_start)!=(b_end-b_start) { return false; }
+    let mut i:u64=0;
+    while i<(a_end-a_start) {
+        if source[a_start+i]!=source[b_start+i] { return false; }
+        i=i+1;
+    }
+    return true;
+}
+
+// Walk the direct let children of one block. Returns their count and writes
+// the first collision it meets to report as code, line and column, or
+// 0/0/0 when the block has none. 800 leaves the count at zero.
+// The position is the let keyword, not the name: the name position belongs
+// to 315, which is the same convention as the body block scan.
+fn scan_block(source:buf<u8>,tree:ntasm_ast.Tree,block_id:u64,params:buf<u64>,
+              used:u64,entry_words:u64,report:buf<u64>)->u64 {
+    let n_let:u64=27;
+    if block_id==0 || block_id>tree.node_count { report[0]=800; return 0; }
+    let block:ntasm_ast.Node=ntasm_ast.node_at(tree,block_id);
+    let mut lets:u64=0;
+    let mut code:u64=0;
+    let mut line:u64=0;
+    let mut column:u64=0;
+    let mut let_id:u64=block.first_child;
+    while let_id!=0 && code==0 {
+        if let_id>tree.node_count { code=800; }
+        else {
+            let ln:ntasm_ast.Node=ntasm_ast.node_at(tree,let_id);
+            if ln.kind==n_let {
+                lets=lets+1;
+                let nid:u64=ln.first_child;
+                if nid==0 || nid>tree.node_count { code=800; }
+                else {
+                    let name:ntasm_ast.Node=ntasm_ast.node_at(tree,nid);
+                    if name.start>name.end || name.end>len(source) {
+                        code=800;
+                    } else {
+                        let mut j:u64=0;
+                        while j<used {
+                            let at:u64=j*entry_words;
+                            if same_name(source,params[at],params[at+1],
+                                         name.start,name.end) {
+                                code=316;
+                                line=ln.line;
+                                column=ln.column;
+                            }
+                            j=j+1;
+                        }
+                    }
+                }
+            }
+            if code==0 { let_id=ln.next_sibling; }
+        }
+    }
+    if code==0 { report[0]=0; report[1]=0; } else { report[0]=code; report[1]=line; report[2]=column; }
+    return lets;
+}
+
+// Check let bindings against the parameters of the same function. For every
+// function (kind 18) the direct parameter children (kind 19) carry their
+// name as first child, and the direct block child (kind 25) is the body.
+//
+// The rule, read from spec/ntasm/ntasm.md section 5: "Pour un `let`, le profil
+// initial prouve ensuite les initialiseurs qui sont un paramètre/local
+// visible ou un call local/importé de type retour exact." One name therefore
+// answers exactly one visible binding, and the band 300-365 refuses the two
+// collisions that would break that:
+//
+//   - 316: a `let` never takes the name of a parameter of the same
+//     function, in the body block and in every nested block alike. Before
+//     this pass only the body block was compared, so one level down the
+//     same source name meant the parameter in one block and the local in
+//     another, with no diagnostic and a silently different proven type.
+//   - 315: the same name declared twice inside one block, owned by locals.
+//
+// A nested `let` may still shadow an outer `let` of the same function: the
+// reference frontend resolves the innermost enclosing block
+// (compiler/c/ntasm/frontend/frontend.c find_variable, exercised by
+// tests_frontend.c "nested_scope_shadow", expected 0), so that case is not
+// compared here and stays accepted.
+//
+// Returns 0 on success, writing out[0]=functions, out[1]=parameters,
+// out[2]=locals of the main block. Returns 316 when a let shadows a
+// parameter of the same function, writing the line and column of the let
+// keyword to out[0..1]. Returns 800 with no write to out on an invalid
+// tree, an invalid span or child chain, an absent body, or an output
+// buffer shorter than three words. The scratch buffers are always freed;
+// neither source nor tree is released.
+export fn check(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    let n_function:u64=18;
+    let n_parameter:u64=19;
+    let n_block:u64=25;
+    let entry_words:u64=2;
+    if tree.ok==false { return 800; }
+    if tree.node_count==0 { return 800; }
+    if len(out)<3 { return 800; }
+
+    let scratch:buf<u64>=alloc(runtime(),tree.node_count*entry_words);
+    let report:buf<u64>=alloc(runtime(),3);
+    let mut used:u64=0;
+    let mut functions:u64=0;
+    let mut parameters:u64=0;
+    let mut main_locals:u64=0;
+    let mut code:u64=0;
+    let mut dup_line:u64=0;
+    let mut dup_column:u64=0;
+
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let node:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if node.kind==n_function {
+            functions=functions+1;
+            used=0;
+            let mut block_id:u64=0;
+            // First pass over direct children: parameters and body block.
+            let mut child_id:u64=node.first_child;
+            while child_id!=0 && code==0 {
+                if child_id>tree.node_count { code=800; }
+                else {
+                    let cn:ntasm_ast.Node=ntasm_ast.node_at(tree,child_id);
+                    if cn.kind==n_parameter {
+                        let nid:u64=cn.first_child;
+                        if nid==0 || nid>tree.node_count { code=800; }
+                        else {
+                            let name:ntasm_ast.Node=ntasm_ast.node_at(tree,nid);
+                            if name.start>name.end || name.end>len(source) {
+                                code=800;
+                            } else {
+                                let at:u64=used*entry_words;
+                                scratch[at]=name.start;
+                                scratch[at+1]=name.end;
+                                used=used+1;
+                                parameters=parameters+1;
+                            }
+                        }
+                    } else if cn.kind==n_block {
+                        block_id=child_id;
+                    }
+                    if code==0 { child_id=cn.next_sibling; }
+                }
+            }
+            // Body required: a function without a direct block child is
+            // an invalid declaration.
+            if code==0 && block_id==0 { code=800; }
+            // Second pass: the direct lets of the body block. They are the
+            // locals of the main block and are compared to the parameters.
+            if code==0 {
+                let found:u64=scan_block(source,tree,block_id,scratch,used,entry_words,report);
+                if report[0]==800 { code=800; }
+                else if report[0]==316 {
+                    code=316;
+                    dup_line=report[1];
+                    dup_column=report[2];
+                } else { main_locals=main_locals+found; }
+            }
+            // Third pass: every other block of the same function, scanned in
+            // node order, which is parse order, so the first offender is the
+            // first one in source. The body block is skipped, the second pass
+            // already owns it. A nested let that takes the name of a
+            // parameter is refused exactly like a body let, and the lets of
+            // these blocks are not counted as locals of the main block.
+            if code==0 {
+                let mut nested:u64=1;
+                while nested<=tree.node_count && code==0 {
+                    let inner:ntasm_ast.Node=ntasm_ast.node_at(tree,nested);
+                    if inner.kind==n_block && nested!=block_id &&
+                       node.start<=inner.start && inner.end<=node.end {
+                        let found:u64=scan_block(source,tree,nested,scratch,used,entry_words,report);
+                        if report[0]==800 { code=800; }
+                        else if report[0]==316 {
+                            code=316;
+                            dup_line=report[1];
+                            dup_column=report[2];
+                        }
+                    }
+                    nested=nested+1;
+                }
+            }
+            if code!=0 { id=tree.node_count+1; }
+        }
+        if code==0 { id=id+1; }
+    }
+
+    if code==0 {
+        out[0]=functions;
+        out[1]=parameters;
+        out[2]=main_locals;
+    } else if code==316 && len(out)>=2 {
+        out[0]=dup_line;
+        out[1]=dup_column;
+    }
+    rt_free(runtime(),report);
+    rt_free(runtime(),scratch);
+    return code;
+}

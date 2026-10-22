@@ -1,0 +1,31 @@
+group,id,kind,source,fixture_size,fixture_sha256,expected_line,golden_hex
+fixups,BR-call-forward,file,legacy/ntasm-s0/fixups/BR-call-forward.ntasm,136,96674f6caf8154007829e7f6fd13946ea40cd952542217f8c97d0b09deb83703,NG_S0_T12_OK,e80000000090
+fixups,BR-call-back,file,legacy/ntasm-s0/fixups/BR-call-back.ntasm,127,9ca088a1bd9d26365d79fb30d130174aea49a2c8c0f3b0595fd0b20b1967c1a9,NG_S0_T12_OK,e8fbffffff
+fixups,BR-jmp-forward,file,legacy/ntasm-s0/fixups/BR-jmp-forward.ntasm,135,92e6533f1d489529cb51e27dd1b6405f210d2799efe21381d84accb1c36831ee,NG_S0_T12_OK,e90000000090
+fixups,BR-jmp-back,file,legacy/ntasm-s0/fixups/BR-jmp-back.ntasm,126,4b21bb04b1f0d7e7ce5cdee3fe5b58bb5a1ee1ce75290719d32779403897e9e5,NG_S0_T12_OK,e9fbffffff
+fixups,BR-je-forward,file,legacy/ntasm-s0/fixups/BR-je-forward.ntasm,134,05ae01312486c69ab2557efd050220d6da6f871243ec627e8474ee268e258625,NG_S0_T12_OK,0f840000000090
+fixups,BR-je-back,file,legacy/ntasm-s0/fixups/BR-je-back.ntasm,125,0d4f3d6497b52d2b223a982d989f9b8cc3bca15b1407f8f301d75514ab391cd5,NG_S0_T12_OK,0f84faffffff
+fixups,BR-jne-forward,file,legacy/ntasm-s0/fixups/BR-jne-forward.ntasm,135,9893639423ed51873ff698cb9ae7b66d111c33a8279a347428a74af116b8a49a,NG_S0_T12_OK,0f850000000090
+fixups,BR-jne-back,file,legacy/ntasm-s0/fixups/BR-jne-back.ntasm,126,84ccb1e39d52fa54cc1233a2c5b6931ffac47cb129b7b884cd725681e7189d69,NG_S0_T12_OK,0f85faffffff
+fixups,BR-jb-forward,file,legacy/ntasm-s0/fixups/BR-jb-forward.ntasm,134,0039a6b9c801ab3f93908fc4fd4f9272d283d8e46a46d1d4021b4b3b5a56bcd7,NG_S0_T12_OK,0f820000000090
+fixups,BR-jb-back,file,legacy/ntasm-s0/fixups/BR-jb-back.ntasm,125,fbde0c244a2d3a5fbbf93b8a586985bccdab662122192f6bc2473c6891c506c8,NG_S0_T12_OK,0f82faffffff
+fixups,BR-jae-forward,file,legacy/ntasm-s0/fixups/BR-jae-forward.ntasm,135,8e4994c09de3a3578a9fea6ec127c77e8a17543b370f021678735194307b0b41,NG_S0_T12_OK,0f830000000090
+fixups,BR-jae-back,file,legacy/ntasm-s0/fixups/BR-jae-back.ntasm,126,f29f06ea008b972963b204d932a613cbc6c051de2b3a88643647546d10cfc634,NG_S0_T12_OK,0f83faffffff
+fixups,RP0,file,legacy/ntasm-s0/fixups/RP0.ntasm,136,919bbfd79612b2d5e1532f4c9171c1b744caa33614548c2a48cbf4ed047dc237,NG_S0_T12_OK,488d15f90f0000
+fixups,RP1,file,legacy/ntasm-s0/fixups/RP1.ntasm,137,31fdc7d838fc9199b04a579f1a671152e6fbf6ffa32657325d99cc558537c20b,NG_S0_T12_OK,440fb60df80f0000
+fixups,RP2,file,legacy/ntasm-s0/fixups/RP2.ntasm,139,39e0bdb3c06aa0c7413c1d12f6962f52dd7b866295dc5de1a42d08a69ac1b150,NG_S0_T12_OK,440fb715f80f0000
+fixups,RP3,file,legacy/ntasm-s0/fixups/RP3.ntasm,142,407c5cfcb9a8a7061403b271b3ffca05e740d43dd2d3d7920b205648d613c534,NG_S0_T12_OK,4c8b3df9ffffff
+fixups,RP4,file,legacy/ntasm-s0/fixups/RP4.ntasm,139,6b5c46b4930232d36bce750bac5fe302a5ead938e2faa4aac0d49872cc9411b1,NG_S0_T12_OK,66448905f81f0000
+fixups,RP5,file,legacy/ntasm-s0/fixups/RP5.ntasm,140,d14c3228cfa8263f75eeebb084af2802a14f8a932c15569c9de64699221b1697,NG_S0_T12_OK,488905f91f0000
+fixups,BR-E0,file,legacy/ntasm-s0/fixups/BR-E0.ntasm,128,33f771036f4d7f404e52b7d7b0e853c153da0320af744e44d4c7e68c526d85af,NGS0 E301 L0006 C0005 O00000040,
+fixups,BR-E1,file,legacy/ntasm-s0/fixups/BR-E1.ntasm,124,e60e188c707646abedf93a78b626bba441cd0b0360c5fde3f0ed5f32213740bd,NGS0 E301 L0006 C0006 O00000041,
+fixups,BR-E2,file,legacy/ntasm-s0/fixups/BR-E2.ntasm,133,aad2a329ca42aa031a5f26ac9792ec057f771e709a12a9f54281e5a342539cab,NGS0 E301 L0007 C0004 O0000004B,
+fixups,BR-E3,file,legacy/ntasm-s0/fixups/BR-E3.ntasm,120,0181d7dadcd7b9ac55f1f181025370c2a78e0b9721ec9bd363b6ac17f88f0e12,NGS0 E201 L0006 C0004 O0000003F,
+fixups,BR-E4,file,legacy/ntasm-s0/fixups/BR-E4.ntasm,132,e2d20701597e99106e87d9817ab7da03a03f50f442ffdf454169c5505c2616dc,NGS0 E201 L0006 C000B O00000046,
+fixups,BR-E5,file,legacy/ntasm-s0/fixups/BR-E5.ntasm,124,eb4735f1507db1caef0cb1cbc452bdb7fd2e3c0f2ad0a258e8d932a06f9d2e0b,NGS0 E400 L0006 C0005 O00000040,
+fixups,RP-E0,file,legacy/ntasm-s0/fixups/RP-E0.ntasm,141,71ae3957a21ba023eb7ebbee4f7c80685afd53898bcc90d692a631d11402a8c8,NGS0 E301 L0006 C0011 O0000004C,
+fixups,RP-E1,file,legacy/ntasm-s0/fixups/RP-E1.ntasm,147,a61427dd0f7ae08a5c552b1cdbc2256b2403ca4c5f8c5cf3961ff60e349e8466,NGS0 E301 L0007 C0011 O00000058,
+fixups,RP-E2,file,legacy/ntasm-s0/fixups/RP-E2.ntasm,131,0c42264dbb53c615706fd60b29959770527fdd60eaa95846d37028c7ba21f0c9,NGS0 E201 L0006 C000E O00000049,
+fixups,RP-E3,file,legacy/ntasm-s0/fixups/RP-E3.ntasm,136,1d1c12c95409caa0799b389ed8a3da7a8f9f005f36b4ec63a7ae44647332515a,NGS0 E201 L0006 C000F O0000004A,
+fixups,RP-E4,file,legacy/ntasm-s0/fixups/RP-E4.ntasm,135,fcb97ffeccf01ed72a4f41bd9454fa925522ddc0e57c172d599aaa5eb030fccc,NGS0 E400 L0006 C0011 O0000004C,
+fixups,RP-E5,file,legacy/ntasm-s0/fixups/RP-E5.ntasm,140,cb7a4974785e433c544986fd74a69a81fc4082f0e10d1e0e62099997e6b44c58,NGS0 E201 L0006 C0014 O0000004F,

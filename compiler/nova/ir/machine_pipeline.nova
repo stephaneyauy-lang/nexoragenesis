@@ -1,0 +1,669 @@
+module machine_pipeline;
+
+import ntasm_ast;
+import ntasm_parser;
+import ntir;
+import machine_ir;
+import machine_emit;
+import ntasm_nxo;
+import ntasm_nxo_pe;
+import ntasm_macro_splice;
+import validate;
+import abi;
+import stub_table;
+
+// ===========================================================================
+// THE PIPELINE. Text -> expansion -> validation -> NTIR -> Machine IR ->
+// object -> executable image.
+//
+// WHY THIS FILE EXISTS AND WHAT IT IS NOT. Three modules already know how to do
+// one link of that chain each -- `ntir.nova` builds the NTIR, `machine_ir.nova`
+// lowers it and verifies the result, `machine_emit.nova` reads a Machine IR and
+// writes an NXO container through the existing writer -- and the only thing that
+// drove the three in sequence was a TEST entry under tests/, which threw the
+// image away when it was done. So the chain was measurable and not reachable.
+// This module is the reachable one.
+//
+// WHAT IT DELIBERATELY DOES NOT CALL. Neither `x64_lower_nxo` nor
+// `x64_lower_nxo_pe` appears in this file. Those modules take an
+// `ntasm_ast.Tree` and would answer a question about the AST, so a pipeline
+// that called one and then said it had gone through the Machine IR would be
+// reporting the AST path under another name. `stub_table` IS imported since
+// 13 October 2026 (A6), for one thing: `graft`, which answers a TREE -- the
+// syscall stub tables validated and grafted as function nodes citing the
+// source's own spans -- that this chain then lowers itself. None of its image
+// exports (`build_pe` and the witnesses) is called here.
+//
+// ---------------------------------------------------------------------------
+// THE EXPANSION IS DONE ONCE, AND IT IS DONE HERE. This is the correction that
+// matters most in this file, and it was a real defect: the first version parsed
+// the caller's SOURCE and lowered that, which silently discarded the macro
+// expansion. `validate.validate` is the existing producer of a developed tree --
+// it calls `ntasm_macro_splice.expand_stage`, takes `unit_of`, runs the semantic
+// passes on the EXPANDED text, and then FREES the splice. A caller that
+// re-parsed the original source afterwards got a tree with no expansion in it,
+// and with spans that refer to text that was never produced. So this module
+// follows the same shape and INVERTS THE OWNERSHIP:
+//
+//   * the splice is created HERE, expanded HERE, and released HERE, on every
+//     path out including every refusal;
+//   * `s.text` -- the EFFECTIVE text, source plus whatever the expansion
+//     appended -- is what the NTIR is built from, what the Machine IR's spans
+//     refer to, and what the object writer copies symbol names out of;
+//   * therefore the splice cannot be released until the OBJECT exists, and it
+//     is released after. `validate.validate` can do the opposite because it
+//     builds nothing afterwards; this module cannot.
+//
+// The expansion runs ONCE: `expand_stage` is called exactly once per source
+// face, and the validation below it is `validate.validate_expanded`, which by its
+// own contract expands nothing and owns nothing. Calling `validate.validate`
+// instead would expand a second time, and comptime I/O is observable, so a
+// double expansion is not a redundancy -- it is a different program.
+//
+// THE TWO FACES, AND WHY BOTH EXIST. Every link has two forms: one that takes
+// TEXT and one that takes an image ALREADY BUILT. The image forms parse
+// nothing, expand nothing and build no NTIR, which makes them two things at
+// once -- the seam a production caller composes with, and the instrument that
+// answers whether the emission is a function of the image. Damage the image and
+// call `build_object_from_image`: if the bytes moved, the emitter read the
+// image, because on that path the text beside it is never parsed.
+//
+// MEMORY. Every allocation is freed on every path out, refusals included, and
+// the host runs these gates under ASan+LSan with halt_on_error.
+// ===========================================================================
+
+// ---- refusals this module owns -------------------------------------------
+//
+// A band nothing else publishes. machine_ir owns 930..948, machine_x64 owns
+// 960..966, machine_emit owns 980..985, ntir owns 800 and 808..819, ntasm_nxo_pe owns 801..807 and
+// nxo_merge owns 820..828; `grep 'return 97[0-9];'` over compiler/nova
+// rendered nothing before this file existed. 972..979 are left free on purpose:
+// a code nothing fires is a promise no gate can check.
+export fn E_OUTPUT()->u64 { return 970; }
+export fn E_BOUND()->u64 { return 971; }
+
+// ---- the stages, as data --------------------------------------------------
+//
+// Published rather than written down, because report[8] names the stage that
+// refused and a number a reader has to take on faith is a number a later edit
+// can move without anything going red. The entry writes them into its own
+// report so the C gate compares against the module and not against a copy.
+export fn STAGE_PARSE()->u64 { return 1; }
+export fn STAGE_EXPAND()->u64 { return 2; }
+export fn STAGE_VALIDATE()->u64 { return 3; }
+export fn STAGE_NTIR()->u64 { return 4; }
+export fn STAGE_LOWER()->u64 { return 5; }
+export fn STAGE_VERIFY()->u64 { return 6; }
+export fn STAGE_OBJECT()->u64 { return 7; }
+export fn STAGE_READ()->u64 { return 8; }
+export fn STAGE_LINK()->u64 { return 9; }
+export fn STAGE_DELIVER()->u64 { return 10; }
+
+export fn REPORT_WORDS()->u64 { return 14; }
+
+// ---------------------------------------------------------------------------
+// WHAT report[0..3] MEANS, AND WHY THIS MODULE DOES NOT RESTATE IT.
+//
+// It is the REFUSING STAGE'S OWN REPORT, copied verbatim, and the stages do not
+// agree on what those four words are:
+//
+//   machine_emit.build      refusal: (record, code, kind, 0)
+//                            acceptance: (records, 0, text bytes, symbols)
+//   machine_ir.lower        refusal: (line, column, code, node)
+//   validate.validate_expanded
+//                           refusal: its own six-word stage scratch
+//
+// An earlier version of this file published a single convention -- it called
+// report[1] a line number -- and that was FALSE for the object stage, where it
+// is the code again. A contract that names one reading for two writers is worse
+// than one that names none, because a reader who trusts it is wrong about half
+// the rows. So: report[0..3] is whatever wrote it, and report[8] says who.
+// ---------------------------------------------------------------------------
+fn clear(report:buf<u64>)->u64 {
+    let mut i:u64=0;
+    while i<REPORT_WORDS() { report[i]=0; i=i+1; }
+    return 0;
+}
+
+// A REFUSAL, WITH THE STAGE THAT PRODUCED IT. The stage's own code is returned
+// UNCHANGED: renaming it here would make this module the only thing in the tree
+// whose codes mean something other than what the module that fired them says.
+fn refuse(report:buf<u64>,stage:u64,code:u64)->u64 {
+    if len(report)>=REPORT_WORDS() { report[8]=stage; report[9]=code; }
+    return code;
+}
+
+// Copies four words of a stage's own report without overwriting the two words
+// this module owns. `report[4..]` are this module's; `report[0..3]` are the
+// stage's.
+fn take4(report:buf<u64>,scratch:buf<u64>)->u64 {
+    report[0]=scratch[0];report[1]=scratch[1];
+    report[2]=scratch[2];report[3]=scratch[3];
+    return 0;
+}
+
+// ---- the Machine IR, owned -----------------------------------------------
+struct Mir { code:u64, words:buf<u64>, count:u64, ntir_count:u64 }
+
+fn mir_failed(code:u64)->Mir {
+    let empty:buf<u64>=alloc(runtime(),0);
+    return Mir{code:code,words:empty,count:0,ntir_count:0};
+}
+
+// THE IMAGE SIZE, COMPUTED BY THE OWNER'S OWN FORMULA. `machine_ir.lower`
+// computes `HEADER_WORDS + (ntir_count*8+64)*NODE_WORDS` and answers E_HEADER when
+// the capacity is short, so any other number here would be a second guess at a
+// formula already written down and already enforced. Read out of the owner
+// rather than restated, so an image that grows a stride moves this bound with it.
+fn mir_words(ntir_count:u64)->u64 {
+    return machine_ir.HEADER_WORDS()+(ntir_count*8+64)*machine_ir.NODE_WORDS();
+}
+
+// THE DIRECTION OF EVERY PARAMETER, from the rule's one owner. machine_ir
+// lowers from the NTIR and holds no AST, so it marks every `mir_param`
+// FLAG_DIR_UNREAD rather than read the direction word a sixth time (the copy
+// census in tests_ntasm_abi.c refuses a new reader, and was right to). This
+// function holds the developed tree: a parameter record's NTIR node IS its AST
+// node, so abi.direction answers for it directly -- 1 in, 2 out, 3 inout, 0 a
+// span that opens on no direction word -- and the record's bit is replaced.
+// A 0 leaves FLAG_DIR_UNREAD in place: the answer is "not read", not `in`.
+// It implements none of the rule: it asks abi.nova, the owner, through
+// abi.parameter_mode. tests_ntasm_abi.c counts every function whose NAME
+// carries the rule's word as a copy, so this one is named for what it fills.
+fn resolve_parameter_modes(text:buf<u8>,tree:ntasm_ast.Tree,words:buf<u64>)->u64 {
+    let count:u64=words[3];
+    let param_kind:u64=machine_ir.kind_at(7);
+    let mut r:u64=1;
+    while r<=count {
+        let at:u64=machine_ir.HEADER_WORDS()+(r-1)*machine_ir.NODE_WORDS();
+        let node:u64=words[at+1];
+        if words[at]==param_kind && node!=0 && node<=tree.node_count {
+            // THE SNAPSHOT IS OURS, AND IT IS RELEASED ON EVERY PATH.
+            //
+            // `ntasm_ast.node_at` builds a Node of its own -- ast.nova:143
+            // says so in as many words, "node_at still owns its copy" -- and
+            // that copy is a fresh 96-byte record on every call. It was
+            // measured on the 56-source reconstruction: this loop alone left
+            // 2664 of them alive, all of them recognised at the caller offset
+            // 112, which says they were real allocations and not bookkeeping.
+            // The accessor is not changed here, because it is public and 1056
+            // call sites read it; the OWNER of a snapshot is its caller, and
+            // this is the caller.
+            let n:ntasm_ast.Node=ntasm_ast.node_at(tree,node);
+            let flags:u64=words[at+13];
+            if n.kind==19 && (flags&machine_ir.FLAG_DIR_UNREAD())!=0 {
+                let code:u64=abi.parameter_mode(text,n);
+                // The last use of the snapshot is the call above: the rule
+                // reads it and answers a number, and nothing below reads it
+                // again.
+                rt_free(runtime(),n);
+                let mut f:u64=flags-machine_ir.FLAG_DIR_UNREAD();
+                if code==2 { f=f+machine_ir.FLAG_DIR_OUT(); }
+                if code==3 { f=f+machine_ir.FLAG_DIR_INOUT(); }
+                if code==0 { f=flags; }
+                words[at+13]=f;
+            } else {
+                // No flag to resolve: the snapshot was allocated all the same,
+                // so it is released all the same.
+                rt_free(runtime(),n);
+            }
+        }
+        r=r+1;
+    }
+    return 0;
+}
+
+// ===========================================================================
+// lower_tree -- AN ALREADY-DEVELOPED AST, LOWERED. No parse, no expansion, no
+// validation, no ownership: the caller keeps the tree and the effective text,
+// and this function reads both.
+//
+// This is the seam the coordinator asked for and it is deliberately the NARROW
+// one. It exists because the source faces have to do the expansion exactly once
+// and then lower the tree that expansion produced, and because a caller that
+// already holds a developed tree -- the production stage runner is the obvious
+// one -- should not have to re-parse its own text to reach the MIR. It does NOT
+// validate, and that is not an omission: validating here would mean running the
+// semantic passes a second time on a tree they have already seen, and the
+// comptime I/O of a pass is observable. A caller that wants validation asks
+// `validate.validate_expanded` on the same tree, which is the API that exists
+// for exactly that and expands nothing.
+// ===========================================================================
+export fn lower_tree(text:buf<u8>,tree:ntasm_ast.Tree,words:buf<u64>,
+        capacity:u64,report:buf<u64>)->u64 {
+    if len(report)<REPORT_WORDS() { return 800; }
+    clear(report);
+    if tree.ok==false { return refuse(report,STAGE_PARSE(),800); }
+    // The NTIR image is sized by the tree it will hold, from the OWNER's two
+    // constants, and that is exact rather than generous: `ntir.build` refuses
+    // with 800 when the capacity is short, and a slack buffer here would be a
+    // number chosen to avoid a failure rather than to describe the data.
+    let nodes:u64=tree.node_count;
+    let ntir_words:u64=ntir.HEADER_WORDS()+nodes*ntir.NODE_WORDS();
+    let image:buf<u64>=alloc(runtime(),ntir_words);
+    let built:u64=ntir.build(text,tree,image,ntir_words);
+    if built!=0 {
+        rt_free(runtime(),image);
+        return refuse(report,STAGE_NTIR(),built);
+    }
+    let ntir_count:u64=image[3];
+    let needed:u64=mir_words(ntir_count);
+    if capacity<needed || len(words)<needed {
+        rt_free(runtime(),image);
+        return refuse(report,STAGE_LOWER(),E_BOUND());
+    }
+    let mut scratch:buf<u64>=alloc(runtime(),16);
+    let mut z:u64=0;
+    while z<16 { scratch[z]=0; z=z+1; }
+    // A6 (13 October 2026): the AST says which expressions are calls; a grafted
+    // stub call has no parenthesis in the text (machine_ir.lower_with_calls).
+    let marks:buf<u64>=machine_ir.ast_call_marks(tree);
+    let lowered:u64=machine_ir.lower_with_calls(text,tree,image,ntir_count,words,needed,scratch,marks);
+    rt_free(runtime(),marks);
+    take4(report,scratch);
+    rt_free(runtime(),image);
+    if lowered!=0 {
+        rt_free(runtime(),scratch);
+        return refuse(report,STAGE_LOWER(),lowered);
+    }
+    let count:u64=words[3];
+    let verdict:u64=finish_facts(text,tree,words,scratch,report);
+    rt_free(runtime(),scratch);
+    if verdict!=0 { return verdict; }
+    // This module's own four facts, in its own words, at the indices this
+    // module owns. The stage reports above are not this module's and are not
+    // touched here.
+    report[4]=ntir_count;
+    report[13]=words[6];
+    return 0;
+}
+
+// Shared declaration ABI resolution and image verification, for both frontends.
+fn finish_facts(text:buf<u8>,tree:ntasm_ast.Tree,words:buf<u64>,scratch:buf<u64>,report:buf<u64>)->u64 {
+    if tree.ok==false || len(words)<machine_ir.HEADER_WORDS() { return 800; }
+    let count:u64=words[3];
+    if count>(len(words)-machine_ir.HEADER_WORDS())/machine_ir.NODE_WORDS() { return 800; }
+    resolve_parameter_modes(text,tree,words);
+    let calls:u64=machine_ir.resolve_call_effects(words,count,text);
+    if calls!=0 { return refuse(report,STAGE_LOWER(),calls); }
+    let code:u64=machine_ir.verify(words,count,scratch);
+    take4(report,scratch);
+    if code!=0 { return refuse(report,STAGE_VERIFY(),code); }
+    return 0;
+}
+export fn finalize_native(text:buf<u8>,tree:ntasm_ast.Tree,words:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<REPORT_WORDS() { return 800; }
+    let scratch:buf<u64>=alloc(runtime(),16);
+    let code:u64=finish_facts(text,tree,words,scratch,report);
+    rt_free(runtime(),scratch);
+    return code;
+}
+// ---- delivery ------------------------------------------------------------
+// The image goes to the caller whole or not at all. `length[0]` is written only
+// after every byte is in place, so a caller that reads it after a refusal reads
+// the zero this module wrote before it started.
+fn deliver(bytes:buf<u8>,out:buf<u8>,length:buf<u64>,report:buf<u64>)->u64 {
+    let size:u64=len(bytes);
+    if len(out)<size { return refuse(report,STAGE_DELIVER(),E_OUTPUT()); }
+    let mut k:u64=0;
+    while k<size { out[k]=bytes[k]; k=k+1; }
+    length[0]=size;
+    return 0;
+}
+
+// ===========================================================================
+// THE OBJECT: an image in, an NXO container out. No parse on this path.
+//
+// THE EMITTER IS machine_emit.nova (A7, 6 October 2026). It replaced
+// machine_x64.build_object on this path: the allocation-based backend lowered
+// one function, no call, no data and no branch layout, and refused the rest of
+// the corpus at 961/963; it keeps its own gates and is not called here. The
+// emitter hands back the container at its own length, written by
+// ntasm_nxo.emit, so no bound is guessed and no prefix is trimmed here.
+// ===========================================================================
+fn emit_object(words:buf<u64>,count:u64,source:buf<u8>,report:buf<u64>)->ntasm_nxo.WriteResult {
+    let mut scratch:buf<u64>=alloc(runtime(),16);
+    let mut z:u64=0;
+    while z<16 { scratch[z]=0; z=z+1; }
+    let built:ntasm_nxo.WriteResult=machine_emit.build(words,count,source,scratch);
+    take4(report,scratch);
+    rt_free(runtime(),scratch);
+    return built;
+}
+
+export fn build_object_from_image(words:buf<u64>,count:u64,source:buf<u8>,
+        out:buf<u8>,length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<REPORT_WORDS() || len(length)<1 { return 800; }
+    length[0]=0;
+    clear(report);
+    if count==0 { return refuse(report,STAGE_OBJECT(),machine_emit.E_IMAGE()); }
+    if len(words)<machine_ir.HEADER_WORDS()+count*machine_ir.NODE_WORDS() {
+        return refuse(report,STAGE_OBJECT(),800);
+    }
+    let built:ntasm_nxo.WriteResult=emit_object(words,count,source,report);
+    // THE FIELDS OUT, THEN THE RECORD. `built` is a fresh record the emitter
+    // built for this call and nobody else holds it, so the two fields this
+    // function needs are read out of it and the record itself is released.
+    // The byte buffer it carries is a SEPARATE allocation: it is the
+    // container's own and it outlives the container.
+    let built_code:u64=built.code;
+    let bytes:buf<u8>=built.bytes;
+    rt_free(runtime(),built);
+    if built_code!=0 { rt_free(runtime(),bytes); return refuse(report,STAGE_OBJECT(),built_code); }
+    // SUCCESS WITH NO BYTES IS NOT A SUCCESS: an accepted image must have
+    // produced a container, and a zero-length one is this module's defect.
+    if len(bytes)==0 { rt_free(runtime(),bytes); return refuse(report,STAGE_OBJECT(),E_BOUND()); }
+    report[5]=len(bytes);
+    let delivered:u64=deliver(bytes,out,length,report);
+    rt_free(runtime(),bytes);
+    if delivered!=0 { return delivered; }
+    return 0;
+}
+
+export fn build_pe_from_image(words:buf<u64>,count:u64,source:buf<u8>,
+        out:buf<u8>,length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<REPORT_WORDS() || len(length)<1 { return 800; }
+    length[0]=0;
+    clear(report);
+    if count==0 { return refuse(report,STAGE_OBJECT(),machine_emit.E_IMAGE()); }
+    if len(words)<machine_ir.HEADER_WORDS()+count*machine_ir.NODE_WORDS() {
+        return refuse(report,STAGE_OBJECT(),800);
+    }
+    let built:ntasm_nxo.WriteResult=emit_object(words,count,source,report);
+    // The same rule as in build_object_from_image: the fields out of the
+    // emitter's record first, the record itself after.
+    let built_code:u64=built.code;
+    let exact:buf<u8>=built.bytes;
+    rt_free(runtime(),built);
+    if built_code!=0 { rt_free(runtime(),exact); return refuse(report,STAGE_OBJECT(),built_code); }
+    if len(exact)==0 { rt_free(runtime(),exact); return refuse(report,STAGE_OBJECT(),E_BOUND()); }
+    report[5]=len(exact);
+    // THE READ-BACK, and it is not decoration. It proves the object the Machine
+    // IR produced is an object the EXISTING reader accepts: the writer and the
+    // reader are two implementations of the same format, and a writer that
+    // satisfies only itself is the failure this round trip exists to make
+    // visible. It is also where report[7] and report[10..12] come from -- read
+    // back off the object rather than recomputed from the image.
+    let parsed:ntasm_nxo.ReadResult=ntasm_nxo.read(exact);
+    if parsed.code!=0 {
+        let fault:ntasm_nxo.Object=parsed.object;
+        let read_code:u64=parsed.code;
+        ntasm_nxo.release(fault);
+        // The reader's own result is a fresh record of its own; the refusal
+        // code has been read out of it, so it goes now.
+        rt_free(runtime(),parsed);
+        rt_free(runtime(),exact);
+        return refuse(report,STAGE_READ(),read_code);
+    }
+    let object:ntasm_nxo.Object=parsed.object;
+    let entry:u64=object.entry;
+    let symbols:u64=len(object.symbols)/8;
+    let relocations:u64=len(object.relocations)/5;
+    let text_size:u64=len(object.text);
+    // Every field of the reader's result this function needs is read above, so
+    // the result is released here and the object it carried goes on living.
+    rt_free(runtime(),parsed);
+    // An object with an unresolved import is a valid RELOCATABLE object and
+    // the object face delivers it; an executable cannot be made of it until a
+    // link supplies the definition, and ntasm_nxo_pe answers 804 for exactly
+    // that, which is reported as the link stage's refusal and never as a fault.
+    let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_pe.convert(object);
+    ntasm_nxo.release(object);
+    // The same rule once more: the converter's result is a fresh record, its
+    // code and its bytes are read out of it, and the record goes.
+    let converted_code:u64=converted.code;
+    let pe:buf<u8>=converted.bytes;
+    rt_free(runtime(),converted);
+    if converted_code!=0 {
+        rt_free(runtime(),pe);
+        rt_free(runtime(),exact);
+        return refuse(report,STAGE_LINK(),converted_code);
+    }
+    report[7]=symbols;report[10]=entry;report[11]=relocations;report[12]=text_size;
+    let delivered:u64=deliver(pe,out,length,report);
+    let pe_size:u64=len(pe);
+    rt_free(runtime(),pe);
+    rt_free(runtime(),exact);
+    // THE DELIVERY REFUSAL IS A RETURN VALUE AND NOT ONLY A REPORT WORD. An
+    // earlier version of this block had lost its `if delivered!=0 { return
+    // delivered; }` line, and the gate caught the consequence: with a 64-byte
+    // output buffer the module wrote report[8]=STAGE_DELIVER and report[9]=970
+    // and then returned 0. A caller that reads the return value -- which is the
+    // one every caller in this tree reads -- would have taken the refusal for a
+    // success and published a length it never received. `report[6]` is left at
+    // the zero `clear` wrote for the same reason.
+    if delivered!=0 { return delivered; }
+    report[6]=pe_size;
+    return 0;
+}
+
+// ===========================================================================
+// THE SOURCE JOURNEY. parse -> expand_stage (ONCE) -> unit_of ->
+// validate_expanded -> lower_tree -> deliver. One function, so the order
+// exists in one place and cannot be got right in one call site and wrong in
+// another.
+//
+// `want` is the destination: 0 hands the Machine IR to the caller's `words`,
+// 1 delivers an NXO container into `out`, 2 delivers a PE container.
+//
+// THE SPLICE OUTLIVES EVERY DELIVERY. `s.text` is the effective text and the
+// object writer copies symbol name spans out of it, so `splice_release` is the
+// LAST thing this function does on every path, after the object exists. Every
+// early return below releases it. That is the whole difference from
+// `validate.validate`, which releases as soon as its last stage is done because
+// it builds nothing afterwards.
+// ===========================================================================
+// A6: THE UNIT TREE, GRAFTED. `stub_table.graft` validates every stub table of
+// the parsed source (with its positions) and answers either the parsed tree
+// itself or a copy holding one grafted function per safe-return syscall entry;
+// an interrupt table is refused there by name (306 reason 11), never dropped.
+// Nothing is re-parsed. `release_unit` frees what the two own: the parsed tree,
+// and the grafted node array when there is one (it shares the token words).
+fn release_unit(base:ntasm_ast.Tree,grafted:stub_table.Grafted)->u64 {
+    if grafted.owned {
+        let nodes:buf<u64>=grafted.tree.node_words;
+        rt_free(runtime(),nodes);
+    }
+    return ntasm_ast.release(base);
+}
+fn journey(source:buf<u8>,want:u64,words:buf<u64>,capacity:u64,out:buf<u8>,
+        length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<REPORT_WORDS() { return 800; }
+    if want!=0 && len(length)<1 { return 800; }
+    // The length is written before any work, so a caller that reads it after a
+    // refusal reads this zero rather than the length of a prefix.
+    if len(length)>=1 { length[0]=0; }
+    clear(report);
+    let base:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if base.ok==false {
+        ntasm_ast.release(base);
+        return refuse(report,STAGE_PARSE(),800);
+    }
+    let stub_report:buf<u64>=alloc(runtime(),4);
+    let grafted:stub_table.Grafted=stub_table.graft(source,base,stub_report);
+    if grafted.code!=0 {
+        take4(report,stub_report);
+        rt_free(runtime(),stub_report);
+        ntasm_ast.release(base);
+        return refuse(report,STAGE_VALIDATE(),grafted.code);
+    }
+    rt_free(runtime(),stub_report);
+    let tree:ntasm_ast.Tree=grafted.tree;
+    // ONE splice, ONE expansion. The scratch is six words because that is what
+    // `expand_stage` and `validate_expanded` write, and it is cleared because
+    // both treat a zero word as "this pass raised nothing".
+    let mut stage_scratch:buf<u64>=alloc(runtime(),6);
+    let mut q:u64=0;
+    while q<6 { stage_scratch[q]=0; q=q+1; }
+    let s:ntasm_macro_splice.Splice=ntasm_macro_splice.blank_splice(source,tree);
+    let mut code:u64=ntasm_macro_splice.expand_stage(s,stage_scratch);
+    if code!=0 {
+        take4(report,stage_scratch);
+        ntasm_macro_splice.splice_release(s);
+        release_unit(base,grafted);
+        rt_free(runtime(),stage_scratch);
+        return refuse(report,STAGE_EXPAND(),code);
+    }
+    let unit:ntasm_ast.Tree=ntasm_macro_splice.unit_of(s);
+    // A6: a stub table that only exists AFTER the expansion (a macro emitted
+    // it) was never grafted, and lowering the unit without it would publish an
+    // image missing its stubs. Refused, 306 reason 13.
+    if stub_table.has_tables(unit) {
+        report[0]=0;report[1]=0;report[2]=13;report[3]=0;
+        ntasm_macro_splice.splice_release(s);
+        release_unit(base,grafted);
+        rt_free(runtime(),stage_scratch);
+        return refuse(report,STAGE_EXPAND(),306);
+    }
+    // THE EFFECTIVE TEXT, and it is not the caller's source whenever the
+    // expansion appended anything. `s.text` is what the NTIR is built from and
+    // what every span in the Machine IR points into.
+    let text:buf<u8>=s.text;
+    let mut verdict:buf<u64>=alloc(runtime(),6);
+    let mut v:u64=0;
+    while v<6 { verdict[v]=0; v=v+1; }
+    code=validate.validate_expanded(text,unit,verdict);
+    if code!=0 {
+        take4(report,verdict);
+        rt_free(runtime(),verdict);
+        ntasm_macro_splice.splice_release(s);
+        release_unit(base,grafted);
+        rt_free(runtime(),stage_scratch);
+        return refuse(report,STAGE_VALIDATE(),code);
+    }
+    rt_free(runtime(),verdict);
+    // The image is always built into a buffer this function owns, and copied out
+    // only when the destination IS the image. A `let mut` buffer rebound to a
+    // second allocation is a shape this compiler has no reason to accept, and a
+    // caller-owned destination would make the caller's capacity decide whether
+    // an OBJECT is produced -- which is not the caller's question to ask.
+    // The size is the owner's formula applied to the TREE's node count, an upper
+    // bound on the NTIR's record count; `lower_tree` refuses with E_BOUND if it
+    // ever turns out short, which is a named refusal rather than a truncated
+    // image nobody can see.
+    let room:u64=mir_words(unit.node_count);
+    let owned:buf<u64>=alloc(runtime(),room);
+    // The DEVELOPED text and the DEVELOPED tree, not the caller's. Everything
+    // below -- the NTIR, every span in the Machine IR, every symbol name the
+    // object writer copies -- points into `text`, and `splice_release` at the
+    // end of this function is what makes keeping it alive possible.
+    let mut lowered:u64=lower_tree(text,unit,owned,room,report);
+    if lowered==0 {
+        let count:u64=owned[3];
+        if want==0 {
+            let needed:u64=machine_ir.HEADER_WORDS()+count*machine_ir.NODE_WORDS();
+            if capacity<needed || len(words)<needed {
+                lowered=refuse(report,STAGE_DELIVER(),E_BOUND());
+            } else {
+                let mut k:u64=0;
+                while k<needed { words[k]=owned[k]; k=k+1; }
+                length[0]=0;
+            }
+        } else if want==1 {
+            lowered=build_object_from_image(owned,count,text,out,length,report);
+        } else {
+            lowered=build_pe_from_image(owned,count,text,out,length,report);
+        }
+    }
+    rt_free(runtime(),owned);
+    ntasm_macro_splice.splice_release(s);
+    release_unit(base,grafted);
+    rt_free(runtime(),stage_scratch);
+    return lowered;
+}
+
+// ===========================================================================
+// THE THREE SOURCE FACES. One call into `journey` each; no chain of their own.
+// ===========================================================================
+export fn lower(source:buf<u8>,words:buf<u64>,capacity:u64,report:buf<u64>)->u64 {
+    let mut length:buf<u64>=alloc(runtime(),1);
+    length[0]=0;
+    // The image destination is a `buf<u8>` and the image buffer a `buf<u64>`,
+    // and Nova does not narrow between them, so the unused one is allocated at
+    // its own element type rather than at the type of the neighbouring
+    // parameter. Binding it to a NAME is the other half of the rule: a buffer
+    // argument must name a buffer.
+    let empty:buf<u8>=alloc(runtime(),0);
+    let code:u64=journey(source,0,words,capacity,empty,length,report);
+    rt_free(runtime(),empty);
+    rt_free(runtime(),length);
+    return code;
+}
+
+export fn build_object(source:buf<u8>,out:buf<u8>,length:buf<u64>,
+        report:buf<u64>)->u64 {
+    if len(report)<REPORT_WORDS() || len(length)<1 { return 800; }
+    length[0]=0;
+    clear(report);
+    let empty:buf<u64>=alloc(runtime(),0);
+    let code:u64=journey(source,1,empty,0,out,length,report);
+    rt_free(runtime(),empty);
+    return code;
+}
+
+export fn build_pe(source:buf<u8>,out:buf<u8>,length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<REPORT_WORDS() || len(length)<1 { return 800; }
+    length[0]=0;
+    clear(report);
+    let empty:buf<u64>=alloc(runtime(),0);
+    let code:u64=journey(source,2,empty,0,out,length,report);
+    rt_free(runtime(),empty);
+    return code;
+}
+
+// ===========================================================================
+// THE EFFECTIVE TEXT, published so a caller can see what the expansion
+// produced. This is what a macro test compares against, and it is the only
+// export that hands back generated text: everything else consumes it.
+//
+// The buffer belongs to the splice and is released when this function returns,
+// so the caller COPIES what it needs and does not hold the pointer.
+// ===========================================================================
+export fn effective_text(source:buf<u8>,out:buf<u8>,length:buf<u64>,
+        report:buf<u64>)->u64 {
+    if len(length)<1 || len(report)<REPORT_WORDS() { return 800; }
+    length[0]=0;
+    clear(report);
+    let base:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if base.ok==false {
+        ntasm_ast.release(base);
+        return refuse(report,STAGE_PARSE(),800);
+    }
+    let stub_report:buf<u64>=alloc(runtime(),4);
+    let grafted:stub_table.Grafted=stub_table.graft(source,base,stub_report);
+    if grafted.code!=0 {
+        take4(report,stub_report);
+        rt_free(runtime(),stub_report);
+        ntasm_ast.release(base);
+        return refuse(report,STAGE_VALIDATE(),grafted.code);
+    }
+    rt_free(runtime(),stub_report);
+    let tree:ntasm_ast.Tree=grafted.tree;
+    let mut stage_scratch:buf<u64>=alloc(runtime(),6);
+    let mut q:u64=0;
+    while q<6 { stage_scratch[q]=0; q=q+1; }
+    let s:ntasm_macro_splice.Splice=ntasm_macro_splice.blank_splice(source,tree);
+    let code:u64=ntasm_macro_splice.expand_stage(s,stage_scratch);
+    if code!=0 {
+        take4(report,stage_scratch);
+        ntasm_macro_splice.splice_release(s);
+        release_unit(base,grafted);
+        rt_free(runtime(),stage_scratch);
+        return refuse(report,STAGE_EXPAND(),code);
+    }
+    let text:buf<u8>=s.text;
+    let size:u64=len(text);
+    if len(out)<size {
+        ntasm_macro_splice.splice_release(s);
+        release_unit(base,grafted);
+        rt_free(runtime(),stage_scratch);
+        return refuse(report,STAGE_DELIVER(),E_OUTPUT());
+    }
+    let mut k:u64=0;
+    while k<size { out[k]=text[k]; k=k+1; }
+    length[0]=size;
+    ntasm_macro_splice.splice_release(s);
+    release_unit(base,grafted);
+    rt_free(runtime(),stage_scratch);
+    return 0;
+}

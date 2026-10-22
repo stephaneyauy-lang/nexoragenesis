@@ -1,0 +1,19 @@
+module corpus_e2e.memory_space_user_data
+target x86_64-nexora-uefi
+section .rdata {
+    data base:u64=30
+}
+section .data {
+    data total:u64=12
+}
+section .text {
+    export fn main() -> u64
+    effects {reads_mem(user),writes_mem(user),changes_flags}
+    clobbers {rax,rbx,rflags} {
+        load rbx,[base]:ptr<user,u64>
+        add rbx,12
+        store [total]:ptr<user,u64>,rbx
+        load rax,[total]:ptr<user,u64>
+        return rax
+    }
+}

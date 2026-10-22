@@ -1,0 +1,172 @@
+module nova_machine_many_entry;
+import nova_language_parse;
+import nova_machine_many;
+import machine_pipeline;
+import machine_ir;
+import ntasm_ast;
+import ntasm_parser;
+import ntir;
+
+// THE MANY ENTRY: several Nova sources in ONE blob, resolved by the frontend
+// into ONE tree, lowered by `nova_machine_many.lower_many`, and emitted as the
+// ABI2 PE.
+//
+// THE FLAT ARGUMENT LAYOUT IS THE FRONTEND'S OWN SIXTEEN WORDS (the blob,
+// the spans, the count, the root and the five tables) FOLLOWED BY THE ABI2
+// OUTPUTS, so the two gates share their borrows and their reading of a buffer
+// argument: a handle and a count, a `buf<u8>` counting BYTES and a
+// `buf<u64>` counting ELEMENTS.
+//
+// THE DECLARATIONS ARE A BUFFER OF THE CALLER'S. The audit has to save them,
+// and a text the harness cannot see is a text nobody can check, so the text
+// this module writes is written where the caller can read it. The LENGTHS
+// BUFFER carries what each stage produced. Eleven buffers and five scalars
+// make TWENTY NINE words, and a count that does not match this arity is
+// refused by the ABI before this body runs.
+//
+// THE CLOSED SCALAR IS THE THIRTIETH WORD. It says which mode the lowering
+// runs in: zero is the NORMAL mode, which emits every function of the
+// program, one is the CLOSED APPLICATION MODE, which emits only the
+// functions the root module's main can reach, and two is the BATCH mode,
+// which emits the functions a range of ranks names. The scalar is EXPLICIT
+// and it is the LAST word of the first thirty, so the flat layout of the
+// twenty nine words before it does not move.
+//
+// THE BATCH'S RANGE IS TWO MORE WORDS: the zero based rank of the first
+// reachable function the object defines, and how many it defines. They come
+// after the mode, and the mode is what says they are read.
+//
+// Independent re-read of the real declaration text: every emitted record's
+// claimed NTIR identity/origin must reproduce its normative coordinates. The
+// emitted text is ONE unit (the modules' functions side by side), so the check
+// re-parses it with the single source parser, exactly as the ABI2 entry does.
+fn provenance(text:buf<u8>,size:u64,words:buf<u64>,report:buf<u64>)->u64 {
+    let exact:buf<u8>=alloc(runtime(),size);let mut i:u64=0;
+    while i<size { exact[i]=text[i];i=i+1; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(exact,1);
+    let capacity:u64=ntir.HEADER_WORDS()+tree.node_count*ntir.NODE_WORDS();
+    let image:buf<u64>=alloc(runtime(),capacity);
+    let mut code:u64=800;let mut checked:u64=0;let mut failures:u64=0;
+    if tree.ok { code=ntir.build(exact,tree,image,capacity); }
+    if code==0 {
+        let mut r:u64=1;
+        while r<=words[3] {
+            let p:u64=machine_ir.HEADER_WORDS()+(r-1)*machine_ir.NODE_WORDS();
+            let mut origin:u64=words[p+1];if origin==0 { origin=words[p+18]; }
+            let mut good:bool=origin>0 && origin<=tree.node_count;
+            if good {
+                let q:u64=ntir.HEADER_WORDS()+(origin-1)*ntir.NODE_WORDS();
+                good=words[p+2]==image[q+2] && words[p+3]==image[q+3];
+            }
+            if good==false {
+                failures=failures+1;
+                if code==0 { report[0]=words[p+2];report[1]=words[p+3];report[2]=971;report[3]=r;code=971; }
+            }
+            checked=checked+1;r=r+1;
+        }
+    }
+    report[11]=checked;report[12]=failures;
+    rt_free(runtime(),image);ntasm_ast.release(tree);rt_free(runtime(),tree);rt_free(runtime(),exact);
+    return code;
+}
+export fn main(blob:buf<u8>,spans:buf<u64>,count:u64,root:u64,
+               nodes:buf<u64>,scopes:buf<u64>,binds:buf<u64>,fields:buf<u64>,
+               modules:buf<u64>,
+               words:buf<u64>,capacity:u64,
+               decls:buf<u8>,decls_count:u64,
+               out:buf<u8>,out_count:u64,length:buf<u64>,report:buf<u64>,
+               mode:u64,batch_start:u64,batch_limit:u64)->u64 {
+    if len(report)<14 || len(length)<7 { return 800; }
+    let mut i:u64=0;
+    while i<7 { length[i]=0;i=i+1; }
+    // THE IMAGE BUILDER'S CAPACITY CODE, PUBLISHED SO THE HARNESS PINS THE
+    // EXACT REFUSAL WITHOUT HOLDING A LITERAL OF ITS OWN. It is the code the
+    // builder raises when the image it was given cannot hold the program, and
+    // the lower reports it in preference to the consequence it runs into
+    // afterwards.
+    length[6]=machine_ir.E_HEADER();
+    // THE STAGE IS SET AFTER `parse_many`, WHICH WRITES THE REPORT ITSELF. The
+    // frontend's layout is [code, reason, line, column] and the lower's is
+    // [node, line, code, column]: they are DIFFERENT, so a reader that mixes
+    // them prints a code where a line belongs. The stage says which one the
+    // report holds.
+    report[13]=0;
+    // THE PHASE MARKERS. THEY ARE NOT A PROOF: the gate's assertion and the
+    // artefacts are the proof. They exist so that a run which stops somewhere
+    // says WHERE it stopped, and they are three lines per call. Each is a
+    // LOCAL NAMED STRING, freed as soon as it has been written.
+    let phase_parse:buf<u8>="many-entry: parse begin\n";
+    rt_diag(runtime(),phase_parse);
+    rt_free(runtime(),phase_parse);
+    let mut code:u64=nova_language_parse.parse_many(blob,spans,count,root,nodes,scopes,binds,fields,modules,report);
+    // THE FRONTEND'S COUNTS ARE READ HERE, BEFORE THE STAGE OVERWRITES THE SLOT
+    // THE BIND COUNT LIVES IN. The object stage clears the report, so these
+    // three numbers have to be carried to the lengths buffer.
+    let nodes_made:u64=report[5];let scopes_made:u64=report[7];let binds_made:u64=report[8];
+    report[8]=1;
+    if code==0 {
+        let text_length:buf<u64>=alloc(runtime(),1);
+        report[8]=2;
+        let phase_lower:buf<u8>="many-entry: lower begin\n";
+        rt_diag(runtime(),phase_lower);
+        rt_free(runtime(),phase_lower);
+        // THE MODE IS THE CALLER'S SCALAR, and the three modes are three
+        // DIFFERENT ENTRIES of the adapter: the normal mode emits every
+        // function of the program, the closed mode emits only the functions
+        // the root module's main can reach, and the batch mode emits the
+        // functions a range of ranks names and imports the rest.
+        if mode==2 {
+            code=nova_machine_many.lower_many_batch(blob,spans,count,root,nodes,report[5],report[6],scopes,binds,fields,modules,
+                                                    words,capacity,decls,text_length,out,out_count,length,report,
+                                                    batch_start,batch_limit);
+        } else if mode==1 {
+            code=nova_machine_many.lower_many_closed(blob,spans,count,root,nodes,report[5],report[6],scopes,binds,fields,modules,
+                                                     words,capacity,decls,text_length,out,out_count,length,report);
+        } else {
+            code=nova_machine_many.lower_many(blob,spans,count,root,nodes,report[5],report[6],scopes,binds,fields,modules,
+                                              words,capacity,decls,text_length,out,out_count,length,report);
+        }
+        // THE CLOSED MODE'S THREE COUNTS ARE READ HERE, BEFORE THE EMISSION
+        // STAGE RUNS: the object stage clears the report, so a count read
+        // after it would be a count of something else. [4] the functions the
+        // program declares, [5] the ones the root module's main can reach,
+        // and [6] the declarations the emitted unit carries, which are the
+        // reachable ones and the three synthetic ones. The normal mode's
+        // report keeps the meaning it had, so the three counts are zero
+        // there. [7] is the number of functions THIS OBJECT DEFINES, which
+        // is the batch's own count.
+        let mut declared:u64=0;let mut reachable:u64=0;let mut emitted:u64=0;let mut defined:u64=0;
+        if mode!=0 { declared=report[4];reachable=report[5];emitted=report[6];defined=report[7]; }
+        if code==0 { code=provenance(decls,text_length[0],words,report); }
+        if code==0 {
+            report[8]=3;
+            let phase_emit:buf<u8>="many-entry: emission begin\n";
+            rt_diag(runtime(),phase_emit);
+            rt_free(runtime(),phase_emit);
+            // A BATCH IS AN OBJECT AND NOT A PROGRAM: only the first batch
+            // has an entry, so the other batches are delivered as the
+            // container the linker joins.
+            if mode==2 {
+                code=machine_pipeline.build_object_from_image(words,words[3],decls,out,length,report);
+            } else {
+                code=machine_pipeline.build_pe_from_image(words,words[3],decls,out,length,report);
+            }
+        }
+        // WHAT EACH STAGE PRODUCED, in the lengths buffer, because the report
+        // was cleared by the object stage and the frontend's counts are gone
+        // from it. [1] the declarations' bytes, [2] the MIR image's used bytes,
+        // [3] the node count, [4] the scope count, [5] the bind count.
+        if code==0 {
+            length[1]=text_length[0];
+            length[2]=(machine_ir.HEADER_WORDS()+words[3]*machine_ir.NODE_WORDS())*8;
+            length[3]=nodes_made;length[4]=scopes_made;length[5]=binds_made;
+            // [7] the functions the program declares, [8] the ones the root
+            // module's main can reach, [9] the declarations the emitted unit
+            // carries, and [10] the functions THIS object defines. They are
+            // published only when the caller lent the room for them.
+            if len(length)>=12 { length[7]=declared;length[8]=reachable;length[9]=emitted;length[10]=defined; }
+        }
+        rt_free(runtime(),text_length);
+    }
+    return code;
+}

@@ -1,0 +1,24 @@
+module ntasm_parser_test;
+import ntasm_parser;
+import ntasm_ast;
+
+fn main(source:buf<u8>,out:buf<u64>)->u64 {
+    // An empty source selects the keyword-table read-back used by the gate to
+    // prove that appending a keyword moved no existing identifier index.
+    // out[0]=ok out[1]=table bytes out[2..]=the NUL-separated table itself.
+    if (len(source)==0) {
+        if (len(out)<1024) { return 902; }
+        let size:u64=ntasm_parser.keyword_read_back(out,2);
+        out[0]=1;out[1]=size;return 0;
+    }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    let needed:u64=10+tree.node_count*12;
+    if (len(out)<(needed)) { ntasm_ast.release(tree);return 901; }
+    out[0]=0;if (tree.ok==true) { out[0]=1; }
+    out[1]=tree.code;out[2]=tree.reason;out[3]=tree.source;
+    out[4]=tree.line;out[5]=tree.column;out[6]=tree.start;out[7]=tree.end;
+    out[8]=tree.token_count;out[9]=tree.node_count;
+    let mut i:u64=0;
+    while (i<tree.node_count*12) { out[10+i]=tree.node_words[i];i=i+1; }
+    ntasm_ast.release(tree);return tree.code;
+}

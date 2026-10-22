@@ -1,0 +1,7 @@
+module nova_machine_abi2;
+import nova_machine_lower;
+// Scalar nova_machine_lower.lower remains a separate, unchanged API.
+export fn lower_abi2(source:buf<u8>,nodes:buf<u64>,count:u64,text_out:buf<u8>,text_length:buf<u64>,
+                    words:buf<u64>,capacity:u64,report:buf<u64>)->u64 {
+    return nova_machine_lower.lower_profile(source,nodes,count,text_out,text_length,words,capacity,report,1);
+}

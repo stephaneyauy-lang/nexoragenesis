@@ -1,0 +1,182 @@
+module control_flow_entry;
+import ntasm_ast;import ntasm_parser;import semantics;import callable_names;
+import control_flow;import body_clobbers;import call_contracts;
+
+// The single instruction of a probe body, or 0 when the body does not hold
+// exactly one, which is what keeps the probe unambiguous.
+fn only_instruction(tree:ntasm_ast.Tree)->u64 {
+    let mut id:u64=1;let mut found:u64=0;let mut count:u64=0;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==32&&n.aux==0 { count=count+1; found=id; }
+        id=id+1;
+    }
+    if count!=1 { return 0; }
+    return found;
+}
+
+// The 17.4 footprint parity probe. body_clobbers is asked first, and because
+// the probe body declares clobbers {} it has to charge its whole required
+// family bitset as 335, where family 5, the stack family, is bit 16; a
+// destination that is no register at all is 336 and writes no family.
+// control_flow is then asked the same question through its exported
+// predicate, and the two answers have to be one and the same.
+fn parity(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    let id:u64=only_instruction(tree);
+    if id==0 { return 800; }
+    let clobber:buf<u64>=alloc(runtime(),4);
+    let code:u64=body_clobbers.check(source,tree,clobber);
+    let mine:bool=control_flow.writes_stack(source,tree,id);
+    let mut theirs:bool=false;
+    if code==335 { let bit:u64=clobber[3]; if (bit&16)!=0 { theirs=true; } }
+    out[0]=0;if mine { out[0]=1; }
+    out[1]=0;if theirs { out[1]=1; }
+    out[2]=code;out[3]=0;
+    if (mine==theirs)==false { out[3]=1; }
+    rt_free(runtime(),clobber);
+    if (mine==theirs)==false { return 1; }
+    return 0;
+}
+
+// mode 2 asks the three questions about the one instruction of the body at
+// once, so the gate asserts the rows of the invalidation table itself and not
+// only what they do to a later call. displaces_stack is the question this lot
+// added, replaces_stack is the compensation witness and writes_stack is the
+// 17.4 footprint question body_clobbers is asked in parallel, so the three
+// words are the whole table for one form. out[3] is 1 when the second and the
+// third differ, and the probe returns 1 on that, which the gate reads as a
+// divergence; the rows where they must differ, pushfq, popfq and ret, are
+// asserted as such by the gate and are not a break.
+fn displacement(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    let id:u64=only_instruction(tree);
+    if id==0 { return 800; }
+    let displaces:bool=control_flow.displaces_stack(source,tree,id);
+    let replaces:bool=control_flow.replaces_stack(source,tree,id);
+    let writes:bool=control_flow.writes_stack(source,tree,id);
+    out[0]=0;if displaces { out[0]=1; }
+    out[1]=0;if replaces { out[1]=1; }
+    out[2]=0;if writes { out[2]=1; }
+    out[3]=0;if replaces!=writes { out[3]=1; }
+    if (replaces!=writes) { return 1; }
+    return 0;
+}
+
+// The single body statement of a probe body, or 0 when the body does not
+// hold exactly one. This is the statement-level twin of only_instruction,
+// and it looks for the two node kinds a NAME statement can never carry: a
+// return is kind 29 and a call is kind 28 (parser.nova:362-368 and
+// :370-374). It is what lets the gate put a real return or a real call
+// statement to the three statement questions, instead of putting a
+// synthetic kind 32 node through the instruction path and calling the
+// result a statement.
+fn only_statement(tree:ntasm_ast.Tree)->u64 {
+    let mut id:u64=1;let mut found:u64=0;let mut count:u64=0;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==28||n.kind==29 { count=count+1; found=id; }
+        id=id+1;
+    }
+    if count!=1 { return 0; }
+    return found;
+}
+
+// mode 5 asks the three 17.4 and 10 questions of the one return or call
+// statement of the body, which is the pair the instruction path could never
+// reach. The three words are the same three writes_stack, displaces_stack
+// and replaces_stack answer for an instruction, taken here from the
+// statement table: out[0] the footprint, out[1] the displacement, out[2]
+// whether the displacement comes back. The third is the one that differs
+// between the two forms, and it is the whole reason the two are rows and not
+// one row: a return pays no debt and a call does not kill the fact.
+fn statement(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if len(out)<4 { return 800; }
+    let id:u64=only_statement(tree);
+    if id==0 { return 800; }
+    let writes:bool=control_flow.statement_writes_stack(source,tree,id);
+    let displaces:bool=control_flow.statement_displaces_stack(source,tree,id);
+    let restores:bool=control_flow.statement_restores_stack(source,tree,id);
+    out[0]=0;if writes { out[0]=1; }
+    out[1]=0;if displaces { out[1]=1; }
+    out[2]=0;if restores { out[2]=1; }
+    out[3]=0;
+    if (writes==false) { return 1; }
+    return 0;
+}
+
+// mode 6 asks control_flow.facts about the LAST call in the tree, and the
+// caller is the function whose source span contains it. The last call is named
+// rather than the first so a fixture may put a helper call first and the
+// call under test second, which is the only shape in which a fact can be spent
+// BEFORE the observation point: a cycle or a chain is entered by a statement
+// that runs earlier, so asking about the first call would walk an empty prefix
+// and answer "live" for the wrong reason.
+//
+// out[0] is the slot count, out[1+k] the effective family of slot k, and
+// out[2+k] whether that fact still holds AT THE CALL. The families are
+// republished beside the liveness so a reader never has to re-derive which
+// register a slot is.
+fn facts(source:buf<u8>,tree:ntasm_ast.Tree,out:buf<u64>)->u64 {
+    if len(out)<2 { return 800; }
+    let mut call_id:u64=0;
+    let mut id:u64=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==28 || (n.kind==35 && n.aux==1) { call_id=id; }
+        id=id+1;
+    }
+    if call_id==0 { return 800; }
+    let at:ntasm_ast.Node=ntasm_ast.node_at(tree,call_id);
+    let mut caller_id:u64=0;
+    id=1;
+    while id<=tree.node_count {
+        let n:ntasm_ast.Node=ntasm_ast.node_at(tree,id);
+        if n.kind==18 && n.start<=at.start && at.end<=n.end { caller_id=id; }
+        id=id+1;
+    }
+    if caller_id==0 { return 800; }
+    return control_flow.facts(source,tree,caller_id,call_id,out);
+}
+
+// mode 0 is the verdict of control_flow.check on its own, the shape every
+// verdict case of the control_flow gate uses. mode 1 is the parity probe above,
+// mode 2 the displacement probe, mode 3 reports control_flow.abi_ceiling() on
+// its own, and mode 4 asks call_contracts.check alone so the gate can put the
+// two copies of the ABI stack alignment ceiling side by side. Neither module
+// can import the other, so the two numbers are bound by that comparison and not
+// by a shared name.
+// Success writes the four words the chosen mode defines; a refusal of the mode
+// 0 pipeline copies the four words of the stage that refused, and a probe
+// returns 1 on a disagreement, which the gate reads as a divergence.
+export fn main(source:buf<u8>,out:buf<u64>,mode:u64)->u64 {
+    if len(out)<4 { return 800; }
+    let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+    if tree.ok==false { ntasm_ast.release(tree); return 800; }
+    let scratch:buf<u64>=alloc(runtime(),4);
+    let mut code:u64=0;
+    if mode==1 {
+        code=parity(source,tree,scratch);
+        out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3];
+    } else if mode==2 {
+        code=displacement(source,tree,scratch);
+        out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3];
+    } else if mode==5 {
+        code=statement(source,tree,scratch);
+        out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3];
+    } else if mode==6 {
+        code=facts(source,tree,out);
+    } else if mode==3 {
+        out[0]=control_flow.abi_ceiling();out[1]=0;out[2]=0;out[3]=0;code=0;
+    } else if mode==4 {
+        code=call_contracts.check(source,tree,out);
+    } else {
+        code=semantics.index(source,tree,scratch);
+        if code==0 { code=callable_names.check(source,tree,scratch); }
+        if code==0 { code=control_flow.check(source,tree,out); }
+        else if code!=800 { out[0]=scratch[0];out[1]=scratch[1];out[2]=scratch[2];out[3]=scratch[3]; }
+    }
+    rt_free(runtime(),scratch);
+    ntasm_ast.release(tree);
+    return code;
+}

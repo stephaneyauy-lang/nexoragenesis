@@ -1,0 +1,9 @@
+module math
+target x86_64-nexora-uefi
+section .text {
+    export fn add(in a:u64 @rcx,in b:u64 @rdx)->u64
+    effects {}
+    clobbers {} {
+        return a+b
+    }
+}

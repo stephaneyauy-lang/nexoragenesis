@@ -1,0 +1,17 @@
+module a4.catalog
+target x86_64-nexora-uefi
+features {sse2}
+section .text {
+fn leaf(in p:ptr<user,u64> @rdi)->u64
+effects {}
+clobbers {}
+requires {feature(sse2),non_null(p),canonical(p),stack_in(kernel),stack_aligned(16),msr_initialized(1),mapping_present(p),valid_user_return(p,p),interrupts_enabled()}
+ensures {canonical(p),interrupts_enabled()} {
+return 42
+}
+export fn main()->u64
+effects {}
+clobbers {} {
+return 42
+}
+}

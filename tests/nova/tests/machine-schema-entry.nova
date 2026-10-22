@@ -1,0 +1,101 @@
+module machine_schema_entry;
+import ntasm_ast;
+import ntasm_parser;
+import ntasm_lexer;
+import ntir;
+import machine_ir;
+import ir_image;
+import register_widths;
+import pointer_spaces;
+import versions;
+
+// A7.02, porte de schéma du coordinateur Claude (4 octobre 2026). Ce module ne
+// décrit rien : il RAPPORTE ce que machine_ir.nova répond, pour qu'une porte C
+// le compare au document spec/machine-ir-v0.md. Aucun nombre du schéma n'est
+// écrit ici ; chacun est une réponse du module.
+//
+//   mode 0  constantes et codes de refus dans report
+//   mode 1  schema_field(index) dans text
+//   mode 2  kind_text(index) dans text, kind_at(index) dans report[0]
+//   mode 3  header_text() dans text
+//   mode 4  parse, ntir.build, machine_ir.lower, machine_ir.verify, puis
+//           machine_ir.serialize : l'image dans out, le texte dans text,
+//           report[0]=code, report[1]=nombre total de mots de l'image
+export fn main(source:buf<u8>,mode:u64,index:u64,ntir_out:buf<u64>,
+        out:buf<u64>,text:buf<u8>,text_length:buf<u64>,report:buf<u64>)->u64 {
+    if len(report)<32 || len(text_length)<1 { return 800; }
+    if mode==0 {
+        report[0]=machine_ir.FORMAT_MAJOR();
+        report[1]=machine_ir.FORMAT_MINOR();
+        report[2]=machine_ir.HEADER_WORDS();
+        report[3]=machine_ir.NODE_WORDS();
+        report[4]=machine_ir.KIND_BASE();
+        report[5]=machine_ir.KIND_COUNT();
+        report[6]=machine_ir.SCHEMA_FIELDS();
+        report[7]=machine_ir.DOMAIN_BIT();
+        report[8]=machine_ir.version_pin();
+        report[9]=machine_ir.E_TAG();
+        report[10]=machine_ir.E_HEADER();
+        report[11]=machine_ir.E_KIND();
+        report[12]=machine_ir.E_LINK();
+        report[13]=machine_ir.E_SHAPE();
+        report[14]=machine_ir.E_CYCLE();
+        report[15]=machine_ir.E_SHARED();
+        report[16]=machine_ir.E_UNREACHED();
+        report[17]=machine_ir.E_TYPED();
+        report[18]=machine_ir.E_ORIGIN();
+        report[19]=machine_ir.E_INPUT();
+        report[20]=machine_ir.E_VALUE();
+        report[21]=machine_ir.E_TARGET();
+        report[22]=machine_ir.E_VERSION();
+        report[23]=machine_ir.E_ARITY();
+        report[24]=machine_ir.E_SCALE();
+        report[25]=machine_ir.E_NTIR();
+        report[26]=machine_ir.E_FRAME();
+        report[27]=machine_ir.E_FORM();
+        return 0;
+    }
+    if mode==1 {
+        let mut field:buf<u8>=machine_ir.schema_field(index);
+        return copy_text(field,text,text_length);
+    }
+    if mode==2 {
+        report[0]=machine_ir.kind_at(index);
+        let mut name:buf<u8>=machine_ir.kind_text(index);
+        return copy_text(name,text,text_length);
+    }
+    if mode==3 {
+        let mut tag:buf<u8>=machine_ir.header_text();
+        return copy_text(tag,text,text_length);
+    }
+    if mode==4 {
+        if len(ntir_out)<ntir.HEADER_WORDS() { return 800; }
+        if len(out)<machine_ir.HEADER_WORDS() { return 800; }
+        let tree:ntasm_ast.Tree=ntasm_parser.parse(source,1);
+        if tree.ok==false { ntasm_ast.release(tree); return 800; }
+        let mut built:u64=ntir.build(source,tree,ntir_out,len(ntir_out));
+        ntasm_ast.release(tree);
+        if built!=0 { return built; }
+        let mut count:u64=ntir_out[3];
+        let mut lowered:u64=machine_ir.lower(source,ntir_out,count,out,len(out),report);
+        if lowered!=0 { return lowered; }
+        let mut checked:u64=machine_ir.verify(out,out[3],report);
+        if checked!=0 { return checked; }
+        let mut records:u64=out[3];
+        let mut total:u64=machine_ir.HEADER_WORDS()+records*machine_ir.NODE_WORDS();
+        let mut written:u64=machine_ir.serialize(out,records,text,text_length);
+        report[0]=written;
+        report[1]=total;
+        return written;
+    }
+    return 800;
+}
+
+fn copy_text(s:buf<u8>,text:buf<u8>,text_length:buf<u64>)->u64 {
+    let mut size:u64=len(s);
+    if size>len(text) { return 827; }
+    let mut i:u64=0;
+    while i<size { text[i]=s[i]; i=i+1; }
+    text_length[0]=size;
+    return 0;
+}

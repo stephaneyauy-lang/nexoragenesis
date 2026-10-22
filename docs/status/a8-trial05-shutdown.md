@@ -92,11 +92,15 @@ compiling the same `NOVA.IN` and the same P2 compiler:
 | 16:22:08Z | 15 | LOWER | 1470 s | no record | - | `9b3509ec` | `413b7816` |
 | 17:03:11Z | 16 | LOWER | 2074 s | 10675 s | **8601 s** | `9b3509ec` | `413b7816` |
 
-Read with care: the run of 14:37 was **still working** when its own deadline
-arrived (38 s of dead wait, the guest was writing until the deadline), and
-the run of 16:22 was stopped by the user. Only the run of 13:53 and the run
-of 17:03 are stops of the guest itself. The run of 16:22 has no
-`transport-result.json`, so its waiting time is unknown, not zero.
+Read with care, the five runs are not five instances of the same thing. The
+run of 14:37 was **still working** when its own deadline arrived (38 s of
+dead wait, the guest was writing until the deadline). The run of 16:22 was
+stopped by the user, and it has no `transport-result.json`, so its waiting
+time is unknown, not zero. The run of 14:14 shows a **third** symptom: its
+serial ends with the firmware loading `Boot0002 "EFI Internal Shell"`, so
+the guest had *returned to the firmware* without a terminal marker and the
+firmware moved on to the next boot option. That leaves two runs where the
+guest stopped by itself: the run of 13:53 and the run of 17:03.
 
 ## What the evidence refutes
 

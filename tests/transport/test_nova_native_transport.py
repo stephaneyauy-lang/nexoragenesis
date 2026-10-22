@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -585,6 +586,65 @@ class RamGuardTests(unittest.TestCase):
         self.assertIn("RAM_POLL_SECONDS", source)
         self.assertIn("ram_decision(free, \"running\")", source)
         self.assertIn("ram_pass(ram)", source)
+
+
+class RamMeasurementTests(unittest.TestCase):
+    """The measurement of the free RAM, when the host is busy.
+
+    A QEMU guest takes every core it is given, and the measurement of the
+    Windows host then takes longer than its timeout. A slow measurement is
+    not a failed one: the call is retried, and only the failure of every
+    attempt refuses the run.
+    """
+
+    def windows(self, side_effect):
+        return mock.patch.multiple(
+            nt, _powershell_path=mock.Mock(return_value=Path("/fake/powershell.exe")),
+            **{"subprocess.run": mock.Mock(side_effect=side_effect),
+               "time.sleep": mock.Mock()})
+
+    def test_a_slow_measurement_is_retried_and_can_succeed(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if len(calls) < 3:
+                raise subprocess.TimeoutExpired(cmd="powershell", timeout=60)
+            return mock.Mock(returncode=0, stdout=b"1048576\r\n")
+
+        with mock.patch.object(nt, "_powershell_path",
+                               return_value=Path("/fake/powershell.exe")), \
+             mock.patch.object(nt.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(nt.time, "sleep"):
+            free = nt._measure_windows()
+        self.assertEqual(free, 1048576 * 1024)
+        self.assertEqual(len(calls), 3)
+
+    def test_a_measurement_that_always_fails_is_still_a_refusal(self):
+        with mock.patch.object(nt, "_powershell_path",
+                               return_value=Path("/fake/powershell.exe")), \
+             mock.patch.object(nt.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(
+                                   cmd="powershell", timeout=60)), \
+             mock.patch.object(nt.time, "sleep"):
+            with self.assertRaises(nt.Refusal) as caught:
+                nt._measure_windows()
+        self.assertIn("after 3 attempts", str(caught.exception))
+
+    def test_an_unreadable_answer_is_still_a_refusal(self):
+        with mock.patch.object(nt, "_powershell_path",
+                               return_value=Path("/fake/powershell.exe")), \
+             mock.patch.object(nt.subprocess, "run",
+                               return_value=mock.Mock(returncode=0,
+                                                     stdout=b"not a number")), \
+             mock.patch.object(nt.time, "sleep"):
+            with self.assertRaises(nt.Refusal):
+                nt._measure_windows()
+
+    def test_the_attempts_and_the_timeout_are_bounded(self):
+        self.assertEqual(nt.RAM_MEASURE_ATTEMPTS, 3)
+        self.assertLessEqual(nt.RAM_MEASURE_TIMEOUT, 120)
+        self.assertGreater(nt.RAM_MEASURE_TIMEOUT, 60)
 
 
 class ForeignQemuTests(unittest.TestCase):

@@ -92,6 +92,16 @@ RAM_START_MIN = 9 * 1024 ** 3
 RAM_STOP_MAX = 8 * 1024 ** 3
 RAM_POLL_SECONDS = 5.0
 
+# The measurement of the free RAM is a call to the Windows host from inside
+# WSL, and the host can be busy: a QEMU guest takes every core it is given,
+# and the WMI call of the measurement then takes longer than its timeout. A
+# slow measurement is NOT a failed measurement, so the call is retried before
+# the run is refused. The budget is bounded, so the boot loop is never
+# blocked for more than RAM_MEASURE_ATTEMPTS * RAM_MEASURE_TIMEOUT seconds.
+RAM_MEASURE_TIMEOUT = 120
+RAM_MEASURE_ATTEMPTS = 3
+RAM_MEASURE_RETRY_SECONDS = 2
+
 # The guest memory of the emulated machine. It is a CONTRACT value: the argv
 # and the contract record always carry THIS one, never a literal of their
 # own. 512M: the 256M guest failed the UEFI AllocatePool (nv_pool_bad).
@@ -279,27 +289,42 @@ def _powershell_path():
 
 
 def _measure_windows():
-    """Free physical memory of the Windows host, in bytes."""
+    """Free physical memory of the Windows host, in bytes.
+
+    The call is retried: a busy host makes it slow, and a slow call is not a
+    refused one. Only when every attempt failed is the measurement a
+    refusal.
+    """
     exe = _powershell_path()
     if exe is None:
         raise Refusal("cannot measure RAM: no powershell.exe under "
                       "/mnt/*/Windows/System32/WindowsPowerShell/v1.0")
     script = ("$os = Get-CimInstance Win32_OperatingSystem; "
               "Write-Output $os.FreePhysicalMemory")
-    try:
-        proc = subprocess.run([str(exe), "-NoProfile", "-NonInteractive",
-                               "-Command", script],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=60, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise Refusal("cannot measure RAM: powershell failed (%s)" % exc)
-    text = proc.stdout.decode("utf-8", "replace").strip()
-    try:
-        kib = int(text)
-    except ValueError:
-        raise Refusal("cannot measure RAM: powershell returned " +
-                      repr(text[:120]))
-    return kib * 1024
+    last = "no attempt was made"
+    for attempt in range(RAM_MEASURE_ATTEMPTS):
+        try:
+            proc = subprocess.run([str(exe), "-NoProfile", "-NonInteractive",
+                                   "-Command", script],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=RAM_MEASURE_TIMEOUT, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            last = str(exc)
+        else:
+            if proc.returncode:
+                last = "powershell returned rc=" + str(proc.returncode)
+            else:
+                text = proc.stdout.decode("utf-8", "replace").strip()
+                try:
+                    kib = int(text)
+                except ValueError:
+                    last = "powershell returned " + repr(text[:120])
+                else:
+                    return kib * 1024
+        if attempt + 1 < RAM_MEASURE_ATTEMPTS:
+            time.sleep(RAM_MEASURE_RETRY_SECONDS)
+    raise Refusal("cannot measure RAM: powershell failed after %d attempts (%s)"
+                  % (RAM_MEASURE_ATTEMPTS, last))
 
 
 def _measure_proc():

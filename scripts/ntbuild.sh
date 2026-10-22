@@ -790,7 +790,7 @@ cmd_policy() {
   echo "  outside-repo              a path that resolves outside the repository"
   echo "  nonexistent-input         a path that is not a regular file"
   echo "  not-a-c-source            an existing file that is not .c or .h"
-  echo "  ungranted-quarantine-source  under bootstrap/quarantine/, not granted"
+  echo "  ungranted-quarantine-source  under a quarantined tree, not granted"
   echo "  not-granted               inside the repository, not granted"
   echo "  forbidden-producer        the selected compiler is an assembler"
   echo "  unresolvable-producer     the selected compiler is not on PATH"

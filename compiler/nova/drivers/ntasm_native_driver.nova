@@ -1,0 +1,311 @@
+module ntasm_native_driver;
+import machine_pipeline;
+import ntasm_nxo_link_pe;
+import ntasm_nxo_pe;
+import ntasm_pe;
+
+// THE FILE-BASED NTASM PILOT, ABI2 `main()->u64`.
+//
+// It reads the private bundle NTASM.IN, compiles EACH source into its own NXO
+// container with the common pipeline (`machine_pipeline.build_object`),
+// gathers the containers in one arena, and links them into ONE PE
+// (`ntasm_nxo_link_pe.link_pe_list`). The PE is written to OUTPUT.EFI, and
+// only when the whole translation has succeeded.
+//
+// WHAT THE LINKED PE IS. It is the PE the existing linker builds out of the
+// linked units. Whether that PE is an ABI2 image is a property of the SOURCES
+// -- of the entry they declare -- and not of this file: this file links what
+// it is given and writes back what the linker returned. The pilot ITSELF is
+// an ABI2 program (`export fn main()->u64`), and that is a statement about
+// this file's own entry, not about the image it produces.
+//
+// THE PROFILE IS "NXO UNITS + LINK", and it is NOT the one-shot multimodule
+// profile of the C producer. Here every source is a unit of its own, each
+// unit is a real NXO container, and the LINKER is what joins them; the C
+// producer takes the whole program in one shot. The corpus pins, the goldens
+// and the attestations of the normal build are NOT touched by this file, and
+// the normal tool does not change: this is a second tool, with its own
+// envelope.
+//
+// THE ENVELOPE, little endian throughout:
+//   8  bytes  "NTSRC001"
+//   3  u64    count, reserved (zero), blob_size
+//   count x (u64 offset, u64 length)  offsets RELATIVE TO THE BLOB
+//   blob_size bytes                   the sources concatenated in span order
+// The file is EXACTLY 32+16*count+blob_size bytes. After the declared body the
+// driver reads ONE sentinel byte: a byte there is a suffix and is refused, EOF
+// is the expected answer, and a short body is refused as truncation. count is
+// 1..64, every source is non-empty, the reserved word is zero, and
+// blob<=4MiB.
+//
+// THE ENVELOPE'S OWN REFUSALS are the 1110 family. They are this pilot's own:
+// a refusal of the pipeline is reported with the pipeline's own code and its
+// own stage, unchanged, and this file never renames a code it did not invent.
+// The band belongs to this pilot and not to the NTASM diagnostic registry,
+// whose codes keep the meaning their own module gives them.
+//
+// THE OWNERSHIP. Every buffer below is allocated here and freed here; the
+// sources and the temporaries are released BEFORE the link, so the link reads
+// the arena and nothing else; the conversion record and its bytes are two
+// distinct things and both are freed.
+export fn E_HEADER()->u64 { return 1110; }    // fewer than 32 bytes
+export fn E_MAGIC()->u64 { return 1111; }     // not NTSRC001
+export fn E_ENVELOPE()->u64 { return 1112; }  // truncated, suffixed, or not 32+16*count+blob
+export fn E_COUNT()->u64 { return 1113; }     // count outside 1..64
+export fn E_RESERVED()->u64 { return 1114; }  // the reserved word is not zero
+export fn E_LIMIT()->u64 { return 1115; }     // blob>4MiB, or a span outside the blob
+export fn E_EMPTY()->u64 { return 1116; }     // a source of length zero
+export fn E_INTERFACE()->u64 { return 1117; } // an allocated capacity is not the declared one
+export fn E_IO()->u64 { return 1118; }        // open/write/close refused
+export fn E_OUTPUT()->u64 { return 1119; }    // emitted PE length 0 or over capacity
+
+// The capacities, stated once and checked after the allocation. A bundle that
+// needs more is refused; nothing here is raised to make a bigger input fit.
+fn INPUT_BYTES_LIMIT()->u64 { return 4195361; } // 32+16*64+4MiB, plus the sentinel byte
+fn BLOB_BYTES_LIMIT()->u64 { return 4194304; }
+fn SPAN_WORDS()->u64 { return 128; }
+// THE ARENA: sixty four descriptors of sixteen bytes are reserved at its
+// head, and the NXO units follow them.
+fn ARENA_BYTES_LIMIT()->u64 { return 33554432; }
+fn ARENA_HEADER_BYTES()->u64 { return 1024; }
+fn NXO_TEMP_BYTES()->u64 { return 16777216; }  // the unit being built, reused
+fn PE_BYTES_LIMIT()->u64 { return 16777216; }
+fn REPORT_WORDS()->u64 { return 14; }
+
+// THIS PILOT'S OWN STAGES. A stage number that means something else is never
+// printed: the driver's stage names where the driver was, and the producer's
+// stage names where inside the pipeline the refusal came from.
+fn STAGE_ENVELOPE()->u64 { return 1; }
+fn STAGE_COMPILE()->u64 { return 2; }
+fn STAGE_LINK()->u64 { return 3; }
+fn STAGE_DELIVER()->u64 { return 4; }
+
+// The magic is a literal, not a parsed string: each of the eight bytes is the
+// one "NTSRC001" carries, so a rename of the version is a visible edit here
+// and not a table that could drift from the bytes on disk.
+fn magic_byte(i:u64)->u64 {
+    if i==0 { return 78; }
+    if i==1 { return 84; }
+    if i==2 { return 83; }
+    if i==3 { return 82; }
+    if i==4 { return 67; }
+    if i==5 { return 48; }
+    if i==6 { return 48; }
+    return 49;
+}
+
+fn le64(bytes:buf<u8>,at:u64)->u64 {
+    let mut value:u64=0;let mut scale:u64=1;let mut i:u64=0;
+    while i<8 { value=value+u64(bytes[at+i])*scale;scale=scale*256;i=i+1; }
+    return value;
+}
+// 0 = exactly want bytes; 1 = EOF (or a refused count) before that.
+fn read_upto(reader:u64,storage:buf<u8>,at:u64,want:u64)->u64 {
+    let mut used:u64=0;
+    while used<want {
+        let room:u64=want-used;
+        let tail:buf<u8>=slice(storage,at+used,room);
+        let got:u64=rt_read(runtime(),reader,tail);
+        rt_free(runtime(),tail);
+        if got==0 || got>room { return 1; }
+        used=used+got;
+    }
+    return 0;
+}
+// The envelope, in the order the protocol states it: header, magic, count,
+// reserved, blob size, exact length, then the span bounds. The sentinel read
+// is what makes "no suffix" observable: after the declared body, one single
+// byte must NOT be readable, and read_upto answers 1 for EOF and 0 for that
+// byte.
+fn read_packet(reader:u64,storage:buf<u8>,spans:buf<u64>)->u64 {
+    if len(storage)!=INPUT_BYTES_LIMIT() || len(spans)!=SPAN_WORDS() { return E_INTERFACE(); }
+    if read_upto(reader,storage,0,32)!=0 { return E_HEADER(); }
+    let mut i:u64=0;
+    while i<8 {
+        if u64(storage[i])!=magic_byte(i) { return E_MAGIC(); }
+        i=i+1;
+    }
+    let count:u64=le64(storage,8);
+    if count<1 || count>64 { return E_COUNT(); }
+    let reserved:u64=le64(storage,16);
+    if reserved!=0 { return E_RESERVED(); }
+    let blob_size:u64=le64(storage,24);
+    if blob_size>BLOB_BYTES_LIMIT() { return E_LIMIT(); }
+    if read_upto(reader,storage,32,16*count+blob_size)!=0 { return E_ENVELOPE(); }
+    let end:u64=32+16*count+blob_size;
+    if read_upto(reader,storage,end,1)!=1 { return E_ENVELOPE(); }
+    i=0;
+    while i<count {
+        let off:u64=le64(storage,32+i*16);
+        let size:u64=le64(storage,40+i*16);
+        if off>blob_size || size>blob_size-off { return E_LIMIT(); }
+        if size==0 { return E_EMPTY(); }
+        spans[i*2]=off;spans[i*2+1]=size;
+        i=i+1;
+    }
+    return 0;
+}
+fn diag_number(value:u64)->u64 {
+    let digits:buf<u8>=alloc(runtime(),20);
+    let mut cursor:u64=20;let mut current:u64=value;let mut done:bool=false;
+    while done==false {
+        cursor=cursor-1;digits[cursor]=u8(48+current%10);current=current/10;
+        if current==0 { done=true; }
+    }
+    let exact:buf<u8>=slice(digits,cursor,20-cursor);
+    rt_diag(runtime(),exact);
+    let newline:buf<u8>="\r\n";rt_diag(runtime(),newline);
+    rt_free(runtime(),newline);rt_free(runtime(),exact);rt_free(runtime(),digits);
+    return 0;
+}
+
+export fn main()->u64 {
+    let input_path:buf<u8>="NTASM.IN";
+    let output_path:buf<u8>="OUTPUT.EFI";
+    let storage:buf<u8>=alloc(runtime(),INPUT_BYTES_LIMIT());
+    let spans:buf<u64>=alloc(runtime(),SPAN_WORDS());
+    let arena:buf<u8>=alloc(runtime(),ARENA_BYTES_LIMIT());
+    let temp:buf<u8>=alloc(runtime(),NXO_TEMP_BYTES());
+    let temp_length:buf<u64>=alloc(runtime(),1);
+    let report:buf<u64>=alloc(runtime(),REPORT_WORDS());
+    let mut code:u64=E_INTERFACE();
+    let mut count:u64=0;
+    let mut stage_id:u64=STAGE_ENVELOPE();
+    // THE PRODUCER'S OWN STAGE, and it is zero until the pipeline is the one
+    // that refused: zero is not a stage of the pipeline, so it says "the
+    // pipeline did not refuse" and not "an unknown stage refused".
+    let mut producer_stage:u64=0;
+    let mut pe_bytes:u64=0;
+    temp_length[0]=0;
+    // THE CAPACITIES ARE THE DECLARED ONES, and a buffer that is not the size
+    // this file asked for is a defect and not a detail.
+    let mut capacity_ok:bool=len(storage)==INPUT_BYTES_LIMIT();
+    if len(spans)!=SPAN_WORDS() { capacity_ok=false; }
+    if len(arena)!=ARENA_BYTES_LIMIT() { capacity_ok=false; }
+    if len(temp)!=NXO_TEMP_BYTES() { capacity_ok=false; }
+    if len(temp_length)!=1 { capacity_ok=false; }
+    if len(report)!=REPORT_WORDS() { capacity_ok=false; }
+    if capacity_ok==false { code=E_INTERFACE(); }
+    if capacity_ok {
+        let reader:u64=rt_open_read(runtime(),input_path);
+        code=read_packet(reader,storage,spans);
+        rt_close(runtime(),reader);
+    }
+    if code==0 {
+        count=le64(storage,8);
+        stage_id=STAGE_COMPILE();
+        // THE DESCRIPTOR TABLE IS ZEROED WHOLE, and the units follow it.
+        let mut h:u64=0;
+        while h<(ARENA_HEADER_BYTES()) { arena[h]=u8(0);h=h+1; }
+        let mut at:u64=ARENA_HEADER_BYTES();
+        let mut i:u64=0;
+        while i<count && code==0 {
+            let off:u64=spans[i*2];
+            let size:u64=spans[i*2+1];
+            // ONE SOURCE, ONE NXO UNIT, built by the common pipeline. The
+            // source is a slice of the storage and it is released as soon as
+            // the unit is built.
+            let source:buf<u8>=slice(storage,32+16*count+off,size);
+            let built:u64=machine_pipeline.build_object(source,temp,temp_length,report);
+            rt_free(runtime(),source);
+            if built!=0 {
+                // THE PIPELINE'S OWN CODE AND ITS OWN STAGE, both unchanged.
+                code=built;
+                producer_stage=report[8];
+            }
+            else {
+                let unit:u64=temp_length[0];
+                if unit==0 || unit>NXO_TEMP_BYTES() { code=E_OUTPUT(); }
+                else if unit>ARENA_BYTES_LIMIT()-at { code=E_OUTPUT(); }
+                else {
+                    // THE UNIT IS COPIED EXACTLY, and its descriptor names it.
+                    let exact:buf<u8>=slice(temp,0,unit);
+                    ntasm_pe.copy(arena,at,exact);
+                    rt_free(runtime(),exact);
+                    ntasm_pe.put64(arena,i*16,at);
+                    ntasm_pe.put64(arena,i*16+8,unit);
+                    at=at+unit;
+                }
+            }
+            i=i+1;
+        }
+    }
+    // THE SOURCES AND THE TEMPORARIES ARE GONE BEFORE THE LINK, and the link
+    // reads the arena and nothing else.
+    rt_free(runtime(),spans);
+    rt_free(runtime(),storage);
+    rt_free(runtime(),temp);
+    rt_free(runtime(),temp_length);
+    if code==0 {
+        stage_id=STAGE_LINK();
+        let converted:ntasm_nxo_pe.ConvertResult=ntasm_nxo_link_pe.link_pe_list(arena,count);
+        // THE CONVERSION RECORD AND ITS BYTES ARE TWO DISTINCT THINGS: the
+        // code is taken, the bytes are the image, and the record is freed
+        // before the image is used.
+        let link_code:u64=converted.code;
+        let image:buf<u8>=converted.bytes;
+        rt_free(runtime(),converted);
+        if link_code!=0 {
+            // THE LINKER'S OWN CODE, unchanged.
+            code=link_code;
+        }
+        else {
+            let size:u64=len(image);
+            if size==0 || size>PE_BYTES_LIMIT() { code=E_OUTPUT(); }
+            else {
+                stage_id=STAGE_DELIVER();
+                pe_bytes=size;
+                // THE OUTPUT IS CREATED EXCLUSIVELY: `rt_open_new` opens with
+                // "wbx", so a pre-existing OUTPUT.EFI is refused by the
+                // runtime and its bytes are left untouched. The image is
+                // written in ONE call and the runtime faults on a short write
+                // instead of returning a short count, so this file never
+                // publishes a truncated image as a success.
+                //
+                // WHAT IS NOT PROMISED HERE IS ATOMICITY. The file is created
+                // before the write, so a write that FAILS can leave a
+                // PARTIAL OUTPUT.EFI on disk. The guarantee that does hold is
+                // the one above it: nothing is opened before the whole
+                // translation has succeeded, so a refusal never touches an
+                // output that was already there.
+                let writer:u64=rt_open_new(runtime(),output_path);
+                let wrote:u64=rt_write(runtime(),writer,image);
+                let closed:u64=rt_close(runtime(),writer);
+                if wrote!=size || closed!=0 { code=E_IO(); }
+            }
+        }
+        rt_free(runtime(),image);
+    }
+    if code!=0 {
+        let refused:buf<u8>="NG_NTASM_NATIVE_DRIVER_REFUSED\r\n";
+        rt_diag(runtime(),refused);rt_free(runtime(),refused);
+        diag_number(code);
+        // THE STAGE THIS PILOT WAS IN, and it is this pilot's own stage: a
+        // number that means something else is never printed under this label.
+        let stage:buf<u8>="NG_NTASM_NATIVE_DRIVER_STAGE\r\n";
+        rt_diag(runtime(),stage);rt_free(runtime(),stage);
+        diag_number(stage_id);
+        // AND THE PRODUCER'S OWN STAGE, when the pipeline is the one that
+        // refused: report[8] is the stage inside the pipeline and it is not
+        // renamed here.
+        if producer_stage!=0 {
+            let inner:buf<u8>="NG_NTASM_NATIVE_DRIVER_PIPELINE_STAGE\r\n";
+            rt_diag(runtime(),inner);rt_free(runtime(),inner);
+            diag_number(producer_stage);
+        }
+    } else {
+        let ok:buf<u8>="NG_NTASM_NATIVE_DRIVER_OK\r\n";
+        rt_diag(runtime(),ok);rt_free(runtime(),ok);
+        let units:buf<u8>="NG_NTASM_NATIVE_DRIVER_UNITS\r\n";
+        rt_diag(runtime(),units);rt_free(runtime(),units);
+        diag_number(count);
+        let pe:buf<u8>="NG_NTASM_NATIVE_DRIVER_PE_BYTES\r\n";
+        rt_diag(runtime(),pe);rt_free(runtime(),pe);
+        diag_number(pe_bytes);
+    }
+    rt_free(runtime(),arena);
+    rt_free(runtime(),report);
+    rt_free(runtime(),output_path);
+    rt_free(runtime(),input_path);
+    return code;
+}

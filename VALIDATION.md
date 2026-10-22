@@ -1,6 +1,6 @@
 # Validation de la réorganisation — 22 octobre 2026
 
-**Copie de revue locale. Aucun commit, push ni livraison B2.1 annoncée.**
+**Snapshot de recherche publié sous MIT. La publication ne constitue pas une livraison B2.1 ni une validation complète du build.**
 
 | Contrôle réellement exécuté | Résultat et portée |
 |---|---|

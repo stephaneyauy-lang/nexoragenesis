@@ -2,7 +2,7 @@
   "project": "Nexora Genesis / NTASM",
   "prepared": "2026-10-22",
   "base_commit": "db3764c99bf2241088b98c11f6c9bd0c9d0ca05e",
-  "status": "local_review_only",
+  "status": "research_snapshot",
   "b21_complete": false,
   "a8_complete": false,
   "a9_complete": false,
@@ -10,12 +10,12 @@
   "source_files_imported": 1332,
   "source_bytes_imported": 14443781,
   "os_uncommitted_changes_imported": false,
-  "pushed": false,
   "license": "MIT",
   "layout": "compiler-by-role",
   "os_location": "examples/os",
   "relocation_c_units_compiled": 17,
   "relocation_pinned_outputs_passed": 8,
   "official_build_accepted": false,
-  "mir_relocation_runtime_validated": false
+  "mir_relocation_runtime_validated": false,
+  "repository": "https://github.com/stephaneyauy-lang/nexoragenesis"
 }

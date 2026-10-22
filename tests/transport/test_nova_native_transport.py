@@ -24,6 +24,7 @@ import inspect
 import io
 import json
 from pathlib import Path
+import re
 import socket
 import sys
 import tempfile
@@ -354,6 +355,69 @@ class AutonomyTests(unittest.TestCase):
         self.assertEqual(nt.DRIVER_REFUSAL_CODES, (970, 803, 1101, 1103))
 
 
+class S0ProducerDependencyTests(unittest.TestCase):
+    """The pinned S0 producers, against the reorganized repository.
+
+    The house build keeps them under bootstrap/; the reorganization archived
+    that directory under legacy/. The transport must find them where the
+    repository publishes them, and must refuse - never skip - when they are
+    absent.
+    """
+
+    REPO = Path(nt.__file__).resolve().parents[1]
+
+    def test_the_documented_directory_is_searched_first(self):
+        self.assertEqual(nt.S0_PRODUCER_DIRS[0], "legacy/ntasm-s0/fixed-point")
+        self.assertIn("bootstrap/ntasm-s0/fixed-point", nt.S0_PRODUCER_DIRS)
+
+    def test_the_pins_are_the_digests_the_repository_publishes(self):
+        readme = self.REPO / "legacy/ntasm-s0/fixed-point/README.md"
+        if not readme.is_file():
+            self.skipTest("the fixed-point documentation is not in this tree")
+        text = readme.read_text(encoding="utf-8", errors="replace")
+        for name, pin in nt.PINS.items():
+            with self.subTest(producer=name):
+                self.assertIn(name, text)
+                self.assertIn(pin, text)
+
+    def test_the_documented_directory_is_accepted_when_it_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "legacy/ntasm-s0/fixed-point").mkdir(parents=True)
+            found = nt.s0_producer_dir(repo)
+            self.assertEqual(found, (repo / "legacy/ntasm-s0/fixed-point").resolve())
+
+    def test_the_house_layout_is_still_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "bootstrap/ntasm-s0/fixed-point").mkdir(parents=True)
+            found = nt.s0_producer_dir(repo)
+            self.assertEqual(found, (repo / "bootstrap/ntasm-s0/fixed-point").resolve())
+
+    def test_a_missing_producer_directory_is_a_refusal_not_a_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            with self.assertRaises(nt.Refusal) as caught:
+                nt.s0_producer_dir(repo)
+            message = str(caught.exception)
+            self.assertIn("missing S0 producer directory", message)
+            # The paths are absolute, and Windows spells them with
+            # backslashes: compare them the same way.
+            message = message.replace("\\", "/")
+            for relative in nt.S0_PRODUCER_DIRS:
+                self.assertIn(relative, message)
+
+    def test_the_transport_names_no_other_producer_path(self):
+        source = Path(nt.__file__).read_text()
+        # Only path-shaped strings are looked at, so a mention in a comment or
+        # in the docstring is not mistaken for a dependency.
+        named = set(re.findall(r"[\"']([\w./-]*fixed-point[\w./-]*)[\"']", source))
+        self.assertTrue(named)
+        for path in named:
+            with self.subTest(path=path):
+                self.assertIn(path, nt.S0_PRODUCER_DIRS)
+
+
 class WorkspaceTests(unittest.TestCase):
     def test_repo_defaults_to_the_parent_of_the_scripts_folder(self):
         self.assertEqual(nt.DEFAULT_REPO, Path(nt.__file__).resolve().parent.parent)
@@ -644,9 +708,11 @@ class FakeProcess:
 class FakeSocket:
     """A scripted HMP socket: a banner, then one answer per command."""
 
-    def __init__(self, answers=None, banner=b"QEMU 8.2.0 monitor\r\n(qemu) "):
+    def __init__(self, answers=None, banner=b"QEMU 8.2.0 monitor\r\n(qemu) ",
+                 write_error=None):
         self.answers = answers or {}
         self.banner = banner
+        self.write_error = write_error or ()
         self.pending = [banner]
         self.sent = []
         self.timeout = None
@@ -658,6 +724,8 @@ class FakeSocket:
     def sendall(self, data):
         self.sent.append(data)
         command = data.decode("ascii", "replace").strip()
+        if command in self.write_error:
+            raise OSError("the monitor refused the command")
         self.pending = list(self.answers.get(command, []))
 
     def recv(self, size):
@@ -677,11 +745,18 @@ class FakeSocket:
 
 
 class FakeMonitor:
-    """The monitor of the mocked QEMU: one new socket per connection."""
+    """The monitor of the mocked QEMU: one new socket per connection.
 
-    def __init__(self, answers=None, refuse=0):
-        self.answers = answers or {}
+    `answers` is either one answer set for every connection, or a list of
+    answer sets used in the order of the connections (the last one repeated).
+    `refuse` refuses the first N connections. `write_error` refuses to write
+    the named commands: the monitor is there, but it never answers.
+    """
+
+    def __init__(self, answers=None, refuse=0, write_error=None):
+        self.answers = answers if answers is not None else {}
         self.refuse = refuse
+        self.write_error = write_error
         self.calls = 0
         self.sockets = []
 
@@ -689,9 +764,14 @@ class FakeMonitor:
         self.calls += 1
         if self.calls <= self.refuse:
             raise ConnectionRefusedError("connection refused")
-        sock = FakeSocket(self.answers)
+        sock = FakeSocket(self.answers_for(self.calls), write_error=self.write_error)
         self.sockets.append(sock)
         return sock
+
+    def answers_for(self, index):
+        if isinstance(self.answers, list):
+            return self.answers[min(index - 1, len(self.answers) - 1)]
+        return self.answers
 
     def commands(self):
         """Every command the transport sent to the monitor."""
@@ -703,19 +783,37 @@ class FakeMonitor:
 
 
 class MockedBoot:
-    """One boot of the transport with no QEMU, no real monitor and no wait."""
+    """One boot of the transport with no QEMU, no real monitor and no wait.
 
-    def __init__(self, serial, answers=None, refuse=0, timeout=10):
+    `serial_at` delays the appearance of the serial log, so the success
+    markers can arrive BETWEEN two scheduled polls.
+    """
+
+    def __init__(self, serial, answers=None, refuse=0, timeout=10,
+                 serial_at=None, write_error=None):
         self.serial = serial
-        self.monitor = FakeMonitor(answers, refuse)
+        self.monitor = FakeMonitor(answers, refuse, write_error)
         self.clock = FakeClock()
         self.process = FakeProcess()
         self.polls = []
         self.timeout = timeout
+        self.serial_at = None if serial_at is None else self.clock.now + serial_at
+        self.written = False
+        self.where = None
+        self.start = self.clock.now
+        self.end = self.start
+
+    def sleep(self, seconds):
+        self.clock.now += max(seconds, self.clock.step)
+        if (self.serial_at is not None and not self.written
+                and self.clock.now >= self.serial_at):
+            self.written = True
+            (self.where / "serial.log").write_text(self.serial, encoding="utf-8")
 
     def run(self):
-        where = Path(tempfile.mkdtemp(prefix="a8-hmp-"))
-        (where / "serial.log").write_text(self.serial, encoding="utf-8")
+        self.where = Path(tempfile.mkdtemp(prefix="a8-hmp-"))
+        if self.serial_at is None:
+            (self.where / "serial.log").write_text(self.serial, encoding="utf-8")
         args = argparse.Namespace(qemu="qemu-system-x86_64", code="code.fd",
                                   vars="vars.fd", timeout=self.timeout)
         real_liveness = nt.hmp_liveness
@@ -732,14 +830,15 @@ class MockedBoot:
              mock.patch.object(nt.socket, "create_connection",
                                side_effect=self.monitor.connect), \
              mock.patch.object(nt.time, "monotonic", self.clock.monotonic), \
-             mock.patch.object(nt.time, "sleep", self.clock.sleep), \
+             mock.patch.object(nt.time, "sleep", self.sleep), \
              mock.patch.object(nt, "hmp_liveness", spy):
             try:
-                nt.boot(where, where / "esp.img", MARKER, args)
+                nt.boot(self.where, self.where / "esp.img", MARKER, args)
             except Exception as exc:
                 error = exc
-        result = json.loads((where / "boot-result.json").read_text())
-        return result, error, where
+            self.end = self.clock.now
+        result = json.loads((self.where / "boot-result.json").read_text())
+        return result, error, self.where
 
 
 def success_serial():
@@ -783,21 +882,44 @@ class HmpStatusTests(unittest.TestCase):
         self.assertTrue(nt.hmp_state_is_fatal("paused", "internal error"))
         self.assertTrue(nt.hmp_state_is_fatal("paused", None))
 
+    def test_a_plain_paused_status_is_a_paused_state(self):
+        # QEMU prints a reason, but a bare `paused` is a paused guest and
+        # never a verified one.
+        self.assertEqual(nt.parse_vm_status("VM status: paused"),
+                         ("paused", None))
+        self.assertTrue(nt.hmp_state_is_fatal(*nt.parse_vm_status(
+            "VM status: paused")))
+        self.assertEqual(nt.hmp_state_text("paused", None), "paused")
+
+    def test_a_truncated_status_is_never_a_verified_state(self):
+        for text in ("VM status: runn", "VM status: paused (shut",
+                     "VM status: running (x)", "VM status:"):
+            with self.subTest(text=text):
+                self.assertIsNone(nt.parse_vm_status(text))
+
     def test_the_state_text_is_the_one_qemu_prints(self):
         self.assertEqual(nt.hmp_state_text("paused", "shutdown"),
                          "paused (shutdown)")
         self.assertEqual(nt.hmp_state_text("running", None), "running")
 
     def test_a_fatal_state_vetoes_the_proof(self):
-        self.assertFalse(nt.liveness_pass({"fatal": True}))
-        self.assertTrue(nt.liveness_pass({"fatal": False}))
-        self.assertTrue(nt.liveness_pass({}))
+        self.assertFalse(nt.liveness_pass({"fatal": True, "confirmed": True}))
+        self.assertFalse(nt.liveness_pass({"fatal": False, "confirmed": False}))
+        self.assertTrue(nt.liveness_pass({"fatal": False, "confirmed": True}))
+
+    def test_an_unconfirmed_success_is_not_a_proof(self):
+        # No fatal state, but no DUE observation either: the markers of the
+        # serial log alone are not a proof.
+        self.assertFalse(nt.liveness_pass({"fatal": False, "confirmed": False}))
+        self.assertFalse(nt.liveness_pass({}))
 
     def test_the_poll_is_read_only_and_never_frequent(self):
         self.assertEqual(nt.HMP_COMMAND, "info status")
         self.assertEqual(nt.HMP_POLL_SECONDS, 5.0)
         self.assertGreater(nt.HMP_QUERY_TIMEOUT, 0)
         self.assertLessEqual(nt.HMP_QUERY_TIMEOUT, nt.HMP_POLL_SECONDS)
+        self.assertEqual(nt.HMP_VERIFIED_STATE, "running")
+        self.assertEqual(nt.HMP_UNKNOWN_STATE, "unknown")
 
 
 class HmpQueryTests(unittest.TestCase):
@@ -865,6 +987,21 @@ class HmpQueryTests(unittest.TestCase):
         self.assertEqual(observation["outcome"], "unavailable")
         self.assertFalse(observation["fatal"])
 
+    def test_an_unreadable_exchange_is_unknown_and_never_running(self):
+        # The monitor answered, but not with a status: the state is UNKNOWN,
+        # and it must never be counted as a verified running guest.
+        for answers, expected in (({"info status": [b"noise\r\n"]}, "malformed"),
+                                  ({"info status": [b"VM status: runn"]},
+                                   "malformed")):
+            with self.subTest(outcome=expected):
+                with mock.patch.object(nt.socket, "create_connection",
+                                       side_effect=FakeMonitor(answers).connect):
+                    observation = nt.hmp_liveness(4711)
+                self.assertEqual(observation["outcome"], expected)
+                self.assertEqual(observation["state"], nt.HMP_UNKNOWN_STATE)
+                self.assertNotEqual(observation["state"], nt.HMP_VERIFIED_STATE)
+                self.assertFalse(observation["fatal"])
+
 
 class BootLivenessTests(unittest.TestCase):
     """The boot loop of the transport, with a mocked QEMU and a mocked
@@ -911,6 +1048,7 @@ class BootLivenessTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(result["pass"])
         self.assertEqual(result["liveness"]["state"], "running")
+        self.assertTrue(result["liveness"]["confirmed"])
         self.assertFalse(result["liveness"]["fatal"])
         self.assertEqual(result["liveness"]["unavailable"], 0)
         self.assertEqual(result["liveness"]["malformed"], 0)
@@ -927,6 +1065,8 @@ class BootLivenessTests(unittest.TestCase):
         self.assertGreaterEqual(result["liveness"]["polled"], 2)
 
     def test_an_unavailable_monitor_is_recorded_and_does_not_fail_a_good_run(self):
+        # The FIRST poll finds no monitor; the next due poll does, and it
+        # confirms the success.
         boot = MockedBoot(
             success_serial(),
             {"info status": [b"VM status: running\r\n(qemu) "]},
@@ -935,16 +1075,134 @@ class BootLivenessTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(result["pass"])
         self.assertEqual(result["liveness"]["unavailable"], 1)
+        self.assertTrue(result["liveness"]["confirmed"])
         self.assertFalse(result["liveness"]["fatal"])
 
-    def test_a_malformed_monitor_is_recorded_and_does_not_fail_a_good_run(self):
+    def test_a_malformed_monitor_is_recorded_and_never_confirms(self):
+        # The monitor never answers with a status: the state stays UNKNOWN,
+        # the success is never confirmed, and the run fails on the deadline.
         boot = MockedBoot(
             success_serial(),
-            {"info status": [b"garbage from the monitor\r\n"]})
+            {"info status": [b"garbage from the monitor\r\n"]},
+            timeout=10)
+        result, error, where = boot.run()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(result["pass"])
+        self.assertGreaterEqual(result["liveness"]["malformed"], 2)
+        self.assertEqual(result["liveness"]["state"], nt.HMP_UNKNOWN_STATE)
+        self.assertNotEqual(result["liveness"]["state"], nt.HMP_VERIFIED_STATE)
+        self.assertFalse(result["liveness"]["confirmed"])
+        # The serial log held a complete proof, and the deadline was kept.
+        self.assertTrue(result["marker_exact_once"])
+        self.assertTrue(result["firmware_return"])
+        self.assertGreaterEqual(boot.end - boot.start, boot.timeout - 1e-6)
+        self.assertIn("never confirmed", result["failure_reason"])
+
+    def test_a_success_between_polls_is_not_accepted_on_a_stale_observation(self):
+        # The markers arrive at t=2, BETWEEN the polls of t=0 and t=5. The
+        # observation of t=0 is stale: it cannot accept the success.
+        boot = MockedBoot(
+            success_serial(),
+            [{"info status": [b"VM status: running\r\n(qemu) "]},
+             {"info status": [b"VM status: running\r\n(qemu) "]}],
+            timeout=30, serial_at=2.0)
         result, error, where = boot.run()
         self.assertIsNone(error)
         self.assertTrue(result["pass"])
+        self.assertTrue(result["liveness"]["confirmed"])
+        # Two polls were needed: the stale one did not accept the markers.
+        self.assertEqual(len(boot.polls), 2)
+        self.assertGreaterEqual(boot.polls[1] - boot.polls[0], 5.0)
+
+    def test_a_shutdown_between_polls_fails_the_proof(self):
+        # The markers arrive at t=2, between the polls. The next DUE poll
+        # finds the guest gone: the proof fails, complete markers or not.
+        boot = MockedBoot(
+            success_serial(),
+            [{"info status": [b"VM status: running\r\n(qemu) "]},
+             {"info status": [b"VM status: paused (shutdown)\r\n(qemu) "]},
+             {"info status": [b"VM status: paused (shutdown)\r\n(qemu) "]}],
+            timeout=30, serial_at=2.0)
+        result, error, where = boot.run()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("paused (shutdown)", str(error))
+        self.assertFalse(result["pass"])
+        self.assertTrue(result["liveness"]["fatal"])
+        self.assertFalse(result["liveness"]["confirmed"])
+        self.assertEqual(result["liveness"]["state"], "paused")
+        self.assertEqual(result["liveness"]["reason"], "shutdown")
+        # The markers were complete: the veto alone failed the run.
+        self.assertTrue(result["marker_exact_once"])
+        self.assertTrue(result["firmware_return"])
+
+    def test_a_success_with_an_unavailable_monitor_is_never_accepted(self):
+        # The monitor never answers. The markers are complete, but the guest
+        # state was never verified: the proof is not a proof.
+        boot = MockedBoot(
+            success_serial(),
+            {"info status": [b"VM status: running\r\n(qemu) "]},
+            timeout=10, write_error=("info status",))
+        result, error, where = boot.run()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(result["pass"])
+        self.assertFalse(result["liveness"]["confirmed"])
+        self.assertFalse(result["liveness"]["fatal"])
+        self.assertEqual(result["liveness"]["state"], nt.HMP_UNKNOWN_STATE)
+        self.assertNotEqual(result["liveness"]["state"], nt.HMP_VERIFIED_STATE)
+        self.assertGreaterEqual(result["liveness"]["unavailable"], 2)
+        # Every other fact of the run is good: the liveness is the only
+        # reason it failed, and the cleanup was the normal one.
+        self.assertTrue(result["marker_exact_once"])
+        self.assertTrue(result["firmware_return"])
+        self.assertEqual(result["shutdown"], "hmp")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["forced"])
+        self.assertIn("never confirmed", result["failure_reason"])
+        # The deadline was kept, and the diagnostics are preserved.
+        self.assertGreaterEqual(boot.end - boot.start, boot.timeout - 1e-6)
+        self.assertTrue((where / "hmp-liveness.log").exists())
+
+    def test_a_plain_paused_status_fails_the_proof(self):
+        boot = MockedBoot(
+            success_serial(),
+            {"info status": [b"VM status: paused\r\n(qemu) "]})
+        result, error, where = boot.run()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("paused", str(error))
+        self.assertFalse(result["pass"])
+        self.assertTrue(result["liveness"]["fatal"])
+        self.assertEqual(result["liveness"]["state"], "paused")
+        self.assertEqual(result["liveness"]["reason"], "")
+
+    def test_a_truncated_status_is_unknown_and_the_next_poll_recovers(self):
+        # The first answer is cut in the middle: it is UNKNOWN, never a
+        # verified running guest. The next due poll answers properly.
+        boot = MockedBoot(
+            success_serial(),
+            [{"info status": [b"VM status: runn"]},
+             {"info status": [b"VM status: running\r\n(qemu) "]}],
+            timeout=30, serial_at=2.0)
+        result, error, where = boot.run()
+        self.assertIsNone(error)
+        self.assertTrue(result["pass"])
+        self.assertTrue(result["liveness"]["confirmed"])
         self.assertEqual(result["liveness"]["malformed"], 1)
+        self.assertEqual(result["liveness"]["state"], "running")
+
+    def test_a_later_malformed_answer_does_not_keep_the_running_state(self):
+        # The first poll says running, the next one is unreadable: the state
+        # must become UNKNOWN, not stay the stale `running`.
+        boot = MockedBoot(start(),
+                          [{"info status": [b"VM status: running\r\n(qemu) "]},
+                           {"info status": [b"garbage\r\n"]},
+                           {"info status": [b"garbage\r\n"]}],
+                          timeout=30)
+        result, error, where = boot.run()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["liveness"]["state"], nt.HMP_UNKNOWN_STATE)
+        self.assertNotEqual(result["liveness"]["state"], nt.HMP_VERIFIED_STATE)
+        self.assertGreaterEqual(result["liveness"]["malformed"], 1)
         self.assertFalse(result["liveness"]["fatal"])
 
     def test_the_poll_is_never_more_often_than_every_five_seconds(self):

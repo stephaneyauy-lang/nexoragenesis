@@ -21,9 +21,13 @@ canonical scripts, the pinned bootstrap and the house sources.
                          error)`) fails the run at once, with the HMP
                          transcript kept and a clear reason, instead of
                          waiting for the timeout. The poll never resumes a
-                         guest it did not pause. EXPERIMENTAL transport work
-                         toward A8: it is NOT an A8 completion, and it is NOT
-                         part of the normal build yet.
+                         guest it did not pause. The success markers are
+                         accepted only by a DUE observation, taken at or
+                         after them, that reports a running guest: a stale,
+                         unknown or unavailable state never accepts them.
+                         EXPERIMENTAL transport work toward A8: it is NOT an
+                         A8 completion, and it is NOT part of the normal
+                         build yet.
   a 512 MiB guest        QEMU runs the guest with 512M of RAM and 4 vCPUs; the
                          values are the named QEMU_MEMORY and QEMU_CPUS of this
                          script
@@ -60,6 +64,16 @@ PINS = {
     "compiler-core.NTASM1.EFI": "a02425be642b839586593b6b5468bc13f4f85d29a503987aa972e4750d1d428f",
 }
 DRIVER_REFUSAL_CODES = (970, 803, 1101, 1103)
+
+# Where the pinned S0 producers live. The house build keeps them under
+# bootstrap/; the reorganized repository archived that directory under
+# legacy/ (legacy/ntasm-s0/fixed-point/README.md publishes the two digests
+# above, and REPLAY.md points at legacy/ntasm-s0/fixed-point). The transport
+# takes the directory that EXISTS and the PINS decide whether the bytes it
+# found there are the ones it must use. A missing directory is a refusal,
+# never a silent skip.
+S0_PRODUCER_DIRS = ("legacy/ntasm-s0/fixed-point",
+                    "bootstrap/ntasm-s0/fixed-point")
 
 TERMINAL_PATTERN = (
     r"(?m)^(NG_NV2_NATIVE_(?:TEST_OK|RUN_OK|BAD)|NG_NTASM_NATIVE_SCAN_OK|"
@@ -399,6 +413,21 @@ def digest(p):
     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
 
+def s0_producer_dir(repo):
+    """The directory of the pinned S0 producers.
+
+    The first of S0_PRODUCER_DIRS that exists wins. When none exists, the
+    run is REFUSED: the transport never continues without the producers it
+    pinned, and it never falls back to an unpinned copy.
+    """
+    for relative in S0_PRODUCER_DIRS:
+        candidate = repo / relative
+        if candidate.is_dir():
+            return candidate
+    raise Refusal("missing S0 producer directory: none of " +
+                  ", ".join(str(repo / r) for r in S0_PRODUCER_DIRS))
+
+
 def run(args, where, label):
     with (where / (label + ".command.json")).open("x") as f:
         json.dump([str(x) for x in args], f)
@@ -483,6 +512,14 @@ HMP_MAX_READS = 32
 # has not started yet: it is NOT a failure, and it is never resumed either.
 HMP_BENIGN_REASONS = ("prelaunch",)
 
+# The ONE state that certifies a live guest. A pause is never a verified
+# guest, whatever its reason, and an unknown state is not a state at all.
+HMP_VERIFIED_STATE = "running"
+
+# The state of a guest nobody could read. It is deliberately NOT `running`:
+# an unknown state must never be counted as a verified one.
+HMP_UNKNOWN_STATE = "unknown"
+
 # The ANSI escape sequences of the HMP prompt and of the echoes.
 ANSI_RE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])")
 
@@ -502,6 +539,9 @@ def parse_vm_status(text):
     The state is `running` or `paused`, and the reason is what QEMU puts in
     parentheses (`shutdown`, `internal error`, `prelaunch`...). None when the
     transcript carries no parsable status at all.
+
+    A truncated answer is NEVER a verified state: `VM status: runn` and
+    `VM status: paused (shut` are unknown, not `running` and not `paused`.
     """
     if not text:
         return None
@@ -511,6 +551,9 @@ def parse_vm_status(text):
     value = match.group(1).strip().lower()
     if value == "running":
         return ("running", None)
+    if value == "paused":
+        # A plain `paused`, without a reason: the guest is not running.
+        return ("paused", None)
     if value.startswith("paused") and value.endswith(")") and "(" in value:
         reason = value[value.index("(") + 1:-1].strip()
         return ("paused", reason or None)
@@ -603,10 +646,14 @@ def hmp_liveness(port, command=HMP_COMMAND):
     The observation says how the exchange went (`ok`, `malformed` or
     `unavailable`), what state the VM was in, the transcript to keep as a
     diagnostic, and whether that state is fatal.
+
+    A malformed or unavailable exchange leaves the state at `unknown`: an
+    unreadable monitor is NOT a running guest, and it must never be counted
+    as one.
     """
     transcript, error = hmp_query(port, command=command)
-    observation = dict(outcome="", state="", reason="", error=error or "",
-                       transcript=transcript, fatal=False)
+    observation = dict(outcome="", state=HMP_UNKNOWN_STATE, reason="",
+                       error=error or "", transcript=transcript, fatal=False)
     parsed = parse_vm_status(transcript)
     if parsed is not None:
         state, reason = parsed
@@ -622,12 +669,16 @@ def hmp_liveness(port, command=HMP_COMMAND):
 
 
 def liveness_pass(liveness):
-    """A guest that is gone fails the run, whatever the serial log says.
+    """The liveness guard of the proof. Both rules are fail-closed.
 
-    This is the veto: the success markers of the serial log cannot make the
-    proof true when the VM is not running any more.
+    1. A guest that is gone fails the run, whatever the serial log says.
+    2. A success that no DUE observation confirmed is NOT a proof: the guest
+       state was stale, unknown or unavailable, and the markers of the serial
+       log cannot stand in for a verified running guest.
     """
-    return not liveness.get("fatal")
+    if liveness.get("fatal"):
+        return False
+    return bool(liveness.get("confirmed"))
 
 
 def append_liveness_log(where, index, transcript):
@@ -650,6 +701,11 @@ def boot(where, image, marker, args, expect_bad=False, marker_checks=None,
     (internal error)` - fails the run at once, with the HMP transcript kept
     and a clear reason, instead of waiting for the timeout. The poll is READ
     ONLY: it never resumes the guest.
+
+    The success markers are NOT enough on their own: they are accepted only
+    when a DUE observation, taken at or after them, reports a running guest.
+    A stale, unknown or unavailable state never accepts them, and the wait
+    for the next due observation is bounded by the same deadline.
     """
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -670,7 +726,8 @@ def boot(where, image, marker, args, expect_bad=False, marker_checks=None,
     ram = dict(start_free=require_ram_start(), last_free=None, polled=0,
                tripped=False, measurement_failed=False, reason="")
     liveness = dict(polled=0, unavailable=0, malformed=0, fatal=False,
-                    state="", reason="", detail="", transcript="")
+                    state=HMP_UNKNOWN_STATE, reason="", outcome="not-polled",
+                    detail="", transcript="", confirmed=False)
     (where / "qemu.command.json").write_text(json.dumps(command, indent=2))
     ready = False
     firmware_evidence = ""
@@ -685,6 +742,7 @@ def boot(where, image, marker, args, expect_bad=False, marker_checks=None,
             deadline = time.monotonic() + args.timeout
             next_ram = time.monotonic()
             next_hmp = time.monotonic()
+            success_pending = False
             while time.monotonic() < deadline and p.poll() is None:
                 now = time.monotonic()
                 if now >= next_ram:
@@ -703,18 +761,16 @@ def boot(where, image, marker, args, expect_bad=False, marker_checks=None,
                                          "threshold %d bytes" % (free, RAM_STOP_MAX))
                         break
                 # The serial evidence of this instant. It is read BEFORE the
-                # liveness poll, so a guest that dies in the very instant it
-                # proved itself still fails the run its own serial log would
-                # have proved.
-                success = False
-                if serial_path.exists():
+                # liveness poll, so an observation of the same instant is
+                # never stale with respect to it.
+                if not success_pending and serial_path.exists():
                     serial = serial_path.read_text(errors="replace")
                     terminal = re.search(TERMINAL_PATTERN, serial)
                     if terminal:
                         firmware_evidence = firmware_return(serial, terminal.end()) or ""
                         if firmware_evidence:
                             ready = True
-                            success = True
+                            success_pending = True
                 # The liveness poll, when it is due. It is bounded, read only,
                 # and it never resumes a guest it did not pause.
                 if now >= next_hmp:
@@ -725,13 +781,20 @@ def boot(where, image, marker, args, expect_bad=False, marker_checks=None,
                         liveness["transcript"] = observation["transcript"]
                         append_liveness_log(where, liveness["polled"],
                                              observation["transcript"])
+                    liveness["outcome"] = observation["outcome"]
                     if observation["outcome"] == "ok":
                         liveness["state"] = observation["state"]
                         liveness["reason"] = observation["reason"]
                     elif observation["outcome"] == "malformed":
                         liveness["malformed"] += 1
+                        # An unreadable answer leaves the state UNKNOWN: it is
+                        # not a running guest, and it must not be counted as one.
+                        liveness["state"] = HMP_UNKNOWN_STATE
+                        liveness["reason"] = ""
                     else:
                         liveness["unavailable"] += 1
+                        liveness["state"] = HMP_UNKNOWN_STATE
+                        liveness["reason"] = ""
                     if observation["fatal"]:
                         liveness["fatal"] = True
                         liveness["detail"] = (
@@ -739,8 +802,15 @@ def boot(where, image, marker, args, expect_bad=False, marker_checks=None,
                             hmp_state_text(observation["state"],
                                            observation["reason"]))
                         break
-                if success:
-                    break
+                    if (success_pending and observation["outcome"] == "ok"
+                            and observation["state"] == HMP_VERIFIED_STATE):
+                        # A DUE observation, taken at or after the success
+                        # markers: the guest was seen running, the proof is
+                        # accepted. A stale, unknown or unavailable state
+                        # never accepts it, and the next observation is not
+                        # made sooner than the five seconds of the bound.
+                        liveness["confirmed"] = True
+                        break
                 time.sleep(.1)
         finally:
             if p is not None and p.poll() is None:
@@ -786,6 +856,12 @@ def boot(where, image, marker, args, expect_bad=False, marker_checks=None,
         result["failure_reason"] = (
             liveness["detail"] + "; the guest VM is gone and the serial log "
             "cannot make the proof true")
+    elif ready and not liveness["confirmed"]:
+        result["failure_reason"] = (
+            "the success markers were never confirmed by a due liveness "
+            "observation; the last guest state was " +
+            hmp_state_text(liveness["state"], liveness["reason"]) +
+            " (last exchange: " + (liveness["outcome"] or "none") + ")")
     else:
         result["failure_reason"] = "the boot did not satisfy the proof"
     (where / "boot-result.json").write_text(json.dumps(result, indent=2))
@@ -1004,6 +1080,7 @@ def record_workspace(where, args, repo, work_root):
         hmp_poll_seconds=HMP_POLL_SECONDS, hmp_command=HMP_COMMAND,
         hmp_read_only=True, hmp_max_query_seconds=HMP_QUERY_TIMEOUT,
         hmp_resumes_guest=False,
+        s0_producer_dirs=list(S0_PRODUCER_DIRS),
         serialization="the builder holds the lock; this transport takes none",
     ), indent=2))
 
@@ -1014,7 +1091,7 @@ def record_workspace(where, args, repo, work_root):
 
 def run_assemble(args, repo, where):
     """Assemble one source with the S0 producer, on QEMU. Nothing is translated."""
-    s0 = repo / "bootstrap/ntasm-s0/fixed-point"
+    s0 = s0_producer_dir(repo)
     material = args.source.read_bytes()
     if args.test_entry:
         if material.count(b"entry h_start\n") != 1:
@@ -1036,6 +1113,7 @@ def run_assemble(args, repo, where):
         source=str(args.source.resolve()), source_sha256=digest(source),
         output=str(output), bytes=output.stat().st_size,
         sha256=digest(output), producer=PINS,
+        s0_producer_dir=str(s0),
         scope="S0-native-assembly-only"), indent=2))
     return ram
 
@@ -1211,7 +1289,7 @@ def preflight(args, repo):
     if args.mode == "assemble":
         if not args.source.is_file():
             raise Refusal("missing source: " + str(args.source))
-        s0 = repo / "bootstrap/ntasm-s0/fixed-point"
+        s0 = s0_producer_dir(repo)
         for name, pin in PINS.items():
             producer = s0 / name
             if not producer.is_file():

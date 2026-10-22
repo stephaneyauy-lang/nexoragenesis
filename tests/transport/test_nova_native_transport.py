@@ -683,16 +683,18 @@ class ForeignQemuTests(unittest.TestCase):
 class BootShapeTests(unittest.TestCase):
     def test_qemu_is_always_512m_four_cpu_headless_without_network(self):
         # The guest memory is ONE named value: the argv and the contract
-        # record must carry exactly "512M", never a literal of their own.
+        # record must carry the EFFECTIVE value, and the default of that
+        # value is the contract one, 512M. A run that asks for another guest
+        # is a diagnostic, and its evidence says so.
         self.assertEqual(nt.QEMU_MEMORY, "512M")
-        self.assertEqual(nt.QEMU_CPUS, 4)
         source = inspect.getsource(nt.boot)
-        for token in ('"-m", QEMU_MEMORY', '"-smp", str(QEMU_CPUS)', '"-nic", "none"',
+        for token in ('"-m", guest_memory', '"-smp", str(QEMU_CPUS)', '"-nic", "none"',
                       '"-display", "none"', '"-monitor"'):
             with self.subTest(token=token):
                 self.assertIn(token, source)
-        self.assertIn("qemu_memory=QEMU_MEMORY",
+        self.assertIn("qemu_memory=getattr(args, \"guest_memory\", None)",
                       inspect.getsource(nt.record_workspace))
+        self.assertIn("qemu_memory_is_contract", inspect.getsource(nt.write_transport_result))
 
     def test_the_cleanup_quits_through_hmp_and_touches_only_its_own_pid(self):
         source = inspect.getsource(nt.boot)
@@ -1517,6 +1519,43 @@ class PinDiscrepancyTests(unittest.TestCase):
                           "os.remove", "unlink", "subprocess.run([\"git\", \"-C\", str(ROOT), \"push\""):
             with self.subTest(token=forbidden):
                 self.assertNotIn(forbidden, source)
+
+
+class GuestMemoryOptionTests(unittest.TestCase):
+    """The memory of the guest.
+
+    The contract value is 512M and it is the default. A diagnostic run may
+    use another one, and the evidence must then say which guest it had.
+    """
+
+    def test_the_contract_value_is_the_default(self):
+        args = nt.build_parser().parse_args(
+            ["--name", "probe", "assemble", "SOURCE"])
+        self.assertEqual(args.guest_memory, nt.QEMU_MEMORY)
+        self.assertEqual(nt.QEMU_MEMORY, "512M")
+
+    def test_the_option_is_accepted_and_recorded(self):
+        args = nt.build_parser().parse_args(
+            ["--name", "probe", "--guest-memory", "1536M", "assemble", "SOURCE"])
+        self.assertEqual(args.guest_memory, "1536M")
+        self.assertEqual(nt.check_guest_memory(args.guest_memory), "1536M")
+
+    def test_a_malformed_guest_memory_is_refused(self):
+        # A unit-less value is fine: QEMU reads it as mebibytes.
+        self.assertEqual(nt.check_guest_memory("512"), "512")
+        for bad in ("", "512MB", "512 m", "many", "512Mx", "-512M", "512 M"):
+            with self.subTest(value=bad):
+                with self.assertRaises(nt.Refusal):
+                    nt.check_guest_memory(bad)
+
+    def test_the_guest_memory_reaches_the_qemu_argv(self):
+        source = inspect.getsource(nt.boot)
+        self.assertIn('"-m", guest_memory', source)
+        self.assertNotIn('"-m", QEMU_MEMORY', source)
+
+    def test_the_contract_record_carries_the_guest_memory(self):
+        source = inspect.getsource(nt.record_workspace)
+        self.assertIn("qemu_memory=getattr(args, \"guest_memory\", None)", source)
 
 
 if __name__ == "__main__":

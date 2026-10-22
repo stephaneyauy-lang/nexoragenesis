@@ -143,6 +143,39 @@ parses it.
 guest, not the reason it stopped. The bisection that would settle it is
 `a8-trial05-bisection.md`.
 
+## The bisection, run A and run B: the zeroing is REFUTED
+
+The bisection (`a8-trial05-bisection.md`) isolates one variable per run. Two
+runs are done, with the same host, the same seed, the same payload and the
+same 512 MiB guest:
+
+| run | runtime | batches | stopped in | the liveness poll saw |
+|---|---|---|---|---|
+| **A** | the word-wise zeroing, `413b7816` | 16 | LOWER | `paused (shutdown)` |
+| **B** | the runtime BEFORE the zeroing, `17fd29cd` | 16 | LOWER | `paused (shutdown)` |
+
+Run B is the byte-wise runtime of the campaign itself
+(`runtime-native/asm-runtime-01/source.ntasm`, sha256 `486ce6f1…`, the image
+`asm-runtime-02` produced). **The guest stops at the same batch, in the same
+phase, with the same VM state, whatever the runtime.**
+
+**So the word-wise pool zeroing is REFUTED as the cause of the trial 05
+shutdown.** It was the only code change between the run that kept going and
+the run that stopped, and reverting it changes nothing.
+
+What the bisection leaves open:
+
+- **The memory of the guest.** A shadow run with a 1536 MiB guest (three
+  times the contract) is running; the transport now takes
+  `--guest-memory` for exactly this, the contract value stays the default
+  and a non-contract guest is flagged in the evidence
+  (`qemu_memory_is_contract`).
+- **The content of batch 16.** The stop is at the LOWER phase of the
+  seventeenth batch, every time. What that batch contains is the next
+  thing to look at.
+- **Whatever the guest does when it powers itself off.** The VM state is
+  measured, the reason is not.
+
 ## What the evidence refutes
 
 **The firmware watchdog is not the cause of the trial-05 stop.** The host of

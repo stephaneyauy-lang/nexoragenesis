@@ -89,7 +89,14 @@ def parse_serial(text):
 
 
 def run_start(directory):
-    """The start of a run, from the name of its directory, or None."""
+    """The start of a run, or None.
+
+    The precise anchor is the moment QEMU was actually started, which the
+    command file records; the name of the run directory is the fallback.
+    """
+    command = Path(directory) / "qemu.command.json"
+    if command.is_file():
+        return datetime.fromtimestamp(command.stat().st_mtime, timezone.utc)
     found = RUN_NAME.match(directory.parent.name)
     if not found:
         return None

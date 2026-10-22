@@ -67,16 +67,16 @@ The transport facts of the same run (`boot-result.json`,
 `"pass": false`.
 
 **When the guest stopped:** the last write of its serial log is at
-**2074 s** after the start of the run (the run directory name carries the
-start stamp `20261021T170311Z`; the mtime of `serial.log` is its last
-write, and reading a file does not change its mtime). The transport then
-waited for its whole budget: 2135 RAM polls at 5 s, that is **10675 s**. So
-**about 8601 s, two hours and twenty-three minutes, were spent waiting for a
-guest that was already gone.** That is the measured "the parent waited until
-timeout and the UI showed waiting".
+**t+2062 s** after QEMU started (the anchor is the mtime of
+`qemu.command.json`, the moment the guest was actually launched; the mtime
+of `serial.log` is its last write, and reading a file does not change it).
+The transport then waited for its whole budget: 2135 RAM polls at 5 s, that
+is **10675 s**. So **about 8613 s, two hours and twenty-three minutes, were
+spent waiting for a guest that was already gone.** That is the measured
+"the parent waited until timeout and the UI showed waiting".
 
-The guest was not slowing down before it stopped: sixteen batches in 2074 s
-is 130 s per batch, against 98 s per batch in the run before it and 186 s
+The guest was not slowing down before it stopped: sixteen batches in 2062 s
+is 129 s per batch, against 98 s per batch in the run before it and 186 s
 per batch in the run of 14:37. It stopped hard, in the middle of a batch.
 
 ## The five producer runs of that day
@@ -90,7 +90,7 @@ compiling the same `NOVA.IN` and the same P2 compiler:
 | 14:14:50Z | 13 | LOWER | 983 s | 960 s | -23 s | `9b3509ec` | `17fd29cd` |
 | 14:37:38Z | 19 | OBJECT | 3527 s | 3565 s | 38 s | `9b3509ec` | `17fd29cd` |
 | 16:22:08Z | 15 | LOWER | 1470 s | no record | - | `9b3509ec` | `413b7816` |
-| 17:03:11Z | 16 | LOWER | 2074 s | 10675 s | **8601 s** | `9b3509ec` | `413b7816` |
+| 17:03:11Z | 16 | LOWER | 2062 s | 10675 s | **8613 s** | `9b3509ec` | `413b7816` |
 
 Read with care, the five runs are not five instances of the same thing. The
 run of 14:37 was **still working** when its own deadline arrived (38 s of
@@ -129,8 +129,11 @@ Three things the archive did not hold:
    (shutdown)`, with the HMP transcript kept. The archive only had the
    house build's own note that a paused VM had to be closed by hand.
 3. **The transport saw the dead guest in at most five seconds**, against the
-   8601 s of dead waiting the archived run records. The liveness poll is
-   proven on a real failure, not only on the deliberate watchdog case.
+   8613 s of dead waiting the archived run records. The liveness poll is
+   proven on a real failure, not only on the deliberate watchdog case: the
+   same step, reproduced here, spent **3.2 s** of dead time instead of
+   8613 s — 2693 times less, because the poll that saw `paused (shutdown)`
+   ended the run there.
 
 The real transcript of that poll is kept as
 `tests/transport/fixtures/hmp-live-paused-shutdown.txt`, and the suite

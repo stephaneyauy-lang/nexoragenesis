@@ -1,0 +1,457 @@
+{
+  "schema": "NEXORA_NOVA_BOOTSTRAP_V1",
+  "nova_compiler": {
+    "path": "nova-compiler.EFI",
+    "sha256": "6ab3b02dac3d5c833d1a19e3ef54fcd6fb804779a907f6dbf7e1bc4b9aba7891"
+  },
+  "compiler_sources": [
+    {
+      "path": "compiler/nova/drivers/nova_native_driver_many.nova",
+      "sha256": "83260f51b59acb5ee06415aa306e9a8405c08a7f530c7b90448eb57f41f60784"
+    },
+    {
+      "path": "compiler/nova/frontend/nova_language_parse.nova",
+      "sha256": "8e4d76f69d4376a5e1ab9011adadfe61853878bf32064faee86abb7078bdcc86"
+    },
+    {
+      "path": "compiler/nova/backend/nova/nova_machine_batches.nova",
+      "sha256": "74943ca06fa4d49bb21b51dd99e7c23796b9073c17918d00f37b7e9a9876cbb9"
+    },
+    {
+      "path": "compiler/nova/formats/nxo/nxo_link_pe.nova",
+      "sha256": "efb1c95653320c825b1133d269558a9117d7f56ae1cf4b4e245489a9bb2b85d9"
+    },
+    {
+      "path": "compiler/nova/formats/nxo/nxo_pe.nova",
+      "sha256": "a0502c3936cdf46650da5f9e014b1e5171d13c59e7e715ded0ceced289c7d823"
+    },
+    {
+      "path": "compiler/nova/formats/pe/pe.nova",
+      "sha256": "c6ecf903cb7483ec0fc9fd2239543093144e3277601ff61ac575f4d6ffa6a564"
+    },
+    {
+      "path": "compiler/nova/backend/nova/nova_machine_many.nova",
+      "sha256": "345be4fa911e3658fc7447549a9952f63e3da1ea82f9f7bef22ec3013a9d3f02"
+    },
+    {
+      "path": "compiler/nova/ir/machine_pipeline.nova",
+      "sha256": "10dbf74895f9925f17b6c8a88302fee3726634face6569e0030feb507fb95ac8"
+    },
+    {
+      "path": "compiler/nova/formats/nxo/nxo_merge.nova",
+      "sha256": "cdc3b1fd056a4108f4dce2dea6ad91ab2ea1c2292316d2677dafbc20f74cf4e3"
+    },
+    {
+      "path": "compiler/nova/formats/nxo/nxo.nova",
+      "sha256": "b8fc39b90211ba033cd81265b5bbae2a70fe4e01b30cd4aa5c6e04e1d45aa0a3"
+    },
+    {
+      "path": "compiler/nova/backend/nova/nova_machine_lower.nova",
+      "sha256": "cae6204e073bdf18c4457c1ceb431a6f98bec355a57d623c87c27ca18096b600"
+    },
+    {
+      "path": "compiler/nova/frontend/ast.nova",
+      "sha256": "05347e8dfcc094ce98c0d7c206201288a69fca9281c4d5a21a6ce726caa86dc7"
+    },
+    {
+      "path": "compiler/nova/frontend/parser.nova",
+      "sha256": "dcf4c18484969a6082e2e10a3cf955210b173bbc4290ba827e9d7b13ef59c9ce"
+    },
+    {
+      "path": "compiler/nova/formats/ntir/ntir.nova",
+      "sha256": "c0ae0f3f7d060ccf945c6b2c28db8653c3528aeb64b178977fc711a764de3546"
+    },
+    {
+      "path": "compiler/nova/ir/machine_ir.nova",
+      "sha256": "5b18b8583b04426bde111d5c4dff69f5700e4faecebd97c47d1c7dda44e8a7ad"
+    },
+    {
+      "path": "compiler/nova/backend/nova/machine_emit.nova",
+      "sha256": "b81ffde88517ad70be4b0e4b2da90c74da18e89063eccf3c3fb40db656cc6d77"
+    },
+    {
+      "path": "compiler/nova/macros/macro_splice.nova",
+      "sha256": "19e7186768cd64ae48a4d506ad4c2b6cd36a5c39909ac58fa8cd23d7dc2910b1"
+    },
+    {
+      "path": "compiler/nova/analysis/validate.nova",
+      "sha256": "ca01ea5284b80fdeef8b547a2c5397d3bd61b20d0b5db787a950cd2102656ebb"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/abi.nova",
+      "sha256": "0e9e6a5d1e5c05990a4264b208376eb4f8781bb88a786fdfdaf9a9a9230ecba6"
+    },
+    {
+      "path": "compiler/nova/frontend/stub_table.nova",
+      "sha256": "e8312bc6286330ac6fcf68c839cff494f8e92cca984f9268bf14f9c07fe72be0"
+    },
+    {
+      "path": "compiler/nova/frontend/lexer.nova",
+      "sha256": "d369a19bb548441e411c1bdffc1a036977b6848d37e025eabc02011ddc890e8c"
+    },
+    {
+      "path": "compiler/nova/analysis/types/register_widths.nova",
+      "sha256": "25773b170e1aae9a358ad889373d812047b4dd58a73b5df76951275f2e53a5de"
+    },
+    {
+      "path": "compiler/nova/backend/x64/x64_fixed.nova",
+      "sha256": "0d5e255f07ae9561d751f2fad0ebc7972e997ff51fadf8ddfa03dd1b05d4d769"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/effects.nova",
+      "sha256": "ed3f1077210d0518cf5e10f41697338e2da4c06c372736b266ee5011c8e02fdd"
+    },
+    {
+      "path": "compiler/nova/macros/macro_expand.nova",
+      "sha256": "2c31a5bd70ec6cfd965444a8af1d800160c75eca3afcc897c8741e88c8447639"
+    },
+    {
+      "path": "compiler/nova/analysis/semantics.nova",
+      "sha256": "f35ebbc1852130da7f41dad345ccef1458054fce9ab79acab1d5628fae54757d"
+    },
+    {
+      "path": "compiler/nova/frontend/targets.nova",
+      "sha256": "1685d88067092d9e564bdf87aac0d6704088c69c50dfcdbcd1375781e3389288"
+    },
+    {
+      "path": "compiler/nova/frontend/versions.nova",
+      "sha256": "3554e7683170196c9b6ba8b0c787770e7d7e5845aa8cd16a039186e6ac61d74f"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/features.nova",
+      "sha256": "613ff510658f583536334ba69b87380dbbef70db5695bd7e2abaf762aab5e220"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/callable_names.nova",
+      "sha256": "4af3d0716c800b04d5bd8220b8f66e4549d7bdd04253519938bec692f5ec6a55"
+    },
+    {
+      "path": "compiler/nova/frontend/symbol_names.nova",
+      "sha256": "e572632470754fb9019913f91a797b5631f94f7a1241386590a347d2c8103133"
+    },
+    {
+      "path": "compiler/nova/analysis/types/types.nova",
+      "sha256": "2ca4a487f6a6517141ecd1d19ed85fed1de936294ffbcc454bef57f20af44856"
+    },
+    {
+      "path": "compiler/nova/analysis/types/constant_types.nova",
+      "sha256": "632d98207f871f5cb0f50fdf60483a635a82d224593cb5ac7311f51d3f8c3227"
+    },
+    {
+      "path": "compiler/nova/analysis/types/literal_initializers.nova",
+      "sha256": "8c8fd9bcdc4667aa10586ecb0592556ac0749ea2c14037c58d9bc0a665afed26"
+    },
+    {
+      "path": "compiler/nova/analysis/types/condition_types.nova",
+      "sha256": "d2434f53b56e7f4ba295c97d3f7b19398c52c53cb306e1000285b19713055159"
+    },
+    {
+      "path": "compiler/nova/frontend/parameters.nova",
+      "sha256": "617e87f324a533c247211f0f1d1a3e0dff7de19d7ec9e88434d07faabc07aebe"
+    },
+    {
+      "path": "compiler/nova/frontend/locals.nova",
+      "sha256": "02b7fc8dcdb82bc710afccce65d704d98b07fa6c1137a11341d0faf25841cefc"
+    },
+    {
+      "path": "compiler/nova/frontend/bindings.nova",
+      "sha256": "e9028e4f8f93cb91e628a92f8cc11388ae72e5145240f191fba5c013dbb8e456"
+    },
+    {
+      "path": "compiler/nova/frontend/register_bindings.nova",
+      "sha256": "fd3e8f3584e109fb223f6b2e4a1087fd83c05ba2ea1a97c5cdc2ab6cf768888a"
+    },
+    {
+      "path": "compiler/nova/analysis/types/pointer_spaces.nova",
+      "sha256": "2d5c3afb78dbaea05c9b268c6c7711dc6f2291cdde8fc72840ee2303a113fdb3"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/body_effects.nova",
+      "sha256": "7da06bc423ba44de5b642a30f61753a02c887931f5b7e361a259eb0b52ed91b7"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/body_intrinsics.nova",
+      "sha256": "9b28a7163f6903ac1edb3e48a1d644dfb0f202bca4e775914eb8a457de010223"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/body_clobbers.nova",
+      "sha256": "2a266abff9e988e6e4f5c03c47784d45435c9c806749b7656f964194827ba2c8"
+    },
+    {
+      "path": "compiler/nova/analysis/control_flow.nova",
+      "sha256": "fde54135b7f5f59a648478c0a6f3f4135a83c93b0094ac2993ea03ef5da19397"
+    },
+    {
+      "path": "compiler/nova/analysis/types/return_types.nova",
+      "sha256": "72529e81482cca72b7c2158765bbaa435095753c20d72d96a432269a577bc9e3"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/contracts.nova",
+      "sha256": "25b86d6434f695ec40a817db130f7d2f2b26f5fde3035c020074d55485456622"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/feature_requirements.nova",
+      "sha256": "c8126cc99229f0765617f33db4de7544fd146b6ce3b9051c53873e5befdd3fe2"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/clobbers.nova",
+      "sha256": "c6da57f027b9420b3d0481e3f04fd50aa73132860752b92b43999a1f0d1f0db3"
+    },
+    {
+      "path": "compiler/nova/frontend/refs.nova",
+      "sha256": "f6416af0914d2fec441ff544389218efdc9fba6ecc2e84bb2cd4804bdb105e87"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/calls.nova",
+      "sha256": "30e3a2d056d0b3a95043ec4ff5ed191bd4a1cf9bec88f33a749e43b3fad26f88"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/call_types.nova",
+      "sha256": "d6ca0d4e6a1470afc4b9702b6b5d133bac929d76010b6ebc73471b0684ccbb4c"
+    },
+    {
+      "path": "compiler/nova/analysis/types/initializer_types.nova",
+      "sha256": "d94cbaf6bede47970bf63cc739a3dfe895cd368f5f46f1c33385b1f9c62a33f7"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/call_effects.nova",
+      "sha256": "78bb5a1f8552a1257a5355f39842bc780dcb36634d7ef0a118a06b32dd52871d"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/call_clobbers.nova",
+      "sha256": "fec773323c4434d38d96d3927fa0ef415ee3c97b59750875398b7ff81028705b"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/call_contracts.nova",
+      "sha256": "6a461ba7b78976136119f4bd0a9d79013d78abee8e73d6d31bfa7761acdf26d0"
+    },
+    {
+      "path": "compiler/nova/macros/constant_eval.nova",
+      "sha256": "1be1fd0c23241d9f3d2710b0969ad4de3cab77de262b2a0df2f3fb0f99a366bf"
+    }
+  ],
+  "compiler_bundle_sha256": "3dbdea63c07f46ed6816017859fcb8def765de124e85238ff4894b31b6f85485",
+  "producer_sources": [
+    {
+      "path": "compiler/nova/drivers/ntasm_native_driver.nova",
+      "sha256": "f23c1a360cb0e70d07ec726ae51e3db6cb93cc8be6422650d2089cc39be3fe46"
+    },
+    {
+      "path": "compiler/nova/ir/machine_pipeline.nova",
+      "sha256": "10dbf74895f9925f17b6c8a88302fee3726634face6569e0030feb507fb95ac8"
+    },
+    {
+      "path": "compiler/nova/formats/nxo/nxo_link_pe.nova",
+      "sha256": "efb1c95653320c825b1133d269558a9117d7f56ae1cf4b4e245489a9bb2b85d9"
+    },
+    {
+      "path": "compiler/nova/formats/nxo/nxo_pe.nova",
+      "sha256": "a0502c3936cdf46650da5f9e014b1e5171d13c59e7e715ded0ceced289c7d823"
+    },
+    {
+      "path": "compiler/nova/formats/pe/pe.nova",
+      "sha256": "c6ecf903cb7483ec0fc9fd2239543093144e3277601ff61ac575f4d6ffa6a564"
+    },
+    {
+      "path": "compiler/nova/frontend/ast.nova",
+      "sha256": "05347e8dfcc094ce98c0d7c206201288a69fca9281c4d5a21a6ce726caa86dc7"
+    },
+    {
+      "path": "compiler/nova/frontend/parser.nova",
+      "sha256": "dcf4c18484969a6082e2e10a3cf955210b173bbc4290ba827e9d7b13ef59c9ce"
+    },
+    {
+      "path": "compiler/nova/formats/ntir/ntir.nova",
+      "sha256": "c0ae0f3f7d060ccf945c6b2c28db8653c3528aeb64b178977fc711a764de3546"
+    },
+    {
+      "path": "compiler/nova/ir/machine_ir.nova",
+      "sha256": "5b18b8583b04426bde111d5c4dff69f5700e4faecebd97c47d1c7dda44e8a7ad"
+    },
+    {
+      "path": "compiler/nova/backend/nova/machine_emit.nova",
+      "sha256": "b81ffde88517ad70be4b0e4b2da90c74da18e89063eccf3c3fb40db656cc6d77"
+    },
+    {
+      "path": "compiler/nova/formats/nxo/nxo.nova",
+      "sha256": "b8fc39b90211ba033cd81265b5bbae2a70fe4e01b30cd4aa5c6e04e1d45aa0a3"
+    },
+    {
+      "path": "compiler/nova/macros/macro_splice.nova",
+      "sha256": "19e7186768cd64ae48a4d506ad4c2b6cd36a5c39909ac58fa8cd23d7dc2910b1"
+    },
+    {
+      "path": "compiler/nova/analysis/validate.nova",
+      "sha256": "ca01ea5284b80fdeef8b547a2c5397d3bd61b20d0b5db787a950cd2102656ebb"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/abi.nova",
+      "sha256": "0e9e6a5d1e5c05990a4264b208376eb4f8781bb88a786fdfdaf9a9a9230ecba6"
+    },
+    {
+      "path": "compiler/nova/frontend/stub_table.nova",
+      "sha256": "e8312bc6286330ac6fcf68c839cff494f8e92cca984f9268bf14f9c07fe72be0"
+    },
+    {
+      "path": "compiler/nova/formats/nxo/nxo_merge.nova",
+      "sha256": "cdc3b1fd056a4108f4dce2dea6ad91ab2ea1c2292316d2677dafbc20f74cf4e3"
+    },
+    {
+      "path": "compiler/nova/frontend/lexer.nova",
+      "sha256": "d369a19bb548441e411c1bdffc1a036977b6848d37e025eabc02011ddc890e8c"
+    },
+    {
+      "path": "compiler/nova/analysis/types/register_widths.nova",
+      "sha256": "25773b170e1aae9a358ad889373d812047b4dd58a73b5df76951275f2e53a5de"
+    },
+    {
+      "path": "compiler/nova/backend/x64/x64_fixed.nova",
+      "sha256": "0d5e255f07ae9561d751f2fad0ebc7972e997ff51fadf8ddfa03dd1b05d4d769"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/effects.nova",
+      "sha256": "ed3f1077210d0518cf5e10f41697338e2da4c06c372736b266ee5011c8e02fdd"
+    },
+    {
+      "path": "compiler/nova/macros/macro_expand.nova",
+      "sha256": "2c31a5bd70ec6cfd965444a8af1d800160c75eca3afcc897c8741e88c8447639"
+    },
+    {
+      "path": "compiler/nova/analysis/semantics.nova",
+      "sha256": "f35ebbc1852130da7f41dad345ccef1458054fce9ab79acab1d5628fae54757d"
+    },
+    {
+      "path": "compiler/nova/frontend/targets.nova",
+      "sha256": "1685d88067092d9e564bdf87aac0d6704088c69c50dfcdbcd1375781e3389288"
+    },
+    {
+      "path": "compiler/nova/frontend/versions.nova",
+      "sha256": "3554e7683170196c9b6ba8b0c787770e7d7e5845aa8cd16a039186e6ac61d74f"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/features.nova",
+      "sha256": "613ff510658f583536334ba69b87380dbbef70db5695bd7e2abaf762aab5e220"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/callable_names.nova",
+      "sha256": "4af3d0716c800b04d5bd8220b8f66e4549d7bdd04253519938bec692f5ec6a55"
+    },
+    {
+      "path": "compiler/nova/frontend/symbol_names.nova",
+      "sha256": "e572632470754fb9019913f91a797b5631f94f7a1241386590a347d2c8103133"
+    },
+    {
+      "path": "compiler/nova/analysis/types/types.nova",
+      "sha256": "2ca4a487f6a6517141ecd1d19ed85fed1de936294ffbcc454bef57f20af44856"
+    },
+    {
+      "path": "compiler/nova/analysis/types/constant_types.nova",
+      "sha256": "632d98207f871f5cb0f50fdf60483a635a82d224593cb5ac7311f51d3f8c3227"
+    },
+    {
+      "path": "compiler/nova/analysis/types/literal_initializers.nova",
+      "sha256": "8c8fd9bcdc4667aa10586ecb0592556ac0749ea2c14037c58d9bc0a665afed26"
+    },
+    {
+      "path": "compiler/nova/analysis/types/condition_types.nova",
+      "sha256": "d2434f53b56e7f4ba295c97d3f7b19398c52c53cb306e1000285b19713055159"
+    },
+    {
+      "path": "compiler/nova/frontend/parameters.nova",
+      "sha256": "617e87f324a533c247211f0f1d1a3e0dff7de19d7ec9e88434d07faabc07aebe"
+    },
+    {
+      "path": "compiler/nova/frontend/locals.nova",
+      "sha256": "02b7fc8dcdb82bc710afccce65d704d98b07fa6c1137a11341d0faf25841cefc"
+    },
+    {
+      "path": "compiler/nova/frontend/bindings.nova",
+      "sha256": "e9028e4f8f93cb91e628a92f8cc11388ae72e5145240f191fba5c013dbb8e456"
+    },
+    {
+      "path": "compiler/nova/frontend/register_bindings.nova",
+      "sha256": "fd3e8f3584e109fb223f6b2e4a1087fd83c05ba2ea1a97c5cdc2ab6cf768888a"
+    },
+    {
+      "path": "compiler/nova/analysis/types/pointer_spaces.nova",
+      "sha256": "2d5c3afb78dbaea05c9b268c6c7711dc6f2291cdde8fc72840ee2303a113fdb3"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/body_effects.nova",
+      "sha256": "7da06bc423ba44de5b642a30f61753a02c887931f5b7e361a259eb0b52ed91b7"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/body_intrinsics.nova",
+      "sha256": "9b28a7163f6903ac1edb3e48a1d644dfb0f202bca4e775914eb8a457de010223"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/body_clobbers.nova",
+      "sha256": "2a266abff9e988e6e4f5c03c47784d45435c9c806749b7656f964194827ba2c8"
+    },
+    {
+      "path": "compiler/nova/analysis/control_flow.nova",
+      "sha256": "fde54135b7f5f59a648478c0a6f3f4135a83c93b0094ac2993ea03ef5da19397"
+    },
+    {
+      "path": "compiler/nova/analysis/types/return_types.nova",
+      "sha256": "72529e81482cca72b7c2158765bbaa435095753c20d72d96a432269a577bc9e3"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/contracts.nova",
+      "sha256": "25b86d6434f695ec40a817db130f7d2f2b26f5fde3035c020074d55485456622"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/feature_requirements.nova",
+      "sha256": "c8126cc99229f0765617f33db4de7544fd146b6ce3b9051c53873e5befdd3fe2"
+    },
+    {
+      "path": "compiler/nova/analysis/abi/clobbers.nova",
+      "sha256": "c6da57f027b9420b3d0481e3f04fd50aa73132860752b92b43999a1f0d1f0db3"
+    },
+    {
+      "path": "compiler/nova/frontend/refs.nova",
+      "sha256": "f6416af0914d2fec441ff544389218efdc9fba6ecc2e84bb2cd4804bdb105e87"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/calls.nova",
+      "sha256": "30e3a2d056d0b3a95043ec4ff5ed191bd4a1cf9bec88f33a749e43b3fad26f88"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/call_types.nova",
+      "sha256": "d6ca0d4e6a1470afc4b9702b6b5d133bac929d76010b6ebc73471b0684ccbb4c"
+    },
+    {
+      "path": "compiler/nova/analysis/types/initializer_types.nova",
+      "sha256": "d94cbaf6bede47970bf63cc739a3dfe895cd368f5f46f1c33385b1f9c62a33f7"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/call_effects.nova",
+      "sha256": "78bb5a1f8552a1257a5355f39842bc780dcb36634d7ef0a118a06b32dd52871d"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/call_clobbers.nova",
+      "sha256": "fec773323c4434d38d96d3927fa0ef415ee3c97b59750875398b7ff81028705b"
+    },
+    {
+      "path": "compiler/nova/analysis/calls/call_contracts.nova",
+      "sha256": "6a461ba7b78976136119f4bd0a9d79013d78abee8e73d6d31bfa7761acdf26d0"
+    },
+    {
+      "path": "compiler/nova/macros/constant_eval.nova",
+      "sha256": "1be1fd0c23241d9f3d2710b0969ad4de3cab77de262b2a0df2f3fb0f99a366bf"
+    }
+  ],
+  "producer_bundle_sha256": "a5f4f2ee454253eb44e1832fc509194b3d6922985a2aad6f0ef71cacba703624",
+  "expected_producer_sha256": "190cb8b162bd63d19609d7174fd0eb5de5360b625e76a2b8434ea61de4e85d55",
+  "bootstrap_history": "Initial C seed quarantined. Current Nova P1/P2 independently executed and byte-compared with a C runtime/loader observer, not a C source compiler. This manifest pins results; actual house build and selfhost evidence are separate. The pinned seed PE (nova_compiler) and expected_producer_sha256 are PUBLISHED ARTEFACTS that come from outside this build: they are not bytes of this repository, they are carried over from the house stage unchanged, and the builder checks them against the bytes it is given at run time.",
+  "runtime": {
+    "source": "compiler/runtime/runtime-v2-s0.ntasm",
+    "source_sha256": "0c768e4823279e4f1c841477dc6f0bed96c89b8594a8779f2b0542c51b10f697",
+    "image_sha256": "413b78160f34609a0d23f3cedb0308118483eb6204cc60e2f6795dc593e2c4b8"
+  },
+  "host": {
+    "source": "compiler/runtime/uefi-host-s0.ntasm",
+    "source_sha256": "a2b8b4dc65defa61921b02154f63e3bc16b1fb400b3f9c25e8e2e4216b99b22a",
+    "image_sha256": "9b3509ec28ca705fdaec2c95e2221d28d2f8793cb7fcc308986899c94b57dad2"
+  }
+}

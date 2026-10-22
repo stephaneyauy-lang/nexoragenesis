@@ -102,6 +102,44 @@ the guest had *returned to the firmware* without a terminal marker and the
 firmware moved on to the next boot option. That leaves two runs where the
 guest stopped by itself: the run of 13:53 and the run of 17:03.
 
+## The measured reproduction (2026-10-22)
+
+The producer step of trial 05 was **reproduced in this repository**: the exact
+four images of the failing run, read from the archive, booted by the
+transport of this branch. It stopped at the same point as the archived run.
+
+```
+NG_NOVA_BATCH_OBJECT_END 15
+NG_NOVA_BATCH_LOWER_BEGIN 16      <- byte for byte the archived tail
+```
+
+and the liveness block of its `boot-result.json` says:
+
+```json
+{"polled": 435, "unavailable": 0, "malformed": 0, "fatal": true,
+ "state": "paused", "reason": "shutdown",
+ "detail": "the monitor reported VM status: paused (shutdown)"}
+```
+
+Three things the archive did not hold:
+
+1. **The guest powers off deterministically** at batch 16. This is a
+   reproduction, not a coincidence of timing.
+2. **The VM state at the moment of the failure is measured**: `paused
+   (shutdown)`, with the HMP transcript kept. The archive only had the
+   house build's own note that a paused VM had to be closed by hand.
+3. **The transport saw the dead guest in at most five seconds**, against the
+   8601 s of dead waiting the archived run records. The liveness poll is
+   proven on a real failure, not only on the deliberate watchdog case.
+
+The real transcript of that poll is kept as
+`tests/transport/fixtures/hmp-live-paused-shutdown.txt`, and the suite
+parses it.
+
+**The cause is still not established.** What is measured is the state of the
+guest, not the reason it stopped. The bisection that would settle it is
+`a8-trial05-bisection.md`.
+
 ## What the evidence refutes
 
 **The firmware watchdog is not the cause of the trial-05 stop.** The host of

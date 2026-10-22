@@ -18,9 +18,30 @@ python -m unittest discover -s tests/transport -p test_nova_native_transport.py
 
 The transport looks for the two pinned S0 producers in `legacy/ntasm-s0/fixed-point` first, then in `bootstrap/ntasm-s0/fixed-point`, and refuses when neither directory holds them. The pins it checks are the digests the repository publishes in `legacy/ntasm-s0/fixed-point/README.md`. The producer binaries themselves are not in this snapshot, so the `assemble` mode cannot run here.
 
+## Live verification (2026-10-22)
+
+The one bounded live QEMU run the review asked for was performed in WSL
+(QEMU 8.2.2, the same build as the archived runs, with the OVMF 4M firmware
+and `mtools`). It is scripted in `tests/transport/a8_live_check.sh` and it
+boots the two hosts of the watchdog proof, so both outcomes are covered:
+
+| case | guest | result | liveness | elapsed |
+|---|---|---|---|---|
+| `live-green` | the certified host | **pass**; `OUTPUT.EFI` byte-identical to the published `ea1dc3f9…` | 4 polls, `running`, confirmed | ~20 s of a 120 s budget |
+| `live-red` | the watchdog host | **fail**, `the monitor reported VM status: paused (shutdown)` | 3 polls, `paused (shutdown)`, fatal | ~15 s of a 120 s budget |
+
+The red case is the measured failure signature itself: the guest powers off
+and the transport says so at once, with the HMP transcript kept, instead of
+waiting for the budget. In the trial-05 terms that is about 15 s instead of
+the 8601 s of dead waiting the archive records.
+
+The real transcripts of the live monitor are kept as fixtures
+(`tests/transport/fixtures/hmp-live-*.txt`) and the test suite parses them,
+so the parser is locked to the format QEMU really sends: the banner, the
+`(qemu)` prompt and the echoed command with its ANSI redisplay escapes.
+
 ## Remaining work
 
-- Verify monitor exchange and cleanup with one bounded live QEMU run.
 - The guest shutdown of trial 05 is still unexplained. What the archived
   evidence does establish, and what it refutes, is in
   [a8-trial05-shutdown.md](a8-trial05-shutdown.md): the firmware watchdog is

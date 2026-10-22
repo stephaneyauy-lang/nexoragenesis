@@ -903,6 +903,25 @@ class HmpStatusTests(unittest.TestCase):
             "VM status: paused")))
         self.assertEqual(nt.hmp_state_text("paused", None), "paused")
 
+    def test_the_live_monitor_transcripts_are_parsed(self):
+        # The fixtures are the REAL transcripts of a live QEMU 8.2.2 monitor,
+        # captured by the bounded live check. They carry the banner, the
+        # prompt and the echoed command with its ANSI redisplay escapes.
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        running = fixtures / "hmp-live-running.txt"
+        shutdown = fixtures / "hmp-live-paused-shutdown.txt"
+        if not (running.is_file() and shutdown.is_file()):
+            self.skipTest("the live transcripts are not in this tree")
+        self.assertEqual(nt.parse_vm_status(running.read_text(encoding="utf-8")),
+                         ("running", None))
+        self.assertEqual(
+            nt.parse_vm_status(shutdown.read_text(encoding="utf-8")),
+            ("paused", "shutdown"))
+        self.assertTrue(nt.hmp_state_is_fatal(
+            *nt.parse_vm_status(shutdown.read_text(encoding="utf-8"))))
+        # The live transcript is the one the archive recorded too.
+        self.assertIn("QEMU 8.2.2 monitor", running.read_text(encoding="utf-8"))
+
     def test_a_truncated_status_is_never_a_verified_state(self):
         for text in ("VM status: runn", "VM status: paused (shut",
                      "VM status: running (x)", "VM status:"):

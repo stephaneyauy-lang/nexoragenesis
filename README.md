@@ -1,42 +1,42 @@
-<p align="center"><img src="assets/nexora-banner.svg" alt="Nexora Genesis — Du langage à la machine" width="100%"></p>
+<p align="center"><img src="assets/nexora-banner.svg" alt="Nexora Genesis — From language to machine" width="100%"></p>
 
 # Nexora Genesis
 
-**Un assembleur typé, des compilateurs et des langages pour construire des systèmes.**
+**A typed assembler, compilers, and languages for building systems.**
 
-[Démarrer](docs/guides/ntasm-quickstart.md) · [Explorer le compilateur](compiler/README.md) · [Spécifications](spec/README.md) · [Roadmaps](#roadmaps) · [Validation](VALIDATION.md) · [Licence MIT](LICENSE)
+[Getting started](docs/guides/ntasm-quickstart.md) · [Explore the compiler](compiler/README.md) · [Specifications](spec/README.md) · [Roadmaps](#roadmaps) · [Validation](VALIDATION.md) · [MIT License](LICENSE)
 
-> **Édition de recherche — 22 octobre 2026.** Le compilateur principal fonctionne encore avec un bootstrap C. La relève en Nova progresse, mais A8 et A9 restent ouverts : cette copie n'est pas annoncée comme une livraison B2.1 achevée.
+> **Research snapshot — October 22, 2026.** The main compiler still relies on a C bootstrap. Its Nova replacement is progressing, but A8 and A9 remain open: this snapshot is not a completed B2.1 release.
 
-## Trouver ce que l'on cherche
+## Find your way around
 
-| Dossier | Rôle |
+| Directory | Purpose |
 |---|---|
-| [`compiler/c/`](compiler/c/README.md) | Implémentation C actuellement utilisée pour construire le compilateur principal |
-| [`compiler/nova/`](compiler/nova/README.md) | Modules Nova : frontend, types, appels, ABI, macros, IR, x86-64, NXO et PE |
-| [`compiler/runtime/`](compiler/runtime/README.md) | Exécution Nova et hôte UEFI natif |
-| [`tests/`](tests/README.md) | Tests, cas négatifs et programmes de contrôle, séparés des implémentations |
-| [`spec/`](spec/README.md) | Contrats de langage, formats et cible x86-64 |
-| [`docs/`](docs/README.md) | Guides d'usage, architecture et état des jalons |
-| [`examples/os/`](examples/os/README.md) | Exemples OS et démonstrations, conservés hors de `legacy/` |
-| [`tools/`](tools/README.md) | Outils utiles à la copie actuelle |
-| [`bootstrap/`](bootstrap/README.md) | Description du seed minimal ; les anciens bootstrap sont archivés |
-| [`legacy/`](legacy/README.md) | Anciennes implémentations et outils de campagne, hors du build normal |
+| [`compiler/c/`](compiler/c/README.md) | C implementation currently used to build the main compiler |
+| [`compiler/nova/`](compiler/nova/README.md) | Nova modules: frontend, types, calls, ABI, macros, IR, x86-64, NXO, and PE |
+| [`compiler/runtime/`](compiler/runtime/README.md) | Nova execution support and native UEFI host |
+| [`tests/`](tests/README.md) | Tests, negative cases, and verification programs, separate from implementations |
+| [`spec/`](spec/README.md) | Language contracts, formats, and the x86-64 target |
+| [`docs/`](docs/README.md) | Usage guides, architecture, and milestone status |
+| [`examples/os/`](examples/os/README.md) | OS examples and demos, kept outside `legacy/` |
+| [`tools/`](tools/README.md) | Tools supporting the current snapshot |
+| [`bootstrap/`](bootstrap/README.md) | Minimal seed description; older bootstraps are archived |
+| [`legacy/`](legacy/README.md) | Earlier implementations and campaign tools, outside the normal build |
 
-## De la source à l'exécutable
+## From source to executable
 
 ```mermaid
 flowchart LR
-    A[Sources NTASM] --> B[Lexique et parseur]
-    B --> C[Types · appels · ABI · macros]
-    C --> D[IR et émission x86-64]
-    D --> E[Objet NXO]
-    E --> F[Liaison et PE]
+    A[NTASM sources] --> B[Lexer and parser]
+    B --> C[Types · calls · ABI · macros]
+    C --> D[IR and x86-64 emission]
+    D --> E[NXO object]
+    E --> F[Linking and PE]
 ```
 
-Le backend C est la voie principale actuelle. Le backend MIR charge des modules Nova. Les deux chemins ne constituent pas deux preuves équivalentes : leurs tests et limites sont décrits dans [VALIDATION.md](VALIDATION.md).
+The C backend is the current primary path. The MIR backend loads Nova modules. These paths do not provide equivalent validation evidence: their tests and limitations are described in [VALIDATION.md](VALIDATION.md).
 
-## Première lecture
+## A first example
 
 ```ntasm
 module bootstrap.return42
@@ -50,11 +50,11 @@ section .text {
 }
 ```
 
-Cet exemple est conservé dans [`examples/ntasm-v0/c-bootstrap/return42.ntasm`](examples/ntasm-v0/c-bootstrap/return42.ntasm). Les exemples ne remplacent pas la [spécification](spec/ntasm/ntasm.md).
+This example is available in [`examples/ntasm-v0/c-bootstrap/return42.ntasm`](examples/ntasm-v0/c-bootstrap/return42.ntasm). Examples do not replace the [specification](spec/ntasm/ntasm.md).
 
-## Construire
+## Building
 
-Sous Linux ou WSL avec Bash, GCC et les outils GNU :
+On Linux or WSL with Bash, GCC, and GNU tools:
 
 ```bash
 bash scripts/ntbuild.sh policy
@@ -62,67 +62,69 @@ bash scripts/ntbuild.sh pins --verify
 bash scripts/ntbuild.sh build
 ```
 
-**La vérification des empreintes signale encore trois écarts hérités du principal.** Ils sont conservés et documentés ; ne pas les contourner pour annoncer un build officiel réussi. Le contrôle de réorganisation a néanmoins recompilé les 17 unités C et reproduit les huit sorties PE de référence. Les sorties de travail restent dans `out/`, exclu de Git.
+**Source hash verification still reports three discrepancies inherited from the main working tree.** They remain documented and visible; bypassing them would not establish a successful official build. The reorganization check nevertheless recompiled all 17 C translation units and reproduced the eight reference PE outputs. Generated files belong in `out/`, which is excluded from Git.
 
 ## Roadmaps
 
-Les cases cochées indiquent les jalons déclarés validés dans le principal, ou une preuve précisément nommée. Elles ne certifient pas que toute cette copie a été retestée. Les autres roadmaps sont des objectifs de développement, sans date ni pourcentage inventé.
+Checked boxes represent milestones recorded as validated in the main working tree, or a specifically identified proof. They do not certify that this entire snapshot has been retested. The other roadmaps describe development goals, without invented deadlines or completion percentages.
 
 ### NTASM — B2.1
 
-- [x] **A1 — Spécification et formats** : grammaire et formats figés selon le contrat actuel.
-- [x] **A2 — x86-64** : encodages, adressage et relocations du périmètre v0.
-- [x] **A3 — Modules et typage** : fonctions, modules et types machine.
-- [x] **A4 — Contrats et ABI** : effets, clobbers et conventions d'appel.
-- [x] **A5 — Macros et comptime** : expansion, hygiène et bornes.
-- [x] **A6 — Stubs système** : chemins structurés et preuves QEMU enregistrées.
-- [x] **A7 — Chaîne commune** : IR, objets NXO, PE et exécution enregistrée.
-- [ ] **A8 — Auto-hébergement complet** : terminer le build maison, le vérifier et retirer le C du build normal.
-- [ ] **A9 — Livraison utilisable** : finaliser commandes, paquet et reproductibilité après A8.
-- [x] **A10 — Diagnostics et contrôles** : améliorations et comparaisons enregistrées.
+- [x] **A1 — Specification and formats:** grammar and formats frozen under the current contract.
+- [x] **A2 — x86-64:** instruction encodings, addressing, and relocations within the v0 scope.
+- [x] **A3 — Modules and typing:** functions, modules, and machine-level types.
+- [x] **A4 — Contracts and ABI:** effects, clobbers, and calling conventions.
+- [x] **A5 — Macros and comptime:** expansion, hygiene, and enforced bounds.
+- [x] **A6 — System stubs:** structured paths with recorded QEMU evidence.
+- [x] **A7 — Shared pipeline:** IR, NXO objects, PE files, and recorded execution.
+- [ ] **A8 — Complete self-hosting:** finish and validate the native build, then remove C from the normal build.
+- [ ] **A9 — Usable release:** finalize commands, packaging, and reproducibility after A8.
+- [x] **A10 — Diagnostics and checks:** recorded improvements and comparisons.
 
-Référence : [contrat B2.1](docs/status/ntasm-completion.md). **Avant le push de cette édition :** valider les trois écarts d'empreintes et revoir la réorganisation ; ne pas cocher A8 sur la seule réussite d'un lot.
+Reference: [B2.1 completion contract](docs/status/ntasm-completion.md). **Before declaring a usable release:** validate the three source hash discrepancies and review the reorganization. A single successful batch does not complete A8.
 
-### Nova — une chaîne autonome
+### Nova — an independent compiler pipeline
 
-- [x] Observer un point fixe du compilateur Nova : P1 et P2 identiques sur les sources du 21 octobre.
-- [x] Produire le pilote NTASM avec P2 et vérifier son corpus de 19 cas dans le laboratoire.
-- [ ] Terminer la reconstruction complète sur le runtime maison, sans traduction des sources par C.
-- [ ] Rejouer les preuves depuis une copie propre, avec les nouveaux chemins du dépôt.
-- [ ] Faire de cette chaîne le build normal et déplacer le bootstrap C hors des dépendances requises.
-- [ ] Figer la grammaire, les interfaces du runtime et la bibliothèque minimale de la prochaine version Nova.
-- [ ] Mesurer les coûts de compilation et corriger les lenteurs avec des cas reproductibles.
-- [ ] Définir et valider séparément les besoins GPU avant d'annoncer un compilateur GPU utilisable.
+- [x] Observe a Nova compiler fixed point: identical P1 and P2 binaries from the October 21 sources.
+- [x] Produce the NTASM driver with P2 and verify its 19-case corpus in the working environment.
+- [ ] Complete the full reconstruction on the native runtime, without translating sources through C.
+- [ ] Reproduce the evidence from a clean checkout using the new repository paths.
+- [ ] Make this pipeline the normal build and remove the C bootstrap from its required dependencies.
+- [ ] Freeze the grammar, runtime interfaces, and minimal library for the next Nova version.
+- [ ] Measure compilation costs and address bottlenecks with reproducible cases.
+- [ ] Define and validate GPU requirements separately before claiming a usable GPU compiler.
 
-### C-Nova — programmation système
+### C-Nova — systems programming
 
-- [ ] Définir précisément le périmètre CPU/système et sa différence avec Nova et NTASM.
-- [ ] Écrire la grammaire, les règles de types, de mémoire et d'interopérabilité.
-- [ ] Construire une première verticale : source → IR commune → exécutable testé.
-- [ ] Ajouter les fonctions, structures, modules et accès mémoire prévus par la spécification.
-- [ ] Valider un petit composant système avec cas positifs et négatifs.
-- [ ] Documenter les garanties et les opérations explicitement non sûres.
+- [ ] Define its CPU/systems scope and how it differs from Nova and NTASM.
+- [ ] Specify the grammar, type system, memory rules, and interoperability.
+- [ ] Build an initial end-to-end path: source → shared IR → tested executable.
+- [ ] Add the functions, structures, modules, and memory operations defined by the specification.
+- [ ] Validate a small systems component with positive and negative cases.
+- [ ] Document guarantees and explicitly unsafe operations.
 
-### NX — applications et outils
+### NX — applications and tools
 
-- [ ] Figer les premiers usages et le contrat d'exécution.
-- [ ] Définir les types, modules, erreurs et interfaces avec Nova/C-Nova.
-- [ ] Relier un frontend minimal à la chaîne commune.
-- [ ] Livrer un programme d'application complet et reproductible.
-- [ ] Ajouter bibliothèque, diagnostics, outils et guide utilisateur au rythme des usages validés.
+- [ ] Establish the initial use cases and execution contract.
+- [ ] Define types, modules, errors, and interfaces with Nova/C-Nova.
+- [ ] Connect a minimal frontend to the shared pipeline.
+- [ ] Deliver a complete, reproducible application example.
+- [ ] Add libraries, diagnostics, tools, and user documentation as use cases are validated.
 
-### MEM et scheduler — pistes à spécifier
+### MEM and scheduling — directions to specify
 
-- [ ] **MEM** : préciser le besoin que les langages existants ne couvrent pas déjà.
-- [ ] Définir régions, durées de vie, permissions et interfaces mémoire à tester.
-- [ ] Comparer un prototype à une implémentation de référence avant de promettre un gain.
-- [ ] **Scheduler** : définir le modèle de tâches, les contraintes temporelles et les invariants.
-- [ ] Valider d'abord le modèle dans un simulateur, puis dans un exemple OS contrôlé.
+- [ ] **MEM:** identify a need that the existing languages do not already cover.
+- [ ] Define regions, lifetimes, permissions, and memory interfaces to test.
+- [ ] Compare a prototype against a reference implementation before promising performance gains.
+- [ ] **Scheduler:** define the task model, timing constraints, and invariants.
+- [ ] Validate the model in a simulator first, then in a controlled OS example.
 
-L'ordre de priorité reste **NTASM A8 → A9 → consolidation Nova → nouveaux langages**. Ces pistes ne signifient pas que MEM ou un langage de scheduler sont déjà implémentés.
+The priority order remains **NTASM A8 → A9 → Nova consolidation → new languages**. These directions do not imply that MEM or a scheduling language is already implemented.
 
-## Licence et contribution
+## License and contribution
 
-Cette édition du code original et de sa documentation est proposée sous **[MIT](LICENSE)** : utilisation gratuite, y compris commerciale, avec conservation des mentions exigées. Les licences propres aux composants tiers restent applicables. Voir [LICENSING.md](LICENSING.md).
+This edition of the original code and its documentation is available under **[MIT](LICENSE)**: free use, including commercial use, subject to preserving the required notices. Third-party components retain their own licenses. See [LICENSING.md](LICENSING.md).
 
-Projet développé avec l'aide d'IA. Une preuve historique, un fichier généré ou une case cochée ne remplacent pas un test reproductible sur la version que l'on publie.
+Developed with AI assistance. Historical evidence, a generated file, or a checked box does not replace a reproducible test on the version being published.
+
+The main README is in English. Some linked specifications, guides, and historical records are still in French.

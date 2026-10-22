@@ -1215,7 +1215,7 @@ def cmd_policy(repo):
         "manifest-missing", "manifest-unreadable", "manifest-schema", "manifest-incomplete",
         "manifest-bad-digest", "manifest-bad-path",
         "source-count", "source-count-mismatch", "source-duplicate", "source-empty",
-        "source-not-in-nova-tree", "source-not-in-runtime-tree", "source-not-nova", "source-not-ntasm",
+        "source-not-in-tree", "source-not-in-runtime-tree", "source-not-nova", "source-not-ntasm",
         "path-escape", "source-missing", "source-digest-mismatch",
         "bundle-mismatch", "seed-missing", "seed-digest-mismatch", "not-pe64",
         "image-digest-mismatch", "source-changed-during-build", "seed-changed-during-build",

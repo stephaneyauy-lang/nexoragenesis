@@ -85,6 +85,8 @@ Reference: [B2.1 completion contract](docs/status/ntasm-completion.md). **Before
 
 ### Nova — an independent compiler pipeline
 
+**A8 first.** The new design goals below are planning items only: do not start their implementation until A8 is formally validated under the B2.1 contract. A9 release work remains ahead of language expansion. Fixes required to complete A8 are still the current priority.
+
 - [x] Observe a Nova compiler fixed point: identical P1 and P2 binaries from the October 21 sources.
 - [x] Produce the NTASM driver with P2 and verify its 19-case corpus in the working environment.
 - [ ] Complete the full reconstruction on the native runtime, without translating sources through C.
@@ -94,7 +96,21 @@ Reference: [B2.1 completion contract](docs/status/ntasm-completion.md). **Before
 - [ ] Measure compilation costs and address bottlenecks with reproducible cases.
 - [ ] Define and validate GPU requirements separately before claiming a usable GPU compiler.
 
+#### Design goals and acceptance criteria — after A8
+
+- [ ] **Fast, separate and incremental compilation.** On a fixed multi-module corpus, record clean, unchanged and single-module-edit builds. An unchanged build must compile no module; an edit must rebuild only the affected dependency closure. Incremental and clean builds of the same sources must produce identical artifacts. Publish timings and peak memory over at least ten runs, with hardware and cache conditions recorded.
+- [ ] **Explicit memory safety.** Specify ownership, borrowing or region rules before implementing them. Positive and negative tests must cover use-after-free, double-free, bounds and aliasing. Each forbidden case must be rejected at compilation or trapped before the invalid access, according to the documented guarantee. Unsafe operations must be explicit; the same safety corpus must pass in development and production modes.
+- [ ] **Native performance with distinct build profiles.** Define development and production profiles with the same language semantics and safety guarantees. Measure compilation time, runtime, peak memory and allocation counts on fixed parsing, buffer-processing and numerical workloads. Declare the reference implementation and performance budgets before optimizing; publish results rather than claiming C++-level speed without evidence.
+- [ ] **Explicit errors and useful diagnostics.** Define typed success/error results, concise propagation and explicit conversions between error types. Tests must reject an unhandled closed error variant, exercise each error path, and verify stable error codes with source locations and an actionable explanation. Propagation must not silently discard or invent an error conversion.
+- [ ] **Expressive types and bounded macros.** Add algebraic data types and exhaustive matching for closed variants, with tests for missing and unreachable cases. Macro tests must detect accidental name capture, preserve expansion provenance, and reject excessive expansion at documented limits. Measure their compile-time cost on a fixed adversarial corpus.
+- [ ] **Practical library interoperability.** Start with a documented C ABI boundary, not a promise to inherit Python's ecosystem. Run bidirectional C/Nova tests for scalar values, structures, buffers and error returns; specify allocation ownership and who releases each buffer. A Python bridge remains a later, separately measured goal.
+- [ ] **Inspectable compilation.** Provide a reproducible way to inspect the relevant IR, emitted code and allocation/check decisions for a small program. Tests must connect those reports to the actual generated artifact, and distinguish checks removed by proof from checks disabled by an unsafe operation.
+
+For every acceptance item, retain the source revision, command, fixture inputs, expected result and raw output. Performance comparisons use the same machine and workload; a green counter alone is not evidence that the goal is complete. No new feature implementation is started by this roadmap update.
+
 ### C-Nova — systems programming
+
+**Blocked on A8 completion and the shared Nova foundation.** These are future acceptance targets, not implemented features or a parallel project to launch now.
 
 - [ ] Define its CPU/systems scope and how it differs from Nova and NTASM.
 - [ ] Specify the grammar, type system, memory rules, and interoperability.
@@ -102,6 +118,15 @@ Reference: [B2.1 completion contract](docs/status/ntasm-completion.md). **Before
 - [ ] Add the functions, structures, modules, and memory operations defined by the specification.
 - [ ] Validate a small systems component with positive and negative cases.
 - [ ] Document guarantees and explicitly unsafe operations.
+
+#### Design goals and acceptance criteria — after A8
+
+- [ ] **A coherent systems-language contract.** Publish the grammar and the rules for types, lifetimes, errors, modules and unsafe operations, including the boundary with Nova and NTASM. Each normative rule must have a positive or negative fixture before its implementation is accepted.
+- [ ] **Predictable memory and layout.** Verify structure size, alignment, field offsets and buffer layout against an independent C or NTASM consumer on each supported ABI. Allocation must be explicit or reported. Use a bounded component with a counting allocator to demonstrate its declared allocation budget; do not claim general memory safety from layout tests alone.
+- [ ] **Safety without hidden runtime requirements.** Specify what the safe subset guarantees and what unsafe code must uphold. Test invalid lifetimes, bounds, aliasing and error propagation in both build profiles. A freestanding example must link and run with only its documented runtime services; record imported symbols and dependencies.
+- [ ] **Reusable compilation and interoperability.** Reuse the shared IR, object formats and backend rather than introducing a second encoding implementation. Link and execute a multi-module example crossing C-Nova, Nova and NTASM boundaries, with independent checks of argument passing, return values, register preservation and error behavior.
+- [ ] **Fast development, measured production performance.** Apply Nova's incremental-build checks to a fixed systems workload. Record clean and incremental build times, executable size, runtime and allocations for both profiles. Agree on the baseline and budget before optimization; retain the same safety guarantees in the optimized profile.
+- [ ] **Stable interfaces and understandable failures.** Version the language and ABI contracts. Keep a compatibility corpus across releases; an incompatible change must have a documented migration or a specific diagnostic. A small real tool or systems component must demonstrate typed errors, readable diagnostics and repeatable builds before expanding the language.
 
 ### NX — applications and tools
 
